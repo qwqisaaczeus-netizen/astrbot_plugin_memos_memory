@@ -1,0 +1,2694 @@
+"""
+astrbot_plugin_memos_memory WebUI (v1.10.1)
+
+Uses Python stdlib http.server + threading for a dependency-light local UI.
+No aiohttp dependency. Runs in a daemon thread, no async event loop required.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+import asyncio
+import calendar
+import builtins
+import gc
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse, parse_qs, unquote
+
+logger = logging.getLogger(__name__)
+
+
+def _strip_internal_metadata(text: str) -> str:
+    import re
+    return re.sub(r"(?m)^\s*<!--\s*memos-memory:[\s\S]*?-->\s*$", "", text or "").strip()
+
+
+def _cors_headers() -> dict[str, str]:
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+    }
+
+
+def _json_response(handler: BaseHTTPRequestHandler, status: int, data: Any) -> None:
+    handler.send_response(status)
+    for k, v in _cors_headers().items():
+        handler.send_header(k, v)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Cache-Control", "no-store")
+    body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _html_response(handler: BaseHTTPRequestHandler, html: str) -> None:
+    handler.send_response(200)
+    for k, v in _cors_headers().items():
+        handler.send_header(k, v)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    body = html.encode("utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_html: str):
+    """Create a request handler class bound to the plugin instance."""
+
+    settings_lock = threading.RLock()
+
+    setting_groups = {
+        "基础与连接": {
+            "enable", "character_name", "memos_base_url", "memos_mode", "memos_token",
+            "memos_timeout", "managed_memos_dir", "managed_memos_exe",
+            "managed_memos_data_dir", "managed_memos_host", "managed_memos_port",
+            "managed_memos_port_start", "vec_db_path", "emb_provider_id",
+        },
+        "原文档案与日记生成": {
+            "compress_provider_id", "compress_llm_timeout", "enable_auto_compress",
+            "compress_every_n_turns", "diary_count", "compress_batch_max_messages",
+            "eod_checkpoint_enable", "eod_checkpoint_min_turns", "eod_checkpoint_max_diaries",
+            "episodic_memory_enable", "episodic_db_path", "evidence_first_generation_enable",
+            "raw_evidence_archive_enable", "episode_extraction_provider_id",
+            "episode_extraction_timeout", "diary_render_provider_id", "diary_render_timeout",
+            "episodic_auto_migrate", "episode_migration_wait_seconds",
+        },
+        "滚动当前状态": {
+            "semantic_state_enable", "semantic_state_provider_id", "semantic_state_timeout",
+            "semantic_state_target_chars", "semantic_state_auto_bootstrap",
+            "semantic_state_bootstrap_episode_limit", "semantic_state_replace_profile",
+        },
+        "4.x 当前精简召回": {
+            "enable_auto_recall", "lean_recall_enable", "lean_recall_candidate_k",
+            "lean_event_index_enable", "lean_source_evidence_enable", "lean_coverage_selection_enable",
+            "lean_adaptive_evidence_enable", "passage_vector_auto_migrate",
+            "source_turn_vector_auto_migrate",
+            "lean_temporal_enable", "lean_story_min_inject", "lean_story_max_inject",
+            "lean_story_normal_inject", "lean_relative_margin", "lean_relative_margin_broad",
+            "recall_safety_net_enable", "recall_safety_net_min_selected",
+            "recall_safety_net_min_top_score",
+            "lean_texture_enable", "min_similarity_to_inject", "w_relevance",
+            "w_importance", "w_recency", "pin_boost", "recall_injection_min_score",
+            "recall_context_query_messages", "recall_context_query_max_chars",
+            "recall_dedup_window", "recall_rerank_enable", "rerank_provider_id",
+            "bm25_tokenizer",
+        },
+        "剧情注入与原文证据": {
+            "inject_order", "inject_format", "summary_chars", "enable_injection_style_rules",
+            "inject_char_budget", "inject_compact_chars",
+            "episodic_evidence_per_memory", "episodic_full_diary_limit",
+            "passage_index_enable", "passage_max_chars", "passage_overlap_chars",
+            "mixed_injection_enable", "full_diary_top_n", "passage_expand_chars",
+        },
+        "兼容回退（不参与当前主路）": {
+            "recall_top_k", "persona_top_k", "plot_top_k", "texture_top_k",
+            "enable_layered_injection", "time_boost", "recall_candidate_pool",
+            "recall_multi_query_enable", "recall_rrf_k", "recall_month_route_enable",
+            "recall_month_route_count", "recall_month_route_candidate_k",
+            "recall_month_route_inject_max", "recall_month_route_timeout",
+            "recall_information_gain_enable", "recall_necessary_can_exceed_max",
+            "recall_necessary_hard_cap", "recall_dynamic_count_enable",
+            "recall_min_inject", "recall_max_inject", "episodic_candidate_pool",
+            "episodic_default_inject", "episodic_narrative_inject", "episodic_min_card_score",
+            "recall_cluster_fold_enable", "recall_cluster_fold_apply",
+            "recall_cluster_similarity", "recall_cluster_base_per_group",
+            "recall_cluster_allow_protected",
+        },
+        "画像与洞察": {
+            "enable_affiliate_profile", "affiliate_profile_max_age_days", "profile_provider_id",
+            "profile_auto_update_days", "profile_recent_persona_limit", "profile_anchor_limit",
+            "profile_manual_limit", "profile_feedback_limit", "profile_llm_timeout",
+            "profile_target_chars", "profile_facts_target_count",
+        },
+        "上下文治理": {
+            "context_governance_enable", "context_exclude_command_turns", "context_keep_recent_messages",
+            "context_min_messages_before_trim", "context_preserve_system_messages",
+            "context_trim_backup_enable",
+            "context_archive_enable", "context_archive_keep_recent_messages",
+            "context_archive_min_total_messages", "context_archive_interval_days",
+            "context_archive_backup_dir",
+        },
+        "角色增强": set(),
+        "缓存诊断": set(),
+        "运行与维护": set(),
+        "重要性规则": {
+            "imp_tier5_keywords", "imp_tier4_keywords", "imp_tier3_keywords", "imp_low_keywords",
+        },
+    }
+    time_insight_setting_keys = {
+        "enable_time_insight_affiliate", "time_insight_auto_update_hours",
+        "time_insight_source_memo_limit", "time_insight_recent_window_days",
+        "time_insight_anniversary_window_days", "time_insight_min_importance",
+        "time_insight_min_evidence_score", "time_insight_trend_min_distinct_days",
+        "time_insight_trend_min_evidence", "time_insight_seasonal_min_years",
+        "time_insight_ambient_max_insights", "time_insight_ambient_max_chars",
+        "time_insight_repeat_cooldown_minutes", "time_insight_query_enable",
+        "time_insight_query_max_insights", "time_insight_query_min_score",
+        "time_insight_query_max_chars", "time_insight_query_lookup_timeout",
+        "time_insight_llm_refine_enable", "time_insight_llm_provider_id",
+        "time_insight_llm_timeout", "time_insight_llm_min_confidence",
+        "time_insight_diagnostic_log",
+    }
+
+    preset_definitions = {
+        "deep_roleplay": {
+            "name": "深度角色塑形",
+            "summary": "长篇 RP 与年月级人格塑形，细节、情感弧和召回覆盖优先。",
+            "cost": "较高",
+            "values": {
+                "compress_every_n_turns": 16, "diary_count": 3, "compress_batch_max_messages": 36,
+                "eod_checkpoint_enable": True, "eod_checkpoint_min_turns": 1,
+                "eod_checkpoint_max_diaries": 8,
+                "evidence_first_generation_enable": True, "raw_evidence_archive_enable": True,
+                "semantic_state_enable": True, "semantic_state_target_chars": 2200,
+                "semantic_state_auto_bootstrap": True, "semantic_state_replace_profile": True,
+                "lean_recall_enable": True, "lean_recall_candidate_k": 70,
+                "lean_event_index_enable": True, "lean_source_evidence_enable": True,
+                "lean_coverage_selection_enable": True,
+                "lean_adaptive_evidence_enable": True, "passage_vector_auto_migrate": True,
+                "source_turn_vector_auto_migrate": True,
+                "lean_temporal_enable": True, "lean_story_min_inject": 1,
+                "lean_story_max_inject": 8, "lean_story_normal_inject": 4,
+                "lean_relative_margin": 0.28, "lean_relative_margin_broad": 0.40,
+                "recall_safety_net_enable": True, "recall_safety_net_min_selected": 2,
+                "recall_safety_net_min_top_score": 0.62,
+                "inject_char_budget": 12000, "inject_compact_chars": 240,
+                "lean_texture_enable": False,
+                "episodic_evidence_per_memory": 4, "episodic_full_diary_limit": 2,
+                "recall_context_query_messages": 6, "recall_context_query_max_chars": 1800,
+                "min_similarity_to_inject": 0.50, "recall_injection_min_score": 0.60,
+                "recall_dedup_window": 4, "recall_rerank_enable": True,
+                "passage_index_enable": True, "passage_max_chars": 220,
+                "passage_overlap_chars": 90, "mixed_injection_enable": True,
+                "full_diary_top_n": 4, "passage_expand_chars": 160,
+                "profile_recent_persona_limit": 160, "profile_anchor_limit": 50,
+                "context_keep_recent_messages": 56, "context_min_messages_before_trim": 100,
+            },
+        },
+        "quality": {
+            "name": "效果优先",
+            "summary": "完整日记和高质量召回优先，适合稳定的日常角色扮演。",
+            "cost": "中高",
+            "values": {
+                "compress_every_n_turns": 20, "diary_count": 2, "compress_batch_max_messages": 40,
+                "eod_checkpoint_enable": True, "eod_checkpoint_min_turns": 1,
+                "eod_checkpoint_max_diaries": 6,
+                "evidence_first_generation_enable": True, "raw_evidence_archive_enable": True,
+                "semantic_state_enable": True, "semantic_state_target_chars": 1800,
+                "semantic_state_auto_bootstrap": True, "semantic_state_replace_profile": True,
+                "lean_recall_enable": True, "lean_recall_candidate_k": 60,
+                "lean_event_index_enable": True, "lean_source_evidence_enable": True,
+                "lean_coverage_selection_enable": True,
+                "lean_adaptive_evidence_enable": True, "passage_vector_auto_migrate": True,
+                "source_turn_vector_auto_migrate": True,
+                "lean_temporal_enable": True, "lean_story_min_inject": 1,
+                "lean_story_max_inject": 6, "lean_story_normal_inject": 3,
+                "lean_relative_margin": 0.24, "lean_relative_margin_broad": 0.34,
+                "recall_safety_net_enable": True, "recall_safety_net_min_selected": 2,
+                "recall_safety_net_min_top_score": 0.60,
+                "inject_char_budget": 10000, "inject_compact_chars": 200,
+                "lean_texture_enable": False,
+                "episodic_evidence_per_memory": 3, "episodic_full_diary_limit": 2,
+                "recall_context_query_messages": 4, "recall_context_query_max_chars": 1200,
+                "min_similarity_to_inject": 0.51, "recall_injection_min_score": 0.61,
+                "recall_dedup_window": 5, "recall_rerank_enable": True,
+                "passage_index_enable": True, "passage_max_chars": 250,
+                "passage_overlap_chars": 75, "mixed_injection_enable": True,
+                "full_diary_top_n": 3, "passage_expand_chars": 130,
+                "context_keep_recent_messages": 48, "context_min_messages_before_trim": 90,
+            },
+        },
+        "balanced": {
+            "name": "均衡推荐",
+            "summary": "效果、延迟和调用成本平衡，适合作为长期默认配置。",
+            "cost": "中等",
+            "values": {
+                "compress_every_n_turns": 24, "diary_count": 2, "compress_batch_max_messages": 48,
+                "eod_checkpoint_enable": True, "eod_checkpoint_min_turns": 1,
+                "eod_checkpoint_max_diaries": 5,
+                "evidence_first_generation_enable": True, "raw_evidence_archive_enable": True,
+                "semantic_state_enable": True, "semantic_state_target_chars": 1600,
+                "semantic_state_auto_bootstrap": True, "semantic_state_replace_profile": True,
+                "lean_recall_enable": True, "lean_recall_candidate_k": 50,
+                "lean_event_index_enable": True, "lean_source_evidence_enable": True,
+                "lean_coverage_selection_enable": True,
+                "lean_adaptive_evidence_enable": True, "passage_vector_auto_migrate": True,
+                "source_turn_vector_auto_migrate": True,
+                "lean_temporal_enable": True, "lean_story_min_inject": 1,
+                "lean_story_max_inject": 5, "lean_story_normal_inject": 3,
+                "lean_relative_margin": 0.24, "lean_relative_margin_broad": 0.34,
+                "recall_safety_net_enable": True, "recall_safety_net_min_selected": 2,
+                "recall_safety_net_min_top_score": 0.60,
+                "inject_char_budget": 8000, "inject_compact_chars": 180,
+                "lean_texture_enable": False,
+                "episodic_evidence_per_memory": 3, "episodic_full_diary_limit": 1,
+                "recall_context_query_messages": 3, "recall_context_query_max_chars": 900,
+                "min_similarity_to_inject": 0.52, "recall_injection_min_score": 0.62,
+                "recall_dedup_window": 6, "recall_rerank_enable": True,
+                "passage_index_enable": True, "passage_max_chars": 280,
+                "passage_overlap_chars": 60, "mixed_injection_enable": True,
+                "full_diary_top_n": 2, "passage_expand_chars": 100,
+                "context_keep_recent_messages": 40, "context_min_messages_before_trim": 80,
+            },
+        },
+        "economy": {
+            "name": "低成本",
+            "summary": "保留原文档案与滚动状态，缩小当前候选池并关闭 rerank。",
+            "cost": "较低",
+            "values": {
+                "compress_every_n_turns": 36, "diary_count": 2, "compress_batch_max_messages": 72,
+                "eod_checkpoint_enable": True, "eod_checkpoint_min_turns": 1,
+                "eod_checkpoint_max_diaries": 4,
+                "evidence_first_generation_enable": False, "raw_evidence_archive_enable": True,
+                "semantic_state_enable": True, "semantic_state_target_chars": 1200,
+                "semantic_state_auto_bootstrap": True, "semantic_state_replace_profile": True,
+                "lean_recall_enable": True, "lean_recall_candidate_k": 35,
+                "lean_event_index_enable": True, "lean_source_evidence_enable": True,
+                "lean_coverage_selection_enable": True,
+                "lean_adaptive_evidence_enable": True, "passage_vector_auto_migrate": True,
+                "source_turn_vector_auto_migrate": True,
+                "lean_temporal_enable": True, "lean_story_min_inject": 1,
+                "lean_story_max_inject": 3, "lean_story_normal_inject": 2,
+                "lean_relative_margin": 0.20, "lean_relative_margin_broad": 0.30,
+                "recall_safety_net_enable": True, "recall_safety_net_min_selected": 1,
+                "recall_safety_net_min_top_score": 0.55,
+                "inject_char_budget": 5000, "inject_compact_chars": 140,
+                "lean_texture_enable": False,
+                "episodic_evidence_per_memory": 2, "episodic_full_diary_limit": 1,
+                "recall_context_query_messages": 2, "recall_context_query_max_chars": 500,
+                "min_similarity_to_inject": 0.56, "recall_injection_min_score": 0.66,
+                "recall_dedup_window": 8, "recall_rerank_enable": False,
+                "passage_index_enable": True, "passage_max_chars": 320,
+                "passage_overlap_chars": 50, "mixed_injection_enable": True,
+                "full_diary_top_n": 1, "passage_expand_chars": 80,
+                "context_keep_recent_messages": 32, "context_min_messages_before_trim": 72,
+            },
+        },
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass  # suppress default stderr logging
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            for k, v in _cors_headers().items():
+                self.send_header(k, v)
+            self.end_headers()
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            path = parsed.path.rstrip("/") or "/"
+            qs = parse_qs(parsed.query)
+
+            if path == "/":
+                _html_response(self, dashboard_html)
+            elif path == "/console" or path == "/logs":
+                _html_response(self, console_html)
+            elif path == "/xinchao":
+                _html_response(self, xinchao_html)
+            elif path == "/api/status":
+                self._api_status()
+            elif path == "/api/stats":
+                self._api_stats()
+            elif path == "/api/passages/status":
+                self._api_passages_status()
+            elif path == "/api/episodic/status":
+                self._api_episodic_status()
+            elif path == "/api/episodic/memories":
+                self._api_episodic_memories(qs)
+            elif path.startswith("/api/episodic/detail/"):
+                self._api_episodic_detail(unquote(path[len("/api/episodic/detail/"):]))
+            elif path == "/api/state/status":
+                self._api_semantic_state_status()
+            elif path == "/api/eval/cases":
+                self._api_eval_cases()
+            elif path == "/api/settings":
+                self._api_settings()
+            elif path == "/api/memories":
+                self._api_memories(qs)
+            elif path == "/api/timeline":
+                self._api_timeline(qs)
+            elif path == "/api/month-route":
+                self._api_month_route(qs)
+            elif path == "/api/search":
+                self._api_search(qs)
+            elif path == "/api/eval":
+                self._api_eval(qs)
+            elif path == "/api/health":
+                self._api_health()
+            elif path == "/api/affiliate/status":
+                self._api_affiliate_status()
+            elif path == "/api/time-insight/status":
+                self._api_time_insight_status()
+            elif path == "/api/time-insight/settings":
+                self._api_time_insight_settings()
+            elif path == "/api/managed-memos/status":
+                self._api_managed_memos_status()
+            elif path == "/api/context/history":
+                self._api_context_history(qs)
+            elif path == "/api/context/backup":
+                self._api_context_backup(qs)
+            elif path == "/api/logs":
+                self._api_logs(qs)
+            elif path == "/api/console/logs":
+                self._api_console_logs()
+            elif path == "/api/console/stats":
+                self._api_console_stats()
+            elif path == "/api/xinchao/overview":
+                self._api_xinchao_overview(qs)
+            elif path == "/api/xinchao/state":
+                self._api_xinchao_state(qs)
+            elif path == "/api/xinchao/settings":
+                self._api_xinchao_settings()
+            elif path.startswith("/api/memo/"):
+                self._api_memo_detail(unquote(path[len("/api/memo/"):]))
+            elif path == "/api/test/llm":
+                self._api_test_llm()
+            elif path == "/api/test/emb":
+                self._api_test_emb()
+            elif path == "/api/test/rerank":
+                self._api_test_rerank()
+            elif path == "/api/graph":
+                self._api_graph()
+            elif path == "/api/graph/clusters":
+                self._api_graph_clusters()
+            elif path == "/api/graph/rebuild":
+                self._api_graph_rebuild()
+            elif path == "/api/graph/related":
+                self._api_graph_related(qs)
+            elif path == "/api/feedback":
+                self._api_feedback()
+            elif path == "/api/keywords":
+                self._api_keywords()
+            elif path == "/api/debug":
+                self._api_debug()
+            else:
+                _json_response(self, 404, {"ok": False, "error": "Not found"})
+
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            path = parsed.path.rstrip("/") or "/"
+            allowed = {
+                "/api/settings/save", "/api/settings/preset",
+                "/api/feedback/apply",
+                "/api/episodic/rebuild",
+                "/api/state/rebuild", "/api/eval/case", "/api/eval/run",
+                "/api/xinchao/settings/save", "/api/xinchao/settle",
+                "/api/xinchao/feedback", "/api/xinchao/thought",
+                "/api/xinchao/simulate", "/api/xinchao/reset",
+                "/api/time-insight/settings/save", "/api/time-insight/update",
+                "/api/time-insight/preview",
+            }
+            if path not in allowed:
+                return _json_response(self, 404, {"ok": False, "error": "Not found"})
+            if not self._same_origin_write_allowed():
+                return self._json_err("跨来源写入已拒绝", 403)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                if length <= 0 or length > 1024 * 1024:
+                    return self._json_err("请求体为空或过大", 400)
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                if not isinstance(body, dict):
+                    return self._json_err("请求格式错误", 400)
+                if path == "/api/settings/save":
+                    self._api_settings_save(body)
+                elif path == "/api/settings/preset":
+                    self._api_settings_preset(body)
+                elif path == "/api/feedback/apply":
+                    self._api_feedback_apply(body)
+                elif path == "/api/episodic/rebuild":
+                    self._api_episodic_rebuild()
+                elif path == "/api/state/rebuild":
+                    self._api_semantic_state_rebuild()
+                elif path == "/api/eval/case":
+                    self._api_eval_case_save(body)
+                elif path == "/api/eval/run":
+                    self._api_eval_run(body)
+                elif path.startswith("/api/time-insight/"):
+                    self._api_time_insight_write(path, body)
+                else:
+                    self._api_xinchao_write(path, body)
+            except json.JSONDecodeError:
+                self._json_err("JSON 格式错误", 400)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _same_origin_write_allowed(self) -> bool:
+            origin = str(self.headers.get("Origin") or "").strip()
+            if not origin:
+                return True
+            try:
+                parsed = urlparse(origin)
+                return parsed.scheme in {"http", "https"} and parsed.netloc == str(self.headers.get("Host") or "")
+            except Exception:
+                return False
+
+        def do_DELETE(self):
+            parsed = urlparse(self.path)
+            path = parsed.path.rstrip("/") or "/"
+            if path == "/api/console/logs":
+                plugin._log_events.clear()
+                if hasattr(plugin, "_save_runtime_telemetry"):
+                    plugin._telemetry_dirty = True
+                    plugin._save_runtime_telemetry(force=True)
+                self._json_ok({"cleared": True})
+            elif path == "/api/logs":
+                plugin._log_events.clear()
+                if hasattr(plugin, "_save_runtime_telemetry"):
+                    plugin._telemetry_dirty = True
+                    plugin._save_runtime_telemetry(force=True)
+                self._json_ok({"cleared": True})
+            elif path.startswith("/api/feedback/"):
+                if not self._same_origin_write_allowed():
+                    return self._json_err("跨来源写入已拒绝", 403)
+                try:
+                    event_id = int(path[len("/api/feedback/"):])
+                    vec = getattr(plugin, "_vec", None)
+                    if vec is None:
+                        return self._json_err("vec not ready", 503)
+                    self._json_ok({"deleted": vec.feedback_event_delete(event_id)})
+                except Exception as e:
+                    self._json_err(str(e), 400)
+            elif path.startswith("/api/eval/case/"):
+                if not self._same_origin_write_allowed():
+                    return self._json_err("跨来源写入已拒绝", 403)
+                try:
+                    store = getattr(plugin, "_episodes", None)
+                    if store is None:
+                        return self._json_err("情景记忆库未就绪", 503)
+                    case_id = unquote(path[len("/api/eval/case/"):])
+                    self._json_ok({"deleted": store.delete_eval_case(case_id)})
+                except Exception as e:
+                    self._json_err(str(e), 400)
+            else:
+                _json_response(self, 404, {"ok": False, "error": "Not found"})
+
+        def _json_ok(self, data):
+            """Wrap response as {ok: true, data: ...} to match dashboard/console JS."""
+            _json_response(self, 200, {"ok": True, "data": data})
+
+        def _json_err(self, msg, code=500):
+            _json_response(self, code, {"ok": False, "error": msg})
+
+        def _api_status(self):
+            try:
+                plg = plugin
+                vec = getattr(plg, "_vec", None)
+                passage_stats = vec.passage_index_stats() if vec is not None else {}
+                episodes = getattr(plg, "_episodes", None)
+                episode_stats = episodes.stats() if episodes is not None else {}
+                session_times = list((getattr(plg, "_session_time", {}) or {}).values())
+                latest_time = max(
+                    (item for item in session_times if isinstance(item, dict)),
+                    key=lambda item: float(item.get("snapshot_ts") or item.get("ts") or 0.0),
+                    default={},
+                )
+                xinchao_settings = getattr(getattr(plg, "_xinchao", None), "settings", {}) or {}
+                data = {
+                    "plugin_version": getattr(plg, "_PLUGIN_VERSION", "?"),
+                    "init_ok": getattr(plg, "_initialized", False),
+                    "init_error": getattr(plg, "_init_error", ""),
+                    "character": getattr(plg, "character_name", "") or "(unset)",
+                    "memos_url": getattr(plg, "memos_base_url", ""),
+                    "memos_mode": getattr(plg, "memos_mode", "external"),
+                    "memos_diag": self._memos_diag(),
+                    "managed_memos": plg._managed_memos.as_dict() if hasattr(plg, "_managed_memos") else {"mode": "external"},
+                    "emb_provider_name": getattr(plg, "_emb_model_id", "") or "(unset)",
+                    "emb_cache_used": len(getattr(plg, "_emb_cache", {})),
+                    "emb_cache_size": getattr(plg, "emb_cache_size", 0),
+                    "compress_count": getattr(plg, "_compress_count", 0),
+                    "eod_checkpoint": {
+                        "enabled": bool(getattr(plg, "eod_checkpoint_enable", False)),
+                        "schedule": "23:45",
+                        "min_turns": int(getattr(plg, "eod_checkpoint_min_turns", 1) or 1),
+                        "max_diaries": int(getattr(plg, "eod_checkpoint_max_diaries", 6) or 6),
+                        "last": dict(getattr(plg, "_eod_last_status", {}) or {}),
+                    },
+                    "reconcile_total_deleted": getattr(plg, "_reconcile_stats", {}).get("deleted", 0),
+                    "last_reconcile_ts": getattr(plg, "_last_reconcile_ts", 0),
+                    "rerank_provider": getattr(plg, "rerank_provider_id", "") or "(off)",
+                    "rerank_active": getattr(plg, "_rerank_provider", None) is not None,
+                    "rp_enhancer_enable": getattr(plg, "rp_enhancer_enable", False),
+                    "rp_inject_max_chars": getattr(plg, "rp_inject_max_chars", 0),
+                    "rp_last_stats": list(getattr(plg, "_rp_stats", {}).values())[-5:],
+                    "context_governance_enable": getattr(plg, "context_governance_enable", False),
+                    "context_exclude_command_turns": getattr(plg, "context_exclude_command_turns", True),
+                    "context_archive_enable": getattr(plg, "context_archive_enable", False),
+                    "context_stats": getattr(plg, "_context_stats", {}),
+                    "recall_architecture": {
+                        "active": (
+                            "lean_full_memory_fusion" if (
+                                episode_stats.get("episodes")
+                                and getattr(plg, "_episode_migration_ready", False)
+                                and getattr(plg, "lean_recall_enable", False)
+                            ) else ("episodic_cascade" if (
+                                episode_stats.get("episodes") and getattr(plg, "_episode_migration_ready", False)
+                            ) else "legacy_hybrid")
+                        ),
+                        "episodic_enabled": bool(getattr(plg, "episodic_memory_enable", False)),
+                        "episodic_ready": bool(
+                            episode_stats.get("episodes") and getattr(plg, "_episode_migration_ready", False)
+                        ),
+                        "lean_enabled": bool(getattr(plg, "lean_recall_enable", False)),
+                        "event_index": bool(getattr(plg, "lean_event_index_enable", False)),
+                        "source_evidence": bool(getattr(plg, "lean_source_evidence_enable", False)),
+                        "coverage_selection": bool(getattr(plg, "lean_coverage_selection_enable", False)),
+                        "adaptive_evidence": bool(getattr(plg, "lean_adaptive_evidence_enable", False)),
+                        "candidate_k": int(getattr(plg, "lean_recall_candidate_k", 0) or 0),
+                        "story_min": int(getattr(plg, "lean_story_min_inject", 0) or 0),
+                        "story_max": int(getattr(plg, "lean_story_max_inject", 0) or 0),
+                        "story_normal": int(getattr(plg, "lean_story_normal_inject", 0) or 0),
+                        "relative_margin": float(getattr(plg, "lean_relative_margin", 0.24) or 0.24),
+                        "relative_margin_broad": float(getattr(plg, "lean_relative_margin_broad", 0.34) or 0.34),
+                        "safety_net": bool(getattr(plg, "recall_safety_net_enable", False)),
+                        "safety_net_min_selected": int(getattr(plg, "recall_safety_net_min_selected", 0) or 0),
+                        "safety_net_min_top_score": float(getattr(plg, "recall_safety_net_min_top_score", 0.0) or 0.0),
+                        "inject_char_budget": int(getattr(plg, "inject_char_budget", 0) or 0),
+                        "inject_compact_chars": int(getattr(plg, "inject_compact_chars", 0) or 0),
+                        "temporal_on_demand": bool(getattr(plg, "lean_temporal_enable", False)),
+                        "multi_query": False if getattr(plg, "lean_recall_enable", False) else bool(getattr(plg, "recall_multi_query_enable", False)),
+                        "month_route": False if getattr(plg, "lean_recall_enable", False) else bool(getattr(plg, "recall_month_route_enable", False)),
+                        "month_route_parallel": False,
+                        "month_route_separate_quota": False,
+                        "month_route_inject_max": int(getattr(plg, "recall_month_route_inject_max", 0) or 0),
+                        "information_gain": False if getattr(plg, "lean_recall_enable", False) else bool(getattr(plg, "recall_information_gain_enable", False)),
+                        "necessary_can_exceed_max": False if getattr(plg, "lean_recall_enable", False) else bool(getattr(plg, "recall_necessary_can_exceed_max", False)),
+                        "necessary_hard_cap": int(getattr(plg, "recall_necessary_hard_cap", 0) or 0),
+                        "passage_index": bool(getattr(plg, "passage_index_enable", False)),
+                        "mixed_injection": bool(getattr(plg, "mixed_injection_enable", False)),
+                    },
+                    "passage_stats": passage_stats,
+                    "episodic_stats": episode_stats,
+                    "episodic_migration": dict(getattr(plg, "_episode_migration_state", {}) or {}),
+                    "passage_vector_migration": dict(getattr(plg, "_passage_vector_migration_state", {}) or {}),
+                    "profile": plugin._affiliate_profile_status() if hasattr(plugin, "_affiliate_profile_status") else {"enabled": False, "connected": False},
+                    "semantic_state": plugin._semantic_state_status() if hasattr(plugin, "_semantic_state_status") else {"enabled": False, "ready": False},
+                    "time_insight": plugin._time_insight_status() if hasattr(plugin, "_time_insight_status") else {"enabled": False, "connected": False},
+                    "time_model": {
+                        "request_snapshot": True,
+                        "current_timezone": getattr(plg, "rp_time_timezone", "Asia/Shanghai"),
+                        "body_timezone": xinchao_settings.get(
+                            "time_zone", getattr(plg, "rp_time_timezone", "Asia/Shanghai")
+                        ) if isinstance(xinchao_settings, dict) else getattr(plg, "rp_time_timezone", "Asia/Shanghai"),
+                        "solar_date": latest_time.get("solar_date", ""),
+                        "period": latest_time.get("period", ""),
+                        "snapshot_ts": float(latest_time.get("snapshot_ts") or latest_time.get("ts") or 0.0),
+                    },
+                    "last_reconcile_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(getattr(plg, "_last_reconcile_ts", 0)))
+                        if getattr(plg, "_last_reconcile_ts", 0) else "\u2014",
+                }
+                self._json_ok(data)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_passages_status(self):
+            try:
+                plg = plugin
+                vec = getattr(plg, "_vec", None)
+                stats = vec.passage_index_stats() if vec is not None else {
+                    "memos": 0, "passages": 0, "traced_passages": 0,
+                    "traced_memos": 0, "multi_passage_memos": 0, "machine_meta_memos": 0,
+                }
+                stats.update({
+                    "enabled": bool(getattr(plg, "passage_index_enable", False)),
+                    "mixed_injection": bool(getattr(plg, "mixed_injection_enable", False)),
+                    "passage_max_chars": int(getattr(plg, "passage_max_chars", 0) or 0),
+                    "passage_overlap_chars": int(getattr(plg, "passage_overlap_chars", 0) or 0),
+                    "full_diary_top_n": int(getattr(plg, "full_diary_top_n", 0) or 0),
+                    "passage_expand_chars": int(getattr(plg, "passage_expand_chars", 0) or 0),
+                    "vector_strategy": vec.get_meta_value("passage_embedding_strategy") if vec is not None else "",
+                    "vector_migration": dict(getattr(plg, "_passage_vector_migration_state", {}) or {}),
+                    "rebuild_command": "/memos-passage-rebuild",
+                    "note": "重建只更新本地派生索引，不改写 Memos 日记、查询反馈或画像。",
+                })
+                self._json_ok(stats)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_episodic_status(self):
+            try:
+                store = getattr(plugin, "_episodes", None)
+                if store is None:
+                    return self._json_ok({
+                        "enabled": bool(getattr(plugin, "episodic_memory_enable", False)),
+                        "ready": False,
+                        "episodes": 0,
+                        "rebuild_command": "/memos-episodic-rebuild",
+                    })
+                data = store.stats()
+                data.update({
+                    "enabled": bool(getattr(plugin, "episodic_memory_enable", False)),
+                    "ready": True,
+                    "migration_ready": bool(getattr(plugin, "_episode_migration_ready", False)),
+                    "migration": dict(getattr(plugin, "_episode_migration_state", {}) or {}),
+                    "evidence_first_generation": bool(getattr(plugin, "evidence_first_generation_enable", False)),
+                    "raw_evidence_archive": bool(getattr(plugin, "raw_evidence_archive_enable", False)),
+                    "active_architecture": "lean_full_memory_fusion" if (
+                        getattr(plugin, "lean_recall_enable", False)
+                        and getattr(plugin, "_episode_migration_ready", False)
+                        and int(data.get("episodes") or 0) > 0
+                    ) else "episodic_cascade",
+                    "lean_candidate_k": int(getattr(plugin, "lean_recall_candidate_k", 0) or 0),
+                    "lean_event_index": bool(getattr(plugin, "lean_event_index_enable", False)),
+                    "lean_source_evidence": bool(getattr(plugin, "lean_source_evidence_enable", False)),
+                    "lean_coverage_selection": bool(getattr(plugin, "lean_coverage_selection_enable", False)),
+                    "lean_adaptive_evidence": bool(getattr(plugin, "lean_adaptive_evidence_enable", False)),
+                    "passage_vector_migration": dict(getattr(plugin, "_passage_vector_migration_state", {}) or {}),
+                    "source_turn_vector_migration": dict(getattr(plugin, "_source_turn_vector_migration_state", {}) or {}),
+                    "lean_story_min": int(getattr(plugin, "lean_story_min_inject", 0) or 0),
+                    "lean_story_max": int(getattr(plugin, "lean_story_max_inject", 0) or 0),
+                    "lean_temporal": bool(getattr(plugin, "lean_temporal_enable", False)),
+                    "lean_texture": bool(getattr(plugin, "lean_texture_enable", False)),
+                    "candidate_pool": int(getattr(plugin, "episodic_candidate_pool", 0) or 0),
+                    "default_inject": int(getattr(plugin, "episodic_default_inject", 0) or 0),
+                    "narrative_inject": int(getattr(plugin, "episodic_narrative_inject", 0) or 0),
+                    "full_diary_limit": int(getattr(plugin, "episodic_full_diary_limit", 0) or 0),
+                    "rebuild_command": "/memos-episodic-rebuild",
+                    "recent_batches": store.batch_status(12),
+                })
+                self._json_ok(data)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_episodic_memories(self, qs):
+            try:
+                store = getattr(plugin, "_episodes", None)
+                if store is None:
+                    return self._json_ok({"items": [], "total": 0})
+                query = str(qs.get("q", [""])[0]).strip()
+                quality = str(qs.get("quality", [""])[0]).strip()
+                limit = max(1, min(500, int(qs.get("limit", ["120"])[0] or 120)))
+                items = store.list_episodes(query=query, quality=quality, limit=limit)
+                self._json_ok({"items": items, "total": len(items), "query": query, "quality": quality})
+            except (TypeError, ValueError) as e:
+                self._json_err(str(e), 400)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_episodic_detail(self, memo_name: str):
+            try:
+                store = getattr(plugin, "_episodes", None)
+                if store is None:
+                    return self._json_err("情景记忆库未就绪", 503)
+                detail = store.episode_detail(memo_name)
+                if not detail:
+                    return self._json_err("未找到情景记忆", 404)
+                self._json_ok(detail)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_episodic_rebuild(self):
+            try:
+                if getattr(plugin, "_episodes", None) is None:
+                    return self._json_err("情景记忆库未就绪", 503)
+                result = self._run_plugin_coro(
+                    plugin._rebuild_episodic_from_memos(force=True),
+                    timeout=600,
+                )
+                self._json_ok(result)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_semantic_state_status(self):
+            try:
+                if not hasattr(plugin, "_semantic_state_status"):
+                    return self._json_err("滚动状态功能不可用", 503)
+                self._json_ok(plugin._semantic_state_status(include_history=True))
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_semantic_state_rebuild(self):
+            try:
+                if getattr(plugin, "_episodes", None) is None:
+                    return self._json_err("情景记忆库未就绪", 503)
+                result = self._run_plugin_coro(plugin._bootstrap_semantic_state(force=True), timeout=600)
+                self._json_ok(result)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_eval_cases(self):
+            try:
+                store = getattr(plugin, "_episodes", None)
+                if store is None:
+                    return self._json_ok({"items": [], "total": 0})
+                items = store.list_eval_cases(enabled_only=False, limit=500)
+                self._json_ok({"items": items, "total": len(items)})
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_eval_case_save(self, body: dict[str, Any]):
+            try:
+                store = getattr(plugin, "_episodes", None)
+                if store is None:
+                    return self._json_err("情景记忆库未就绪", 503)
+                result = store.upsert_eval_case(
+                    str(body.get("query") or ""),
+                    body.get("expected_memos") if isinstance(body.get("expected_memos"), list) else [],
+                    case_id=str(body.get("case_id") or ""),
+                    note=str(body.get("note") or ""),
+                    source=str(body.get("source") or "webui"),
+                    enabled=bool(body.get("enabled", True)),
+                )
+                self._json_ok(result)
+            except ValueError as e:
+                self._json_err(str(e), 400)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_eval_run(self, body: dict[str, Any]):
+            try:
+                modes = body.get("modes") if isinstance(body.get("modes"), list) else None
+                limit = max(1, min(200, int(body.get("case_limit") or 80)))
+                result = self._run_plugin_coro(
+                    plugin._run_recall_ablation(modes, case_limit=limit),
+                    timeout=max(600, limit * 30),
+                )
+                self._json_ok(result)
+            except ValueError as e:
+                self._json_err(str(e), 400)
+            except Exception as e:
+                self._json_err(str(e))
+
+        @staticmethod
+        def _settings_schema() -> dict[str, Any]:
+            schema = getattr(getattr(plugin, "config", None), "schema", None)
+            if isinstance(schema, dict) and schema:
+                return schema
+            try:
+                data = json.loads((Path(__file__).resolve().parent / "_conf_schema.json").read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
+
+        @staticmethod
+        def _is_sensitive_setting(key: str) -> bool:
+            lowered = str(key or "").lower()
+            return any(word in lowered for word in ("token", "password", "secret", "api_key"))
+
+        @staticmethod
+        def _setting_group(key: str) -> str:
+            for group, keys in setting_groups.items():
+                if key in keys:
+                    return group
+            if key.startswith("rp_"):
+                return "角色增强"
+            if key.startswith("cache_"):
+                return "缓存诊断"
+            if key.startswith(("retry_", "webui_", "reconcile_", "enable_auto_reconcile")) or key in {
+                "emb_cache_size", "recall_embed_timeout", "recall_search_timeout", "rerank_timeout",
+            }:
+                return "运行与维护"
+            return "运行与维护"
+
+        @staticmethod
+        def _setting_options(key: str) -> list[dict[str, str]]:
+            choices = {
+                "memos_mode": [("external", "外部服务"), ("managed", "插件托管")],
+                "inject_order": [("relevance", "相关性"), ("story_time", "事件时间"), ("insert_time", "写入时间")],
+                "inject_format": [("diary", "完整日记"), ("summary", "摘要"), ("quote", "引用")],
+                "bm25_tokenizer": [("jieba", "jieba"), ("bigram", "字符 bigram")],
+            }
+            return [{"value": value, "label": label} for value, label in choices.get(key, [])]
+
+        def _api_settings(self):
+            try:
+                schema = self._settings_schema()
+                config = getattr(plugin, "config", {})
+                items = []
+                for key, meta in schema.items():
+                    if not isinstance(meta, dict):
+                        continue
+                    if key in time_insight_setting_keys or key == "time_insight_max_age_days":
+                        continue
+                    sensitive = self._is_sensitive_setting(key)
+                    current = config.get(key, meta.get("default")) if hasattr(config, "get") else meta.get("default")
+                    items.append({
+                        "key": key,
+                        "type": meta.get("type", "string"),
+                        "description": meta.get("description", key),
+                        "hint": meta.get("hint", ""),
+                        "default": "" if sensitive else meta.get("default"),
+                        "value": "" if sensitive else current,
+                        "configured": bool(current) if sensitive else True,
+                        "sensitive": sensitive,
+                        "group": self._setting_group(key),
+                        "options": self._setting_options(key),
+                        "min": meta.get("min"),
+                        "max": meta.get("max"),
+                        "step": meta.get("step"),
+                    })
+                presets = [dict({"id": preset_id}, **definition) for preset_id, definition in preset_definitions.items()]
+                self._json_ok({
+                    "items": items,
+                    "groups": list(setting_groups.keys()),
+                    "presets": presets,
+                    "count": len(items),
+                    "save_supported": hasattr(config, "save_config"),
+                    "notice": "连接、Provider、路径、端口及后台周期类设置保存后需重载插件；其他参数会立即热应用。",
+                })
+            except Exception as e:
+                self._json_err(str(e))
+
+        @staticmethod
+        def _coerce_setting(key: str, raw: Any, meta: dict[str, Any]) -> Any:
+            kind = str(meta.get("type") or "string")
+            if kind == "bool":
+                if isinstance(raw, bool):
+                    return raw
+                if isinstance(raw, str) and raw.strip().lower() in {"true", "1", "yes", "on"}:
+                    return True
+                if isinstance(raw, str) and raw.strip().lower() in {"false", "0", "no", "off"}:
+                    return False
+                raise ValueError(f"{key} 必须是布尔值")
+            if kind == "int":
+                if isinstance(raw, bool):
+                    raise ValueError(f"{key} 必须是整数")
+                value = int(raw)
+            elif kind == "float":
+                if isinstance(raw, bool):
+                    raise ValueError(f"{key} 必须是数字")
+                value = float(raw)
+            else:
+                value = str(raw if raw is not None else "").strip()
+                if len(value) > 20000:
+                    raise ValueError(f"{key} 内容过长")
+                return value
+            if meta.get("min") is not None and value < meta["min"]:
+                raise ValueError(f"{key} 不能小于 {meta['min']}")
+            if meta.get("max") is not None and value > meta["max"]:
+                raise ValueError(f"{key} 不能大于 {meta['max']}")
+            return value
+
+        def _save_settings_values(self, incoming: dict[str, Any], source: str) -> dict[str, Any]:
+            if not isinstance(incoming, dict) or not incoming:
+                raise ValueError("没有需要保存的设置")
+            schema = self._settings_schema()
+            config = getattr(plugin, "config", None)
+            if config is None or not hasattr(config, "get"):
+                raise RuntimeError("插件配置对象不可用")
+            unknown = sorted(set(incoming) - set(schema))
+            if unknown:
+                raise ValueError("未知设置: " + ", ".join(unknown[:8]))
+            changes: dict[str, dict[str, Any]] = {}
+            coerced: dict[str, Any] = {}
+            for key, raw in incoming.items():
+                if self._is_sensitive_setting(key):
+                    if raw == "__CLEAR__":
+                        raw = ""
+                    elif raw is None or str(raw).strip() == "":
+                        continue
+                value = self._coerce_setting(key, raw, schema[key])
+                old = config.get(key, schema[key].get("default"))
+                if old != value:
+                    coerced[key] = value
+                    changes[key] = {
+                        "old": "已配置" if self._is_sensitive_setting(key) and old else ("未配置" if self._is_sensitive_setting(key) else old),
+                        "new": "已配置" if self._is_sensitive_setting(key) and value else ("未配置" if self._is_sensitive_setting(key) else value),
+                    }
+            if not changes:
+                return {"changed": {}, "restart_required": [], "hot_applied": [], "source": source}
+
+            restart_exact = {
+                "memos_base_url", "memos_mode", "memos_token", "memos_timeout", "vec_db_path",
+                "episodic_db_path", "episodic_memory_enable", "episodic_auto_migrate",
+                "passage_vector_auto_migrate", "source_turn_vector_auto_migrate",
+                "emb_provider_id", "rerank_provider_id", "profile_provider_id", "rp_time_timezone",
+                "webui_enable", "webui_host", "webui_port", "enable_auto_reconcile",
+                "reconcile_interval", "profile_auto_update_days", "context_archive_interval_days",
+            }
+            restart_prefixes = ("managed_memos_",)
+            restart_required = sorted(
+                key for key in changes
+                if key in restart_exact or key.startswith(restart_prefixes)
+            )
+            hot_applied = []
+            with settings_lock:
+                save = getattr(config, "save_config", None)
+                if not callable(save):
+                    raise RuntimeError("当前配置对象不支持持久化；请从 AstrBot 正常加载插件后再保存")
+                previous = {key: config.get(key, schema[key].get("default")) for key in coerced}
+                try:
+                    for key, value in coerced.items():
+                        config[key] = value
+                    save()
+                except Exception:
+                    for key, value in previous.items():
+                        config[key] = value
+                    raise
+                for key, value in coerced.items():
+                    if key not in restart_required and hasattr(plugin, key):
+                        setattr(plugin, key, value)
+                        hot_applied.append(key)
+                if "emb_cache_size" in hot_applied:
+                    while len(getattr(plugin, "_emb_cache", {})) > max(0, int(plugin.emb_cache_size)):
+                        plugin._emb_cache.popitem(last=False)
+            if hasattr(plugin, "_log_event"):
+                plugin._log_event("system", f"WebUI 设置已保存: {len(changes)}项", {
+                    "source": source, "hot_applied": hot_applied, "restart_required": restart_required,
+                })
+            return {
+                "changed": changes, "changed_count": len(changes), "source": source,
+                "hot_applied": hot_applied, "restart_required": restart_required,
+                "message": "设置已持久化" + ("；部分设置需重载插件" if restart_required else "并已热应用"),
+            }
+
+        def _api_settings_save(self, body: dict[str, Any]):
+            values = body.get("values")
+            if not isinstance(values, dict):
+                return self._json_err("缺少 values", 400)
+            try:
+                self._json_ok(self._save_settings_values(values, "manual"))
+            except ValueError as e:
+                self._json_err(str(e), 400)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_settings_preset(self, body: dict[str, Any]):
+            preset_id = str(body.get("preset") or "").strip()
+            preset = preset_definitions.get(preset_id)
+            if not preset:
+                return self._json_err("未知预设", 400)
+            try:
+                result = self._save_settings_values(dict(preset["values"]), f"preset:{preset_id}")
+                result["preset"] = {"id": preset_id, "name": preset["name"]}
+                self._json_ok(result)
+            except ValueError as e:
+                self._json_err(str(e), 400)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _get_webui_db(self):
+            """Get a fresh SQLite connection for WebUI thread (avoids cross-thread issue)."""
+            import sqlite3
+            db_path = getattr(plugin, "vec_db_path", "")
+            if not db_path:
+                return None
+            conn = sqlite3.connect(db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            return conn
+
+        def _api_stats(self):
+            try:
+                vec = getattr(plugin, "_vec", None)
+                if vec is None:
+                    return self._json_err("vec not ready", 503)
+                # Use own connection to avoid thread issue
+                conn = self._get_webui_db()
+                if conn is None:
+                    return self._json_err("db not available", 503)
+                items = []
+                total = 0
+                try:
+                    total = conn.execute("SELECT COUNT(DISTINCT memo_name) AS n FROM chunks").fetchone()["n"]
+                    cur = conn.execute(
+                        """SELECT memo_name, MAX(ts_text) AS ts_text, MAX(importance) AS importance,
+                                  MAX(occurred_at) AS occurred_at, MAX(event_ts) AS event_ts,
+                                  MAX(time_basis) AS time_basis,
+                                  MAX(source_created_ts) AS source_created_ts, MAX(created_ts) AS created_ts,
+                                  MAX(tags) AS tags
+                           FROM chunks GROUP BY memo_name
+                           ORDER BY COALESCE(NULLIF(MAX(event_ts),0), NULLIF(MAX(source_created_ts),0), MAX(created_ts)) DESC
+                           LIMIT 10000""")
+                    for r in cur:
+                        items.append({
+                            "importance": int(r["importance"] or 3),
+                            "created_ts": float(r["created_ts"] or 0),
+                            "occurred_at": str(r["occurred_at"] or ""),
+                            "event_ts": float(r["event_ts"] or 0),
+                            "source_created_ts": float(r["source_created_ts"] or 0),
+                            "time_basis": r["time_basis"] or "unknown",
+                        })
+                finally:
+                    conn.close()
+                imp_dist = {}
+                month_dist = {}
+                for it in items:
+                    imp = it.get("importance", 3)
+                    imp_dist[imp] = imp_dist.get(imp, 0) + 1
+                    occurred_at = str(it.get("occurred_at") or "")
+                    if len(occurred_at) >= 7 and occurred_at[4:5] == "-":
+                        m = occurred_at[:7]
+                        month_dist[m] = month_dist.get(m, 0) + 1
+                    else:
+                        ts = it.get("event_ts") or it.get("source_created_ts") or it.get("created_ts", 0)
+                        if not ts:
+                            continue
+                        m = time.strftime("%Y-%m", time.localtime(ts))
+                        month_dist[m] = month_dist.get(m, 0) + 1
+                data = {
+                    "memories_total": total,
+                    "importance_dist": [{"k": str(k), "v": v} for k, v in sorted(imp_dist.items())],
+                    "by_month": [{"k": k, "v": v} for k, v in sorted(month_dist.items())],
+                    "time_quality": {
+                        "exact_or_explicit": sum(1 for x in items if (x.get("event_ts") or x.get("occurred_at")) and x.get("time_basis") in {"explicit", "explicit_dialogue", "conversation_now"}),
+                        "inferred": sum(1 for x in items if (x.get("event_ts") or x.get("occurred_at")) and "inferred" in str(x.get("time_basis") or "")),
+                        "unknown": sum(1 for x in items if not x.get("event_ts") and not x.get("occurred_at")),
+                    },
+                }
+                self._json_ok(data)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_memories(self, qs):
+            try:
+                vec = getattr(plugin, "_vec", None)
+                if vec is None:
+                    return self._json_err("vec not ready", 503)
+                limit = min(int(qs.get("limit", ["200"])[0]), 10000)
+                offset = int(qs.get("offset", ["0"])[0])
+                conn = self._get_webui_db()
+                if conn is None:
+                    return self._json_err("db not available", 503)
+                try:
+                    cur = conn.execute(
+                        """SELECT memo_name, MAX(ts_text) AS ts_text, MAX(occurred_at) AS occurred_at,
+                                  MAX(event_ts) AS event_ts, MAX(time_basis) AS time_basis,
+                                  MAX(source_created_ts) AS source_created_ts, MAX(source_updated_ts) AS source_updated_ts,
+                                  MAX(indexed_ts) AS indexed_ts, MAX(importance) AS importance,
+                                  MAX(created_ts) AS created_ts, MAX(manual) AS manual,
+                                  MAX(tags) AS tags, MAX(memory_type) AS memory_type,
+                                  MAX(long_effect) AS long_effect, MAX(trigger_hint) AS trigger_hint,
+                                  MIN(chunk_text) AS chunk_text
+                           FROM chunks GROUP BY memo_name
+                           ORDER BY COALESCE(NULLIF(MAX(event_ts),0), NULLIF(MAX(source_created_ts),0), MAX(created_ts)) DESC
+                           LIMIT ? OFFSET ?""",
+                        (limit, offset))
+                    items = []
+                    for r in cur:
+                        tags_raw = r["tags"] or ""
+                        tags = [t for t in tags_raw.split(",") if t.strip()] if tags_raw else []
+                        items.append({
+                            "memo_name": r["memo_name"],
+                            "ts_text": r["ts_text"] or "",
+                            "occurred_at": r["occurred_at"] or "",
+                            "event_ts": float(r["event_ts"] or 0),
+                            "time_basis": r["time_basis"] or "unknown",
+                            "source_created_ts": float(r["source_created_ts"] or 0),
+                            "source_updated_ts": float(r["source_updated_ts"] or 0),
+                            "indexed_ts": float(r["indexed_ts"] or 0),
+                            "importance": int(r["importance"] or 3),
+                            "tags": ",".join(tags),
+                            "memory_type": r["memory_type"] or "plot_fact",
+                            "long_effect": r["long_effect"] or "",
+                            "trigger_hint": r["trigger_hint"] or "",
+                            "preview": (r["chunk_text"] or "")[:120],
+                            "chunk_text": r["chunk_text"] or "",
+                        })
+                    total = conn.execute("SELECT COUNT(DISTINCT memo_name) AS n FROM chunks").fetchone()["n"]
+                finally:
+                    conn.close()
+                self._json_ok({"total": total, "items": items})
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_memo_detail(self, memo_name):
+            try:
+                if not memo_name:
+                    return self._json_err("missing memo_name", 400)
+                memos = getattr(plugin, "_memos", None)
+                ts_text = "unknown"
+                importance = 3
+                tags = []
+                full_text = ""
+                memory_type = "plot_fact"
+                long_effect = ""
+                trigger_hint = ""
+                occurred_at = ""
+                event_ts = 0.0
+                time_basis = "unknown"
+                source_created_ts = 0.0
+                source_updated_ts = 0.0
+                indexed_ts = 0.0
+                passages = []
+                scene_anchor = ""
+                retrieval_key = ""
+                state_change = ""
+                entities = ""
+
+                # Try memos API first
+                if memos is not None and memo_name.startswith("memos/"):
+                    try:
+                        memo = self._run_plugin_coro(memos.get_memo(memo_name), timeout=30)
+                        if memo:
+                            raw = _strip_internal_metadata((memo.get("content") or "").strip())
+                            lines = raw.split("\n")
+                            if lines:
+                                ts_text = lines[0].strip()
+                                body_lines = []
+                                for ln in lines[1:]:
+                                    stripped = ln.strip()
+                                    if stripped.startswith("#"):
+                                        continue
+                                    if stripped.startswith(("长期影响:", "长期影响：")):
+                                        long_effect = stripped.split(":", 1)[-1] if ":" in stripped else stripped.split("：", 1)[-1]
+                                        continue
+                                    if stripped.startswith(("触发线索:", "触发线索：")):
+                                        trigger_hint = stripped.split(":", 1)[-1] if ":" in stripped else stripped.split("：", 1)[-1]
+                                        continue
+                                    body_lines.append(ln)
+                                full_text = "\n".join(body_lines).strip()
+                    except Exception:
+                        pass
+
+                # Local DB owns normalized temporal metadata even when full text came from Memos.
+                conn = self._get_webui_db()
+                if conn is not None:
+                    try:
+                        cur = conn.execute(
+                                """SELECT id AS chunk_id, chunk_text, ts_text, importance, tags, memory_type,
+                                          long_effect, trigger_hint, occurred_at, event_ts, time_basis,
+                                          source_created_ts, source_updated_ts, indexed_ts,
+                                          passage_index, char_start, char_end, scene_anchor,
+                                          retrieval_key, state_change, entities
+                                   FROM chunks WHERE memo_name=? ORDER BY passage_index, rowid""",
+                                (memo_name,))
+                        rows = cur.fetchall()
+                        if rows:
+                            ts_text = rows[0]["ts_text"] or ts_text
+                            importance = int(rows[0]["importance"] or 3)
+                            tags = (rows[0]["tags"] or "").split(",") if rows[0]["tags"] else []
+                            memory_type = rows[0]["memory_type"] or memory_type
+                            long_effect = rows[0]["long_effect"] or long_effect
+                            trigger_hint = rows[0]["trigger_hint"] or trigger_hint
+                            occurred_at = rows[0]["occurred_at"] or ""
+                            event_ts = float(rows[0]["event_ts"] or 0)
+                            time_basis = rows[0]["time_basis"] or "unknown"
+                            source_created_ts = float(rows[0]["source_created_ts"] or 0)
+                            source_updated_ts = float(rows[0]["source_updated_ts"] or 0)
+                            indexed_ts = float(rows[0]["indexed_ts"] or 0)
+                            scene_anchor = rows[0]["scene_anchor"] or ""
+                            retrieval_key = rows[0]["retrieval_key"] or ""
+                            state_change = rows[0]["state_change"] or ""
+                            entities = rows[0]["entities"] or ""
+                            passages = [{
+                                "chunk_id": int(r["chunk_id"] or 0),
+                                "passage_index": int(r["passage_index"] or 0),
+                                "char_start": int(r["char_start"] or 0),
+                                "char_end": int(r["char_end"] or 0),
+                                "text": r["chunk_text"] or "",
+                            } for r in rows]
+                            if not full_text:
+                                parts = []
+                                for r in rows:
+                                    ct = (r["chunk_text"] or "").strip()
+                                    if not ct:
+                                        continue
+                                    if parts:
+                                        last = parts[-1]
+                                        for ol in range(30, 10, -1):
+                                            if last.endswith(ct[:ol]):
+                                                ct = ct[ol:]
+                                                break
+                                    parts.append(ct)
+                                full_text = "".join(parts)
+                    finally:
+                        conn.close()
+
+                if not full_text:
+                    return self._json_err("not found", 404)
+
+                self._json_ok({
+                    "memo_name": memo_name,
+                    "ts_text": ts_text,
+                    "occurred_at": occurred_at,
+                    "event_ts": event_ts,
+                    "time_basis": time_basis,
+                    "source_created_ts": source_created_ts,
+                    "source_updated_ts": source_updated_ts,
+                    "indexed_ts": indexed_ts,
+                    "importance": importance,
+                    "tags": tags,
+                    "memory_type": memory_type,
+                    "long_effect": long_effect,
+                    "trigger_hint": trigger_hint,
+                    "scene_anchor": scene_anchor,
+                    "retrieval_key": retrieval_key,
+                    "state_change": state_change,
+                    "entities": entities,
+                    "passages": passages,
+                    "full_text": full_text,
+                })
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_timeline(self, qs):
+            try:
+                vec = getattr(plugin, "_vec", None)
+                if vec is None:
+                    return self._json_err("vec not ready", 503)
+                months = vec.month_index_overview()
+                target = str(qs.get("month", [""])[0] or "").strip()
+                if not target and months:
+                    target = months[0]["year_month"]
+                detail = vec.month_calendar(target) if target else {
+                    "year_month": "", "memo_count": 0, "day_count": 0, "days": [], "index": {},
+                }
+                day_map = {int(item.get("day") or 0): item for item in detail.get("days") or []}
+                weeks = []
+                if target:
+                    year, month = (int(value) for value in target.split("-", 1))
+                    first_weekday, days_in_month = calendar.monthrange(year, month)
+                    cells = [{"day": 0, "count": 0, "memos": []} for _ in range(first_weekday)]
+                    for day in range(1, days_in_month + 1):
+                        entry = day_map.get(day, {"day": day, "count": 0, "memos": []})
+                        cells.append(entry)
+                    while len(cells) % 7:
+                        cells.append({"day": 0, "count": 0, "memos": []})
+                    weeks = [cells[i:i + 7] for i in range(0, len(cells), 7)]
+                recent = []
+                for month_item in months[:3]:
+                    month_detail = vec.month_calendar(month_item["year_month"])
+                    for day in month_detail.get("days") or []:
+                        recent.extend(day.get("memos") or [])
+                recent.sort(
+                    key=lambda item: float(item.get("event_ts") or item.get("source_created_ts") or item.get("created_ts") or 0),
+                    reverse=True,
+                )
+                self._json_ok({
+                    "months": months,
+                    "selected": target,
+                    "calendar": dict(detail, weeks=weeks),
+                    "recent": recent[:8],
+                    "view": {
+                        "mode": "archive_only",
+                        "participates_in_recall": False,
+                    },
+                })
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_month_route(self, qs):
+            try:
+                query = str(qs.get("q", [""])[0] or "").strip()
+                if not query:
+                    return self._json_err("missing q parameter", 400)
+                data = self._run_plugin_coro(plugin._eval_month_route(query), timeout=30)
+                self._json_ok(data)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_search(self, qs):
+            try:
+                query = qs.get("q", [""])[0].strip()
+                if not query:
+                    return self._json_err("missing q parameter", 400)
+                top_k = int(qs.get("top_k", ["5"])[0])
+                data = self._run_plugin_coro(plugin._eval_recall_query(query, top_k=top_k), timeout=60)
+                out = []
+                for h in data.get("hits", []):
+                    out.append({
+                        "memo_name": h.get("memo_name", ""),
+                        "ts_text": h.get("ts_text", ""),
+                        "occurred_at": h.get("occurred_at", ""),
+                        "event_ts": h.get("event_ts", 0),
+                        "time_basis": h.get("time_basis", "unknown"),
+                        "importance": h.get("importance", 3),
+                        "memory_type": h.get("memory_type", "plot_fact"),
+                        "long_effect": h.get("long_effect", ""),
+                        "trigger_hint": h.get("trigger_hint", ""),
+                        "score": round(h.get("score", 0), 4),
+                        "relevance": round(h.get("relevance", 0), 4),
+                        "preview": (h.get("preview", "") or "")[:300],
+                        "selected": bool(h.get("selected")),
+                        "reject_reason": h.get("reject_reason", ""),
+                    })
+                self._json_ok({"query": query, "hits": out, "candidate_count": data.get("candidate_count", len(out))})
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_eval(self, qs):
+            try:
+                query = qs.get("q", [""])[0].strip()
+                if not query:
+                    return self._json_err("missing q parameter", 400)
+                try:
+                    top_k = int(qs.get("top_k", ["0"])[0]) or None
+                except Exception:
+                    top_k = None
+                main_loop = getattr(getattr(plugin, "_webui", None), "_loop", None)
+                if main_loop and main_loop.is_running():
+                    future = asyncio.run_coroutine_threadsafe(
+                        plugin._eval_recall_query(query, top_k=top_k),
+                        main_loop,
+                    )
+                    data = future.result(timeout=60)
+                else:
+                    loop = asyncio.new_event_loop()
+                    data = loop.run_until_complete(plugin._eval_recall_query(query, top_k=top_k))
+                    loop.close()
+                self._json_ok(data)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_feedback_apply(self, body):
+            try:
+                memo_name = str(body.get("memo_name") or body.get("memo") or "").strip()
+                action = str(body.get("action") or "").strip()
+                request_id = str(body.get("request_id") or "").strip()
+                query = str(body.get("query") or "").strip()
+                source = str(body.get("source") or "webui").strip()[:40]
+                if not memo_name or not action:
+                    return self._json_err("missing memo_name/action", 400)
+                mapping = {
+                    "useful": (0.06, "有帮助"),
+                    "key": (0.14, "关键记忆"),
+                    "irrelevant": (-0.10, "与本次问题无关"),
+                    "incorrect": (-0.18, "事实错误，待核验"),
+                    "stale": (-0.12, "对当前状态已过时"),
+                    "frequent": (-0.06, "近期出现太频繁"),
+                }
+                if action not in mapping:
+                    return self._json_err("unknown action", 400)
+                vec = getattr(plugin, "_vec", None)
+                if vec is None:
+                    return self._json_err("vec not ready", 503)
+                if request_id and not query:
+                    for stat in reversed(list(getattr(plugin, "_last_injection_stats", []) or [])):
+                        if str(stat.get("request_id") or "") == request_id:
+                            query = str(stat.get("query") or stat.get("query_with_context") or "").strip()
+                            break
+                if not query:
+                    return self._json_err("feedback requires its original query", 400)
+                embedding = None
+                try:
+                    embedding = self._run_plugin_coro(plugin._embed(query), timeout=20)
+                except Exception as exc:
+                    logger.debug("[memos-memory] feedback embedding unavailable: %s", exc)
+                effect, default_reason = mapping[action]
+                result = vec.feedback_record(
+                    request_id=request_id,
+                    memo_name=memo_name,
+                    query_text=query,
+                    action=action,
+                    effect=effect,
+                    reason=str(body.get("reason") or default_reason),
+                    source=source,
+                    query_embedding=embedding,
+                )
+                self._json_ok(result)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_affiliate_status(self):
+            try:
+                if hasattr(plugin, "_affiliate_profile_status"):
+                    self._json_ok(plugin._affiliate_profile_status())
+                else:
+                    self._json_ok({"enabled": False, "connected": False, "reason": "unsupported"})
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_time_insight_status(self):
+            try:
+                service = getattr(plugin, "_time_insight", None)
+                if service is not None:
+                    self._json_ok(self._run_plugin_coro(service.status(), timeout=15))
+                elif hasattr(plugin, "_time_insight_status"):
+                    self._json_ok(plugin._time_insight_status())
+                else:
+                    self._json_ok({"enabled": False, "connected": False, "reason": "unsupported"})
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_time_insight_settings(self):
+            try:
+                service = getattr(plugin, "_time_insight", None)
+                if service is None:
+                    return self._json_err("内置时间洞察未加载", 503)
+                controller = self._xinchao_controller()
+                self._json_ok({
+                    "settings": service.settings_snapshot(),
+                    "providerOptions": controller.provider_options(),
+                    "status": self._run_plugin_coro(service.status(), timeout=15),
+                })
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_time_insight_write(self, path: str, body: dict[str, Any]):
+            try:
+                service = getattr(plugin, "_time_insight", None)
+                if service is None:
+                    return self._json_err("内置时间洞察未加载", 503)
+                if path == "/api/time-insight/settings/save":
+                    incoming = body.get("settings")
+                    if not isinstance(incoming, dict):
+                        return self._json_err("settings 必须是对象", 400)
+                    unknown = sorted(set(incoming) - time_insight_setting_keys)
+                    if unknown:
+                        return self._json_err("未知时间洞察设置: " + ", ".join(unknown[:8]), 400)
+                    save_result = self._save_settings_values(incoming, "time-insight")
+                    service.apply_settings()
+                    return self._json_ok({
+                        "save": save_result,
+                        "settings": service.settings_snapshot(),
+                    })
+                if path == "/api/time-insight/update":
+                    data = self._run_plugin_coro(service.update("webui"), timeout=190)
+                elif path == "/api/time-insight/preview":
+                    data = self._run_plugin_coro(service.preview(), timeout=60)
+                else:
+                    return self._json_err("未知操作", 404)
+                self._json_ok(data)
+            except (TypeError, ValueError) as e:
+                self._json_err(str(e), 400)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_managed_memos_status(self):
+            try:
+                st = plugin._managed_memos.as_dict() if hasattr(plugin, "_managed_memos") else {"mode": "external"}
+                self._json_ok(st)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _memos_diag(self):
+            try:
+                memos = getattr(plugin, "_memos", None)
+                if memos is None:
+                    return {"connected": False, "note": "memos 客户端未初始化"}
+                return self._run_plugin_coro(memos.diagnose(), timeout=8)
+            except Exception as e:
+                return {"connected": False, "note": str(e)[:120]}
+
+        def _api_health(self):
+            try:
+                vec = getattr(plugin, "_vec", None)
+                if vec is None:
+                    return self._json_err("vec not ready", 503)
+                self._json_ok(vec.health_check())
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_test_llm(self):
+            try:
+                import asyncio
+                ctx = getattr(plugin, "context", None)
+                prov = None
+                if ctx and hasattr(ctx, "get_using_provider"):
+                    try:
+                        prov = ctx.get_using_provider()
+                    except Exception:
+                        pass
+                if prov is None:
+                    return self._json_err("LLM provider not available", 503)
+                name = getattr(prov, "provider_id", "unknown")
+                t0 = time.time()
+                resp = self._run_plugin_coro(prov.text_chat(prompt="ping", contexts=[], system_prompt=""), timeout=30)
+                cost = (time.time() - t0) * 1000
+                text = getattr(resp, "completion_text", "") or ""
+                self._json_ok({"provider": name, "ms": round(cost, 1), "response_len": len(text)})
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_test_emb(self):
+            try:
+                emb = getattr(plugin, "_emb_provider", None)
+                if emb is None:
+                    return self._json_err("Emb provider not available", 503)
+                name = getattr(emb, "provider_id", "unknown")
+                t0 = time.time()
+                vec = self._run_plugin_coro(emb.get_embedding("ping"), timeout=30)
+                cost = (time.time() - t0) * 1000
+                self._json_ok({"provider": name, "ms": round(cost, 1), "dim": len(vec), "first5": [round(x, 4) for x in vec[:5]]})
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_test_rerank(self):
+            try:
+                rp = getattr(plugin, "_rerank_provider", None)
+                if rp is None:
+                    rid = getattr(plugin, "rerank_provider_id", "")
+                    if not rid:
+                        return self._json_err("rerank not configured", 503)
+                    return self._json_err(f"rerank provider '{rid}' not available", 503)
+                import time, concurrent.futures
+                name = getattr(rp, "provider_id", "unknown")
+                t0 = time.time()
+                main_loop = getattr(getattr(plugin, "_webui", None), "_loop", None)
+                if main_loop and main_loop.is_running():
+                    future = asyncio.run_coroutine_threadsafe(
+                        rp.rerank(query="cat", documents=["cat sat on mat", "the sky is blue", "a dog barks"], top_n=3),
+                        main_loop,
+                    )
+                    results = future.result(timeout=15)
+                else:
+                    return self._json_err("event loop not available", 503)
+                cost = (time.time() - t0) * 1000
+                scores = [{"idx": r.index, "score": round(r.relevance_score, 4)} for r in results] if results else []
+                self._json_ok({"provider": name, "ms": round(cost, 1), "results": scores})
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_graph(self):
+            try:
+                parsed = urlparse(self.path)
+                qs = parse_qs(parsed.query)
+                limit = min(max(int(qs.get("limit", ["120"])[0] or 120), 20), 400)
+                query = (qs.get("q", [""])[0] or "").strip().lower()
+                conn = self._get_webui_db()
+                if conn is None:
+                    return self._json_err("db not available", 503)
+                try:
+                    node_sql = """SELECT memo_name, MAX(ts_text) AS ts, MAX(importance) AS imp,
+                                         MAX(tags) AS tags, MAX(memory_type) AS memory_type,
+                                         MAX(long_effect) AS long_effect, MAX(trigger_hint) AS trigger_hint,
+                                         MIN(chunk_text) AS preview, MAX(created_ts) AS created_ts,
+                                         MAX(event_ts) AS event_ts, MAX(time_basis) AS time_basis
+                                  FROM chunks GROUP BY memo_name"""
+                    params: list[Any] = []
+                    if query:
+                        node_sql += """ HAVING lower(memo_name) LIKE ? OR lower(MAX(tags)) LIKE ?
+                                             OR lower(MAX(memory_type)) LIKE ? OR lower(MIN(chunk_text)) LIKE ?
+                                             OR lower(MAX(ts_text)) LIKE ?"""
+                        like = f"%{query}%"
+                        params.extend([like, like, like, like, like])
+                    node_sql += " ORDER BY MAX(importance) DESC, COALESCE(NULLIF(MAX(event_ts),0), NULLIF(MAX(source_created_ts),0), MAX(created_ts)) DESC LIMIT ?"
+                    params.append(limit)
+                    memo_rows = conn.execute(node_sql, params).fetchall()
+                    cluster_rows = conn.execute(
+                        "SELECT memo_name, cluster_id, representative, cluster_size, max_similarity, reason FROM memo_similarity_clusters"
+                    ).fetchall()
+                    cluster_map = {r["memo_name"]: r for r in cluster_rows}
+                    nodes = []
+                    seen = set()
+                    for r in memo_rows:
+                        mn = r["memo_name"]
+                        cr = cluster_map.get(mn)
+                        seen.add(mn)
+                        nodes.append({
+                            "id": mn,
+                            "label": mn.replace("memos/", ""),
+                            "cluster_id": cr["cluster_id"] if cr else f"solo:{mn}",
+                            "cluster_size": int(cr["cluster_size"] or 1) if cr else 1,
+                            "representative": cr["representative"] if cr else mn,
+                            "cluster_reason": cr["reason"] if cr else "unclustered",
+                            "cluster_similarity": float(cr["max_similarity"] or 1.0) if cr else 1.0,
+                            "imp": int(r["imp"] or 3),
+                            "ts": r["ts"] or "",
+                            "tags": r["tags"] or "",
+                            "memory_type": r["memory_type"] or "plot_fact",
+                            "long_effect": r["long_effect"] or "",
+                            "trigger_hint": r["trigger_hint"] or "",
+                            "preview": (r["preview"] or "")[:260],
+                            "created_ts": float(r["created_ts"] or 0),
+                            "event_ts": float(r["event_ts"] or 0),
+                            "time_basis": r["time_basis"] or "unknown",
+                        })
+                    if seen:
+                        placeholders = ",".join("?" for _ in seen)
+                        rows = conn.execute(
+                            f"""SELECT memo_a, memo_b, similarity, source, shared_tags FROM memo_similarity_edges
+                                WHERE memo_a IN ({placeholders}) OR memo_b IN ({placeholders})
+                                ORDER BY similarity DESC LIMIT ?""",
+                            [*seen, *seen, limit * 4],
+                        ).fetchall()
+                    else:
+                        rows = conn.execute(
+                            "SELECT memo_a, memo_b, similarity, source, shared_tags FROM memo_similarity_edges ORDER BY similarity DESC LIMIT ?",
+                            (limit * 4,),
+                        ).fetchall()
+                    edges = []
+                    for r in rows:
+                        a = r["memo_a"]
+                        b = r["memo_b"]
+                        if query and a not in seen and b not in seen:
+                            continue
+                        edges.append({
+                            "from": a, "to": b, "sim": float(r["similarity"] or 0),
+                            "source": r["source"] or "embedding",
+                            "tags": r["shared_tags"] or "",
+                        })
+                        for mn in (a, b):
+                            if mn not in seen:
+                                cr = cluster_map.get(mn)
+                                seen.add(mn)
+                                row = conn.execute(
+                                    """SELECT MAX(ts_text) AS ts, MAX(importance) AS imp, MAX(tags) AS tags,
+                                              MAX(memory_type) AS memory_type, MAX(long_effect) AS long_effect,
+                                              MAX(trigger_hint) AS trigger_hint, MIN(chunk_text) AS preview,
+                                              MAX(created_ts) AS created_ts, MAX(event_ts) AS event_ts,
+                                              MAX(time_basis) AS time_basis
+                                       FROM chunks WHERE memo_name=?""",
+                                    (mn,),
+                                ).fetchone()
+                                nodes.append({
+                                    "id": mn,
+                                    "label": mn.replace("memos/", ""),
+                                    "cluster_id": cr["cluster_id"] if cr else f"solo:{mn}",
+                                    "cluster_size": int(cr["cluster_size"] or 1) if cr else 1,
+                                    "representative": cr["representative"] if cr else mn,
+                                    "cluster_reason": cr["reason"] if cr else "unclustered",
+                                    "cluster_similarity": float(cr["max_similarity"] or 1.0) if cr else 1.0,
+                                    "imp": int(row["imp"] or 3) if row else 3,
+                                    "ts": row["ts"] or "" if row else "",
+                                    "tags": row["tags"] or "" if row else "",
+                                    "memory_type": row["memory_type"] or "plot_fact" if row else "plot_fact",
+                                    "long_effect": row["long_effect"] or "" if row else "",
+                                    "trigger_hint": row["trigger_hint"] or "" if row else "",
+                                    "preview": (row["preview"] or "")[:260] if row else "",
+                                    "created_ts": float(row["created_ts"] or 0) if row else 0,
+                                    "event_ts": float(row["event_ts"] or 0) if row else 0,
+                                    "time_basis": row["time_basis"] or "unknown" if row else "unknown",
+                                })
+                    total = conn.execute("SELECT COUNT(DISTINCT memo_name) AS n FROM chunks").fetchone()["n"]
+                    cluster_count = conn.execute("SELECT COUNT(DISTINCT cluster_id) AS n FROM memo_similarity_clusters").fetchone()["n"]
+                finally:
+                    conn.close()
+                self._json_ok({"nodes": nodes, "edges": edges, "total_memos": total, "cluster_count": cluster_count, "query": query})
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_graph_clusters(self):
+            try:
+                conn = self._get_webui_db()
+                if conn is None:
+                    return self._json_err("db not available", 503)
+                try:
+                    clusters = getattr(plugin._vec, "similarity_cluster_overview")(limit=80)
+                    edge_count = conn.execute("SELECT COUNT(*) AS n FROM memo_similarity_edges").fetchone()["n"]
+                    memo_count = conn.execute("SELECT COUNT(DISTINCT memo_name) AS n FROM chunks").fetchone()["n"]
+                finally:
+                    conn.close()
+                self._json_ok({"clusters": clusters, "total_memos": memo_count, "total_edges": edge_count})
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_graph_rebuild(self):
+            try:
+                import asyncio
+                main_loop = getattr(getattr(plugin, "_webui", None), "_loop", None)
+                if main_loop and main_loop.is_running():
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._do_graph_rebuild(), main_loop)
+                    result = future.result(timeout=60)
+                    self._json_ok(result)
+                else:
+                    self._json_err("event loop not available", 503)
+            except Exception as e:
+                self._json_err(str(e))
+
+        async def _do_graph_rebuild(self):
+            """Rebuild similarity clusters from WebUI."""
+            if not await plugin._ensure_init():
+                return {"ok": False, "error": "init failed"}
+            stats = plugin._build_similarity_cluster_index()
+            return {"ok": True, "data": stats}
+
+        def _api_graph_related(self, qs):
+            try:
+                mn = unquote(qs.get("memo", [""])[0])
+                if not mn:
+                    return self._json_err("missing memo param", 400)
+                conn = self._get_webui_db()
+                if conn is None:
+                    return self._json_err("db not available", 503)
+                try:
+                    rows = conn.execute(
+                        "SELECT memo_b AS related, similarity, source, shared_tags FROM memo_similarity_edges WHERE memo_a=? UNION ALL SELECT memo_a, similarity, source, shared_tags FROM memo_similarity_edges WHERE memo_b=? ORDER BY similarity DESC LIMIT 20",
+                        (mn, mn)).fetchall()
+                    related = []
+                    for r in rows:
+                        meta = conn.execute(
+                            """SELECT MAX(ts_text) AS ts, MAX(importance) AS imp, MAX(memory_type) AS memory_type,
+                                      MIN(chunk_text) AS preview FROM chunks WHERE memo_name=?""",
+                            (r["related"],),
+                        ).fetchone()
+                        related.append({
+                            "memo_name": r["related"],
+                            "similarity": float(r["similarity"] or 0),
+                            "source": r["source"] or "embedding",
+                            "tags": r["shared_tags"] or "",
+                            "ts": meta["ts"] or "" if meta else "",
+                            "importance": int(meta["imp"] or 3) if meta else 3,
+                            "memory_type": meta["memory_type"] or "" if meta else "",
+                            "preview": (meta["preview"] or "")[:180] if meta else "",
+                        })
+                    if len(related) < 8:
+                        base = conn.execute(
+                            "SELECT MAX(tags) AS tags, MAX(memory_type) AS memory_type FROM chunks WHERE memo_name=?",
+                            (mn,),
+                        ).fetchone()
+                        base_tags = {t.strip().lstrip("#") for t in ((base["tags"] or "") if base else "").replace(",", " ").split() if t.strip()}
+                        base_type = (base["memory_type"] or "") if base else ""
+                        seen_related = {x["memo_name"] for x in related}
+                        candidates = conn.execute(
+                            """SELECT memo_name, MAX(ts_text) AS ts, MAX(importance) AS imp, MAX(memory_type) AS memory_type,
+                                      MAX(tags) AS tags, MIN(chunk_text) AS preview
+                               FROM chunks WHERE memo_name<>? GROUP BY memo_name
+                               ORDER BY MAX(importance) DESC,
+                                        COALESCE(NULLIF(MAX(event_ts),0), NULLIF(MAX(source_created_ts),0), MAX(created_ts)) DESC LIMIT 300""",
+                            (mn,),
+                        ).fetchall()
+                        fallback = []
+                        for c in candidates:
+                            cmn = c["memo_name"]
+                            if cmn in seen_related:
+                                continue
+                            ctags = {t.strip().lstrip("#") for t in (c["tags"] or "").replace(",", " ").split() if t.strip()}
+                            shared = sorted(base_tags & ctags)
+                            type_hit = bool(base_type and base_type == (c["memory_type"] or ""))
+                            score = len(shared) * 0.08 + (0.04 if type_hit else 0) + min(int(c["imp"] or 3), 5) * 0.01
+                            if score <= 0:
+                                continue
+                            fallback.append((score, c, shared))
+                        fallback.sort(key=lambda x: -x[0])
+                        for score, c, shared in fallback[: max(0, 12 - len(related))]:
+                            related.append({
+                                "memo_name": c["memo_name"],
+                                "similarity": round(min(0.79, score), 4),
+                                "tags": ",".join(shared) or (c["tags"] or ""),
+                                "ts": c["ts"] or "",
+                                "importance": int(c["imp"] or 3),
+                                "memory_type": c["memory_type"] or "",
+                                "preview": (c["preview"] or "")[:180],
+                                "fallback": True,
+                            })
+                finally:
+                    conn.close()
+                self._json_ok({"memo": mn, "related": related})
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_feedback(self):
+            try:
+                vec = getattr(plugin, "_vec", None)
+                if vec is None:
+                    return self._json_err("vec not ready", 503)
+                recent_requests = []
+                for stat in reversed(list(getattr(plugin, "_last_injection_stats", []) or [])):
+                    query = str(stat.get("query") or "").strip()
+                    memos = [str(value) for value in (stat.get("memos") or []) if value]
+                    if not query or not memos:
+                        continue
+                    recent_requests.append({
+                        "request_id": str(stat.get("request_id") or ""),
+                        "ts": float(stat.get("ts") or 0),
+                        "ts_iso": stat.get("ts_iso") or "",
+                        "query": query,
+                        "memos": memos,
+                        "outcome": stat.get("outcome") or "",
+                        "recall_postprocess": stat.get("recall_postprocess") or {},
+                    })
+                    if len(recent_requests) >= 30:
+                        break
+                self._json_ok({
+                    "feedback": vec.feedback_event_list(limit=300),
+                    "recent_requests": recent_requests,
+                    "legacy_feedback": vec.feedback_get_all(),
+                    "legacy_active": False,
+                    "actions": ["useful", "key", "irrelevant", "incorrect", "stale", "frequent"],
+                })
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_keywords(self):
+            try:
+                conn = self._get_webui_db()
+                if conn is None:
+                    return self._json_err("db not available", 503)
+                try:
+                    rows = conn.execute("SELECT memo_name, keyword, weight FROM memo_keywords ORDER BY memo_name, weight DESC").fetchall()
+                    result = {}
+                    for r in rows:
+                        result.setdefault(r["memo_name"], []).append({"keyword": r["keyword"], "weight": r["weight"]})
+                finally:
+                    conn.close()
+                self._json_ok({"keywords": result})
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_debug(self):
+            """Diagnostic: dump plugin internal state."""
+            try:
+                vec = getattr(plugin, "_vec", None)
+                memos = getattr(plugin, "_memos", None)
+                vec_db_path = getattr(plugin, "vec_db_path", "?")
+                db_exists = Path(vec_db_path).exists() if vec_db_path != "?" else False
+                db_size = Path(vec_db_path).stat().st_size if db_exists else 0
+                chunk_count = 0
+                memo_count = 0
+                conn = self._get_webui_db()
+                if conn is not None:
+                    try:
+                        chunk_count = conn.execute("SELECT count(*) as c FROM chunks").fetchone()["c"]
+                        memo_count = conn.execute("SELECT COUNT(DISTINCT memo_name) AS n FROM chunks").fetchone()["n"]
+                    except Exception as ve:
+                        chunk_count = f"error: {ve}"
+                    finally:
+                        conn.close()
+                data = {
+                    "initialized": getattr(plugin, "_initialized", False),
+                    "init_error": getattr(plugin, "_init_error", ""),
+                    "vec_is_none": vec is None,
+                    "memos_is_none": memos is None,
+                    "vec_db_path": vec_db_path,
+                    "db_exists": db_exists,
+                    "db_size_bytes": db_size,
+                    "chunk_count": chunk_count,
+                    "memo_count": memo_count,
+                    "emb_provider": getattr(plugin, "_emb_model_id", ""),
+                    "emb_dim": getattr(plugin, "_emb_dim", None),
+                    "log_events_count": len(getattr(plugin, "_log_events", [])),
+                    "memos_url": getattr(plugin, "memos_base_url", ""),
+                }
+                self._json_ok(data)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _run_plugin_coro(self, coro, timeout=30):
+            main_loop = getattr(getattr(plugin, "_webui", None), "_loop", None)
+            if main_loop and main_loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(coro, main_loop)
+                return future.result(timeout=timeout)
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(coro)
+            finally:
+                loop.close()
+
+        def _xinchao_controller(self):
+            controller = getattr(plugin, "_xinchao", None)
+            if controller is None:
+                raise RuntimeError("心潮控制器未加载")
+            return controller
+
+        def _api_xinchao_overview(self, qs):
+            try:
+                controller = self._xinchao_controller()
+                key = (qs.get("key", [""])[0] or "").strip()
+                overview = self._run_plugin_coro(controller.all_states(), timeout=15)
+                selected = controller.scope_key_from_query(key or overview.get("selected", ""))
+                overview["selected"] = selected
+                overview["state"] = self._run_plugin_coro(controller.status(selected), timeout=15)
+                overview["version"] = getattr(plugin, "_PLUGIN_VERSION", "?")
+                overview["providerOptions"] = controller.provider_options()
+                self._json_ok(overview)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_xinchao_state(self, qs):
+            try:
+                key = (qs.get("key", [""])[0] or "").strip()
+                controller = self._xinchao_controller()
+                self._json_ok(self._run_plugin_coro(controller.status(key), timeout=15))
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_xinchao_settings(self):
+            try:
+                controller = self._xinchao_controller()
+                self._json_ok({
+                    "settings": dict(controller.settings),
+                    "providerOptions": controller.provider_options(),
+                })
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_xinchao_write(self, path: str, body: dict[str, Any]):
+            try:
+                controller = self._xinchao_controller()
+                key = str(body.get("key") or "")
+                if path == "/api/xinchao/settings/save":
+                    settings = body.get("settings")
+                    if not isinstance(settings, dict):
+                        return self._json_err("settings 必须是对象", 400)
+                    return self._json_ok({"settings": controller.save_settings(settings)})
+                if path == "/api/xinchao/settle":
+                    data = self._run_plugin_coro(controller.settle_now(key), timeout=20)
+                elif path == "/api/xinchao/feedback":
+                    data = self._run_plugin_coro(
+                        controller.feedback(key, str(body.get("drive") or ""), float(body.get("delta") or 0)),
+                        timeout=20,
+                    )
+                elif path == "/api/xinchao/thought":
+                    data = self._run_plugin_coro(
+                        controller.add_thought(
+                            key,
+                            str(body.get("drive") or ""),
+                            str(body.get("text") or ""),
+                            float(body.get("intensity") or 0.6),
+                        ),
+                        timeout=20,
+                    )
+                elif path == "/api/xinchao/simulate":
+                    event = body.get("event")
+                    if event is not None and not isinstance(event, dict):
+                        return self._json_err("event 必须是对象", 400)
+                    data = self._run_plugin_coro(
+                        controller.simulate(key, float(body.get("hours") or 0), event),
+                        timeout=20,
+                    )
+                elif path == "/api/xinchao/reset":
+                    if body.get("confirm") != "RESET":
+                        return self._json_err("请输入 RESET 确认重置", 400)
+                    data = self._run_plugin_coro(controller.reset(key), timeout=20)
+                else:
+                    return self._json_err("未知操作", 404)
+                self._json_ok(data)
+            except (TypeError, ValueError) as e:
+                self._json_err(str(e), 400)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _backup_dir(self) -> Path:
+            import os
+            raw = getattr(plugin, "context_archive_backup_dir", "./data/astrbot_plugin_memos_memory/context_backups")
+            base = Path(os.path.expanduser(raw or "./data/astrbot_plugin_memos_memory/context_backups"))
+            if not base.is_absolute():
+                base = Path.cwd() / base
+            return base
+
+        @staticmethod
+        def _message_preview(item, index: int) -> dict[str, Any]:
+            if not isinstance(item, dict):
+                item = {"role": "unknown", "content": str(item)}
+            content = item.get("content", "")
+            if not isinstance(content, str):
+                try:
+                    content = json.dumps(content, ensure_ascii=False)
+                except Exception:
+                    content = str(content or "")
+            return {
+                "index": index,
+                "role": item.get("role", "unknown"),
+                "chars": len(content),
+                "content": content,
+                "tool_calls": item.get("tool_calls"),
+            }
+
+        @staticmethod
+        def _conversation_history_list(conversation: Any) -> list[Any]:
+            if conversation is None:
+                return []
+            raw = getattr(conversation, "history", None)
+            if raw is None:
+                raw = getattr(conversation, "content", None)
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw or "[]")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return []
+            if isinstance(raw, dict):
+                raw = raw.get("history") or raw.get("messages") or raw.get("content") or []
+            return list(raw) if isinstance(raw, (list, tuple)) else []
+
+        @staticmethod
+        def _conversation_identity(conversation: Any) -> tuple[str, str]:
+            umo = str(
+                getattr(conversation, "user_id", "")
+                or getattr(conversation, "unified_msg_origin", "")
+                or ""
+            )
+            cid = str(
+                getattr(conversation, "cid", "")
+                or getattr(conversation, "conversation_id", "")
+                or ""
+            )
+            return umo, cid
+
+        def _backup_list(self) -> list[dict[str, Any]]:
+            base = self._backup_dir()
+            if not base.exists():
+                return []
+            out = []
+            for p in sorted(base.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True)[:80]:
+                meta = {}
+                try:
+                    raw = json.loads(p.read_text(encoding="utf-8"))
+                    meta = raw.get("plan", {}) if isinstance(raw, dict) else {}
+                    umo = raw.get("unified_msg_origin", "") if isinstance(raw, dict) else ""
+                    cid = raw.get("conversation_id", "") if isinstance(raw, dict) else ""
+                except Exception:
+                    umo = ""
+                    cid = ""
+                st = p.stat()
+                out.append({
+                    "file": p.name,
+                    "mtime": st.st_mtime,
+                    "size": st.st_size,
+                    "unified_msg_origin": umo,
+                    "conversation_id": cid,
+                    "total": meta.get("total"),
+                    "kept": meta.get("kept"),
+                    "removed": meta.get("removed"),
+                })
+            return out
+
+        async def _collect_context_history(self, selected_umo: str = "", selected_cid: str = "") -> dict[str, Any]:
+            mgr = getattr(plugin.context, "conversation_manager", None)
+            seen_sessions = set(getattr(plugin, "_seen_context_sessions", set()) or [])
+            items = []
+            selected = None
+            if mgr is not None:
+                discovered: dict[tuple[str, str], Any] = {}
+                try:
+                    conversations = await mgr.get_conversations()
+                except Exception:
+                    conversations = []
+                for conversation in conversations or []:
+                    umo, cid = self._conversation_identity(conversation)
+                    if umo and cid:
+                        discovered[(umo, cid)] = conversation
+                        seen_sessions.add(umo)
+
+                current_ids: dict[str, str] = {}
+                for umo in sorted(seen_sessions):
+                    try:
+                        cid = await mgr.get_curr_conversation_id(umo)
+                        if cid:
+                            current_ids[umo] = str(cid)
+                            discovered.setdefault((umo, str(cid)), None)
+                    except Exception as e:
+                        items.append({"unified_msg_origin": umo, "error": str(e), "history_count": 0})
+
+                rows_with_history: list[tuple[dict[str, Any], list[Any]]] = []
+                for (umo, cid), summary in list(discovered.items())[:200]:
+                    try:
+                        conversation = await mgr.get_conversation(umo, cid)
+                        if conversation is None:
+                            conversation = summary
+                        history = self._conversation_history_list(conversation)
+                        stat = getattr(plugin, "_context_stats", {}).get(umo, {})
+                        row = {
+                            "unified_msg_origin": umo,
+                            "conversation_id": cid,
+                            "title": str(getattr(conversation, "title", "") or "未命名对话"),
+                            "history_count": len(history),
+                            "created_at": getattr(conversation, "created_at", 0) or 0,
+                            "updated_at": getattr(conversation, "updated_at", 0) or 0,
+                            "is_current": current_ids.get(umo) == cid,
+                            "last_request_stat": stat,
+                        }
+                        rows_with_history.append((row, history))
+                    except Exception as e:
+                        rows_with_history.append(({
+                            "unified_msg_origin": umo,
+                            "conversation_id": cid,
+                            "error": str(e),
+                            "history_count": 0,
+                            "is_current": current_ids.get(umo) == cid,
+                        }, []))
+
+                def row_sort_key(pair):
+                    row = pair[0]
+                    try:
+                        updated = float(row.get("updated_at") or row.get("created_at") or 0)
+                    except Exception:
+                        updated = 0.0
+                    return (bool(row.get("is_current")), updated)
+
+                rows_with_history.sort(key=row_sort_key, reverse=True)
+                items.extend(row for row, _ in rows_with_history)
+                for row, history in rows_with_history:
+                    matches = (
+                        (selected_cid and row.get("conversation_id") == selected_cid)
+                        or (selected_umo and not selected_cid and row.get("unified_msg_origin") == selected_umo and row.get("is_current"))
+                    )
+                    if matches or (not selected_umo and not selected_cid and selected is None):
+                        selected = {
+                            **row,
+                            "messages": [self._message_preview(x, i) for i, x in enumerate(history)],
+                        }
+                        if matches:
+                            break
+            return {
+                "sessions": items,
+                "selected": selected,
+                "backups": self._backup_list(),
+                "settings": {
+                    "exclude_command_turns": getattr(plugin, "context_exclude_command_turns", True),
+                    "request_keep": getattr(plugin, "context_keep_recent_messages", 0),
+                    "request_min": getattr(plugin, "context_min_messages_before_trim", 0),
+                    "archive_keep": getattr(plugin, "context_archive_keep_recent_messages", 0),
+                    "archive_min": getattr(plugin, "context_archive_min_total_messages", 0),
+                    "archive_enabled": getattr(plugin, "context_archive_enable", False),
+                    "archive_interval_days": getattr(plugin, "context_archive_interval_days", 0),
+                },
+            }
+
+        def _api_context_history(self, qs):
+            try:
+                umo = (qs.get("umo", [""])[0] or "").strip()
+                cid = (qs.get("cid", [""])[0] or "").strip()
+                data = self._run_plugin_coro(self._collect_context_history(umo, cid), timeout=30)
+                self._json_ok(data)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_context_backup(self, qs):
+            try:
+                name = (qs.get("file", [""])[0] or "").strip()
+                if not name:
+                    return self._json_err("missing file", 400)
+                base = self._backup_dir().resolve()
+                path = (base / name).resolve()
+                if base not in path.parents and path != base:
+                    return self._json_err("invalid file", 400)
+                if not path.exists() or path.suffix.lower() != ".json":
+                    return self._json_err("backup not found", 404)
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                history = raw.get("history", []) if isinstance(raw, dict) else []
+                if not isinstance(history, list):
+                    history = []
+                self._json_ok({
+                    "file": path.name,
+                    "meta": {k: v for k, v in raw.items() if k != "history"} if isinstance(raw, dict) else {},
+                    "messages": [self._message_preview(x, i) for i, x in enumerate(history)],
+                })
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_logs(self, qs):
+            try:
+                if qs.get("clear"):
+                    plugin._log_events.clear()
+                    if hasattr(plugin, "_save_runtime_telemetry"):
+                        plugin._telemetry_dirty = True
+                        plugin._save_runtime_telemetry(force=True)
+                    return self._json_ok({"cleared": True})
+                limit = min(int(qs.get("limit", ["200"])[0]), 1000)
+                cat = (qs.get("category", [""])[0] or "").strip()
+                logs = plugin._get_logs(limit=limit, category=cat)
+                logs = [e for e in logs if isinstance(e, dict) and e.get("category") != "kb_cache"]
+                known = ["xinchao", "enhancer", "compress", "inject", "cache", "recall", "sync", "system"]
+                counts = {k: 0 for k in known}
+                for e in plugin._log_events:
+                    c = e["category"]
+                    if c == "kb_cache":
+                        continue
+                    counts[c] = counts.get(c, 0) + 1
+                self._json_ok({"logs": logs, "total": sum(counts.values()), "counts": counts})
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_console_logs(self):
+            self._json_ok([
+                event for event in list(getattr(plugin, "_log_events", []))
+                if isinstance(event, dict) and event.get("category") != "kb_cache"
+            ])
+
+        def _api_console_stats(self):
+            try:
+                keys = ["current_time", "semantic_state", "profile", "time_insight", "diary", "event_core", "evidence", "memory_structure", "xinchao", "enhancer", "context", "other_extra"]
+                rows = []
+                for source in list(getattr(plugin, "_last_injection_stats", []) or [])[-80:]:
+                    row = dict(source) if isinstance(source, dict) else {}
+                    composition = dict(row.get("composition") or {})
+                    composition.pop("kb_cache", None)
+                    row.pop("kb_cache", None)
+                    row["composition"] = composition
+                    row["total_est_chars"] = sum(int(composition.get(key) or 0) for key in keys)
+                    rows.append(row)
+                totals = {k: 0 for k in keys}
+                for row in rows:
+                    comp = row.get("composition", {}) if isinstance(row, dict) else {}
+                    for k in keys:
+                        try:
+                            totals[k] += int(comp.get(k) or 0)
+                        except Exception:
+                            pass
+                total_chars = sum(totals.values())
+                events = [
+                    event for event in (getattr(plugin, "_log_events", []) or [])
+                    if isinstance(event, dict) and event.get("category") != "kb_cache"
+                ]
+                known = ["xinchao", "enhancer", "compress", "inject", "cache", "recall", "sync", "system"]
+                counts = {k: 0 for k in known}
+                for e in events:
+                    c = e.get("category", "system") if isinstance(e, dict) else "system"
+                    counts[c] = counts.get(c, 0) + 1
+                rp_stats = getattr(plugin, "_rp_stats", {}) if isinstance(getattr(plugin, "_rp_stats", {}), dict) else {}
+                provider_cache_stats = getattr(plugin, "_provider_cache_stats", {}) if isinstance(getattr(plugin, "_provider_cache_stats", {}), dict) else {}
+                ctx_stats = getattr(plugin, "_context_stats", {}) if isinstance(getattr(plugin, "_context_stats", {}), dict) else {}
+                sys_stats = getattr(plugin, "_system_cache_stats", {}) if isinstance(getattr(plugin, "_system_cache_stats", {}), dict) else {}
+                prefix_stats = getattr(plugin, "_prefix_cache_stats", {}) if isinstance(getattr(plugin, "_prefix_cache_stats", {}), dict) else {}
+                self._json_ok({
+                    "rows": rows,
+                    "latest": rows[-1] if rows else {},
+                    "totals": totals,
+                    "total_chars": total_chars,
+                    "counts": counts,
+                    "features": {
+                        "enhancer": bool(getattr(plugin, "rp_enhancer_enable", False)),
+                        "provider_cache": bool(getattr(plugin, "cache_prefix_drift_enable", False)),
+                        "context": bool(getattr(plugin, "context_governance_enable", False)),
+                        "system_cache_guard": bool(getattr(plugin, "cache_friendly_system_guard_enable", False)),
+                        "prefix_drift": bool(getattr(plugin, "cache_prefix_drift_enable", False)),
+                        "archive": bool(getattr(plugin, "context_archive_enable", False)),
+                        "profile": bool(getattr(plugin, "enable_affiliate_profile", False)),
+                        "time_insight": bool(getattr(plugin, "enable_time_insight_affiliate", False)),
+                        "xinchao": bool(getattr(getattr(plugin, "_xinchao", None), "settings", {}).get("enable", False)),
+                        "managed_memos": getattr(plugin, "memos_mode", "external") == "managed",
+                    },
+                    "latest_runtime": {
+                        "enhancer": list(rp_stats.values())[-1] if rp_stats else {},
+                        "provider_cache": list(provider_cache_stats.values())[-1] if provider_cache_stats else {},
+                        "context": list(ctx_stats.values())[-1] if ctx_stats else {},
+                        "system_cache_guard": list(sys_stats.values())[-1] if sys_stats else {},
+                        "prefix_drift": list(prefix_stats.values())[-1] if prefix_stats else {},
+                        "xinchao": (
+                            list(getattr(plugin._xinchao, "_last_injection", {}).values())[-1]
+                            if getattr(getattr(plugin, "_xinchao", None), "_last_injection", {})
+                            else {}
+                        ),
+                        "managed_memos": plugin._managed_memos.as_dict() if hasattr(plugin, "_managed_memos") else {"mode": "external"},
+                    },
+                    "log_total": len(events),
+                    "telemetry": {
+                        "plugin_version": getattr(plugin, "_PLUGIN_VERSION", "?"),
+                        "instance": hex(id(plugin)),
+                        "sample_count": len(rows),
+                        "event_count": len(events),
+                        "persisted_at": float(getattr(plugin, "_telemetry_last_save", 0) or 0),
+                        "dirty": bool(getattr(plugin, "_telemetry_dirty", False)),
+                    },
+                })
+            except Exception as e:
+                self._json_err(str(e))
+
+    return Handler
+
+
+class WebUIServer:
+    """WebUI server using stdlib http.server + threading. No aiohttp dependency."""
+
+    def __init__(self, plugin):
+        self.plugin = plugin
+        self._server: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def _registry_key(self) -> tuple[str, int]:
+        return (str(self.plugin.webui_host), int(self.plugin.webui_port))
+
+    @staticmethod
+    def _server_matches(server: Any, host: str, port: int) -> bool:
+        try:
+            address = server.server_address
+            return int(address[1]) == int(port) and str(address[0]) in {str(host), "0.0.0.0", "127.0.0.1", "::"}
+        except Exception:
+            return False
+
+    def _close_stale_server(self) -> bool:
+        """Take over a WebUI port left behind by an older hot-reloaded plugin instance."""
+        host, port = self._registry_key
+        registry = getattr(builtins, "_astrbot_memos_webui_servers", None)
+        if not isinstance(registry, dict):
+            registry = {}
+            setattr(builtins, "_astrbot_memos_webui_servers", registry)
+        stale = registry.get((host, port))
+        candidates = []
+        if stale is not None and stale is not self:
+            server = getattr(stale, "_server", None)
+            if server is not None:
+                candidates.append(server)
+        if not candidates:
+            for obj in gc.get_objects():
+                try:
+                    if isinstance(obj, ThreadingHTTPServer) and obj is not self._server and self._server_matches(obj, host, port):
+                        candidates.append(obj)
+                except Exception:
+                    continue
+        closed = False
+        for server in candidates[:2]:
+            try:
+                server.shutdown()
+                server.server_close()
+                closed = True
+            except Exception:
+                continue
+        registry.pop((host, port), None)
+        return closed
+
+    async def start(self) -> bool:
+        """Start the server in a daemon thread. Async signature for compatibility."""
+        if not self.plugin.webui_enable:
+            return False
+        try:
+            if await asyncio.to_thread(self._close_stale_server):
+                logger.info("[memos-memory] WebUI took over stale hot-reload server on %s:%d", self.plugin.webui_host, self.plugin.webui_port)
+            here = Path(__file__).resolve().parent
+            dashboard_html = (here / "dashboard.html").read_text(encoding="utf-8") if (here / "dashboard.html").exists() else "<h1>dashboard.html missing</h1>"
+
+            # Console HTML (inline)
+            console_html = self._build_console_html()
+            xinchao_html = (
+                (here / "xinchao.html").read_text(encoding="utf-8")
+                if (here / "xinchao.html").exists()
+                else "<h1>xinchao.html missing</h1>"
+            )
+
+            handler_cls = _make_handler(self.plugin, dashboard_html, console_html, xinchao_html)
+            self._server = ThreadingHTTPServer(
+                (self.plugin.webui_host, self.plugin.webui_port),
+                handler_cls,
+            )
+            self._loop = asyncio.get_event_loop()
+            self._thread = threading.Thread(
+                target=self._server.serve_forever,
+                name="MemosMemoryWebUI",
+                daemon=True,
+            )
+            self._thread.start()
+            registry = getattr(builtins, "_astrbot_memos_webui_servers", None)
+            if isinstance(registry, dict):
+                registry[self._registry_key] = self
+            logger.info("[memos-memory] WebUI started: http://%s:%d/",
+                       self.plugin.webui_host, self.plugin.webui_port)
+            return True
+        except Exception as exc:
+            logger.warning("[memos-memory] WebUI start failed: %s", exc)
+            return False
+
+    async def stop(self) -> None:
+        if self._server is not None:
+            server = self._server
+            self._server = None
+            self._thread = None
+            await asyncio.to_thread(server.shutdown)
+            server.server_close()
+        registry = getattr(builtins, "_astrbot_memos_webui_servers", None)
+        if isinstance(registry, dict) and registry.get(self._registry_key) is self:
+            registry.pop(self._registry_key, None)
+
+    def _build_console_html(self) -> str:
+        ver = getattr(self.plugin, "_PLUGIN_VERSION", "?")
+        return _CONSOLE_HTML_V2.replace("{{VERSION}}", ver)
+
+
+_CONSOLE_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>memos-memory console</title>
+<style>
+:root{color-scheme:dark;--bg:#080c14;--panel:#101725;--panel2:#141f31;--line:#26364d;--line2:#1b283a;--text:#e4edf8;--muted:#8998ad;--blue:#60a5fa;--green:#34d399;--amber:#fbbf24;--red:#fb7185;--violet:#a78bfa;--cyan:#22d3ee;--pink:#f472b6}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Microsoft YaHei",monospace;background:#080c14;color:var(--text);padding:18px;font-size:12px;letter-spacing:0}
+.shell{max-width:1540px;margin:0 auto}
+.head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:14px}
+.brand{display:flex;align-items:center;gap:10px;margin-bottom:6px}
+h1{font-size:18px;color:#fff;font-weight:780;letter-spacing:0}
+.ver{height:22px;display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:6px;padding:0 8px;color:#b7c5d8;background:#111a2a;font-size:12px}
+.sub{font-size:12px;color:var(--muted);line-height:1.5}
+.top-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.top-actions a,.filter-bar button{padding:7px 12px;border:1px solid var(--line);border-radius:7px;background:var(--panel2);color:var(--text);cursor:pointer;font-size:12px;text-decoration:none}
+.top-actions a:hover,.filter-bar button:hover{border-color:#3b82f6;background:#17243a}
+.grid{display:grid;grid-template-columns:1.1fr 1.4fr;gap:12px;margin-bottom:12px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;box-shadow:0 18px 54px rgba(0,0,0,.22)}
+.panel-title{display:flex;justify-content:space-between;align-items:center;color:#fff;font-size:13px;font-weight:760;margin-bottom:10px}
+.muted{color:var(--muted)}
+.stats{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:8px;margin-bottom:12px}
+.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;color:var(--muted)}
+.metric span{display:block;font-size:22px;line-height:1.1;margin-top:4px;color:#fff;font-weight:760;font-variant-numeric:tabular-nums}
+.mix{display:grid;gap:8px}
+.mix-row{display:grid;grid-template-columns:96px 1fr 74px;gap:9px;align-items:center}
+.mix-name{color:#c7d2e3}
+.mix-val{color:#fff;text-align:right;font-variant-numeric:tabular-nums}
+.bar{height:9px;background:#0b1220;border:1px solid #1b293d;border-radius:999px;overflow:hidden}
+.fill{height:100%;width:0;background:var(--blue)}
+.fill.current_time{background:#f97316}.fill.semantic_state{background:#22c55e}.fill.profile{background:var(--violet)}.fill.diary{background:var(--amber)}.fill.event_core{background:#fb7185}.fill.evidence{background:#38bdf8}.fill.memory_structure{background:#94a3b8}.fill.time_insight{background:var(--cyan)}.fill.enhancer{background:var(--green)}.fill.context{background:var(--blue)}.fill.other_extra{background:var(--pink)}
+.latest-meta{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px}
+.mini{border:1px solid var(--line2);border-radius:7px;padding:8px;color:var(--muted);background:#0c1421}
+.mini b{display:block;color:#fff;font-size:15px;margin-top:2px;font-variant-numeric:tabular-nums}
+.inject-table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+.inject-table th,.inject-table td{border-bottom:1px solid var(--line2);padding:7px 6px;text-align:right;white-space:nowrap}
+.inject-table th:first-child,.inject-table td:first-child{text-align:left}
+.inject-table th{color:var(--muted);font-weight:600}
+.inject-table td{color:#d9e5f5}
+.filter-bar{display:flex;gap:7px;margin-bottom:12px;flex-wrap:wrap;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px}
+.filter-bar button.active{background:#1d4ed8;color:#fff;border-color:#3b82f6}
+#log-list{background:var(--panel);border-radius:8px;border:1px solid var(--line);max-height:calc(100vh - 510px);min-height:220px;overflow-y:auto}
+.log-entry{padding:8px 12px;border-bottom:1px solid var(--line2);display:grid;grid-template-columns:86px 92px 1fr;gap:10px;align-items:flex-start;line-height:1.45}
+.log-entry:hover{background:#111d2f}.log-entry:last-child{border-bottom:none}
+.log-cat{display:inline-block;padding:2px 8px;border-radius:5px;font-size:11px;font-weight:760;min-width:72px;text-align:center;text-transform:uppercase;letter-spacing:.3px}
+.cat-enhancer{background:rgba(52,211,153,.12);color:var(--green);border:1px solid rgba(52,211,153,.26)}
+.cat-compress{background:rgba(96,165,250,.12);color:var(--blue);border:1px solid rgba(96,165,250,.26)}
+.cat-inject{background:rgba(251,191,36,.12);color:var(--amber);border:1px solid rgba(251,191,36,.26)}
+.cat-recall{background:rgba(167,139,250,.12);color:var(--violet);border:1px solid rgba(167,139,250,.26)}
+.cat-sync{background:rgba(244,114,182,.12);color:var(--pink);border:1px solid rgba(244,114,182,.26)}
+.cat-cache{background:rgba(20,184,166,.12);color:#5eead4;border:1px solid rgba(20,184,166,.26)}
+.cat-system{background:rgba(148,163,184,.12);color:#cbd5e1;border:1px solid rgba(148,163,184,.24)}
+.log-time{color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
+.log-msg{word-break:break-word;color:#d9e5f5}
+.log-detail{display:block;color:#93a4bb;font-size:11px;margin-top:4px;white-space:pre-wrap}
+.empty{padding:34px;text-align:center;color:var(--muted)}
+label{color:var(--muted)}input[type=checkbox]{accent-color:#3b82f6}
+@media(max-width:980px){.grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}#log-list{max-height:none}.latest-meta{grid-template-columns:1fr}.log-entry{grid-template-columns:1fr;gap:4px}.head{display:block}.top-actions{justify-content:flex-start;margin-top:10px}}
+</style>
+</head>
+<body>
+<div class="shell">
+<div class="head">
+<div>
+<div class="brand"><h1>memos-memory console</h1><span class="ver">v{{VERSION}}</span></div>
+<div class="sub">注入构成、上下文治理、enhancer、检索与同步事件的实时控制台。</div>
+</div>
+<div class="top-actions"><a href="/">WebUI</a><a href="/api/console/stats" target="_blank">Stats API</a></div>
+</div>
+
+<div class="stats">
+<div class="metric">Logs <span id="total">0</span></div>
+<div class="metric">Inject <span id="cnt-inject">0</span></div>
+<div class="metric">Provider Cache <span id="cnt-cache">0</span></div>
+<div class="metric">Enhancer <span id="cnt-enhancer">0</span></div>
+<div class="metric">Compress <span id="cnt-compress">0</span></div>
+<div class="metric">Sync <span id="cnt-sync">0</span></div>
+</div>
+
+<div class="grid">
+<section class="panel">
+<div class="panel-title"><span>Latest Injection Mix</span><span class="muted" id="latest-time">waiting</span></div>
+<div class="mix" id="latest-mix"></div>
+<div class="latest-meta">
+<div class="mini">Total input estimate<b id="latest-total">0</b></div>
+<div class="mini">Memory block<b id="latest-memory">0</b></div>
+<div class="mini">Memo count<b id="latest-count">0</b></div>
+</div>
+</section>
+<section class="panel">
+<div class="panel-title"><span>Recent Injection Samples</span><span class="muted">last 8</span></div>
+<div id="inject-table"></div>
+</section>
+</div>
+
+<div class="filter-bar">
+<button class="active" data-cat="">All</button>
+<button data-cat="enhancer">enhancer</button>
+<button data-cat="compress">compress</button>
+<button data-cat="inject">inject</button>
+<button data-cat="cache">cache</button>
+<button data-cat="recall">recall</button>
+<button data-cat="sync">sync</button>
+<button data-cat="system">system</button>
+<button id="refresh-btn">Refresh</button>
+<label style="display:flex;align-items:center;gap:4px;font-size:12px;margin-left:auto">
+<input type="checkbox" id="auto-refresh" checked> Auto
+</label>
+<button id="clear-btn" style="margin-left:8px">Clear</button>
+</div>
+
+<div id="log-list"><div class="empty">Loading...</div></div>
+</div>
+
+<script>
+var cat="", timer=null;
+var cats={enhancer:"cat-enhancer",compress:"cat-compress",inject:"cat-inject",cache:"cat-cache",recall:"cat-recall",sync:"cat-sync",system:"cat-system"};
+var labels={current_time:"当前时间",semantic_state:"滚动状态",profile:"旧画像",time_insight:"时间洞察",diary:"日记视角",event_core:"事件核心",evidence:"原文证据",memory_structure:"记忆结构",enhancer:"Enhancer",cache:"Provider缓存",context:"Astr上下文",other_extra:"其他注入",compress:"compress",inject:"inject",recall:"recall",sync:"sync",system:"system"};
+var mixKeys=["current_time","semantic_state","profile","time_insight","diary","event_core","evidence","memory_structure","enhancer","context","other_extra"];
+
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){if(c==="&")return "&amp;";if(c==="<")return "&lt;";if(c===">")return "&gt;";if(c==='"')return "&quot;";return "&#39;";});}
+function n(v){v=Number(v||0);return v.toLocaleString("zh-CN");}
+function pct(v,t){return t>0?Math.round((Number(v||0)*1000)/t)/10:0;}
+
+function setCat(c,btn){
+  cat=c;
+  document.querySelectorAll(".filter-bar button[data-cat]").forEach(function(b){b.classList.remove("active");});
+  if(btn)btn.classList.add("active");
+  fetchAll();
+}
+
+async function fetchAll(){await Promise.all([fetchLogs(),fetchStats()]);}
+
+async function fetchStats(){
+  try{
+    var r=await fetch("/api/console/stats");var d=await r.json();if(!d.ok)return;
+    var data=d.data||{}, latest=data.latest||{}, comp=latest.composition||{};
+    var total=Number(latest.total_est_chars||0);
+    document.getElementById("latest-time").textContent=latest.ts_iso||"waiting";
+    document.getElementById("latest-total").textContent=n(total)+" 字";
+    document.getElementById("latest-memory").textContent=n(latest.chars||0)+" 字";
+    document.getElementById("latest-count").textContent=n(latest.count||0);
+    var mix=document.getElementById("latest-mix");
+    if(!total){mix.innerHTML="<div class='empty'>还没有注入样本。对话触发一次召回后这里会显示占比。</div>";}
+    else{
+      mix.innerHTML=mixKeys.map(function(k){
+        var val=Number(comp[k]||0), p=pct(val,total);
+        return "<div class='mix-row'><div class='mix-name'>"+labels[k]+"</div><div class='bar'><div class='fill "+k+"' style='width:"+p+"%'></div></div><div class='mix-val'>"+n(val)+" / "+p+"%</div></div>";
+      }).join("");
+    }
+    var rows=(data.rows||[]).slice(-8).reverse();
+    var tbl=document.getElementById("inject-table");
+    if(!rows.length){tbl.innerHTML="<div class='empty'>No injection samples yet.</div>";}
+    else{
+      tbl.innerHTML="<table class='inject-table'><thead><tr><th>time</th><th>total</th><th>now</th><th>ctx</th><th>story</th><th>state</th><th>evidence</th><th>profile</th><th>enh</th><th>other</th><th>soft target</th></tr></thead><tbody>"
+        +rows.map(function(x){
+          var c=x.composition||{};
+          var b=x.injection_budget||{};
+          var budgetCell="-";
+          if(b.budget){budgetCell=n(b.before)+"→"+n(b.after)+" / 目标 "+n(b.budget);if((b.demoted||0)+(b.compacted||0)>0){budgetCell+=" (降"+n(b.demoted||0)+"/缩"+n(b.compacted||0)+")";}if((b.overflow_chars||0)>0){budgetCell+=" · 超 "+n(b.overflow_chars);}}
+          return "<tr><td>"+esc(x.ts_iso||"")+"</td><td>"+n(x.total_est_chars)+"</td><td>"+n(c.current_time)+"</td><td>"+n(c.context)+"</td><td>"+n(c.diary)+"</td><td>"+n(c.semantic_state)+"</td><td>"+n(c.evidence)+"</td><td>"+n(c.profile)+"</td><td>"+n(c.enhancer)+"</td><td>"+n(c.other_extra)+"</td><td>"+budgetCell+"</td></tr>";
+        }).join("")+"</tbody></table>";
+    }
+  }catch(e){}
+}
+
+async function fetchLogs(){
+  try{
+    var url=cat?"/api/logs?limit=300&category="+encodeURIComponent(cat):"/api/logs?limit=300";
+    var r=await fetch(url);var d=await r.json();if(!d.ok)return;
+    var logs=d.data.logs||[], counts=d.data.counts||{};
+    document.getElementById("total").textContent=n(d.data.total||0);
+    document.getElementById("cnt-enhancer").textContent=n(counts.enhancer||0);
+    document.getElementById("cnt-compress").textContent=n(counts.compress||0);
+    document.getElementById("cnt-inject").textContent=n(counts.inject||0);
+    document.getElementById("cnt-cache").textContent=n(counts.cache||0);
+    document.getElementById("cnt-sync").textContent=n(counts.sync||0);
+    var el=document.getElementById("log-list");
+    if(!logs.length){el.innerHTML="<div class='empty'>No logs yet. Logs appear after conversations.</div>";return;}
+    el.innerHTML=logs.map(function(l){
+      var detail=l.detail&&Object.keys(l.detail).length?" <span class='log-detail'>"+esc(JSON.stringify(l.detail))+"</span>":"";
+      return "<div class='log-entry'><span class='log-time'>"+esc(l.ts_iso||"")+"</span><span class='log-cat "+(cats[l.category]||"cat-system")+"'>"+esc(l.category||"system")+"</span><span class='log-msg'>"+esc(l.message||"")+detail+"</span></div>";
+    }).join("");
+  }catch(e){document.getElementById("log-list").innerHTML="<div class='empty'>Load failed: "+esc(e.message)+"</div>";}
+}
+
+async function clearLogs(){await fetch("/api/logs?clear=1");fetchAll();}
+function toggleAuto(){if(document.getElementById("auto-refresh").checked){timer=setInterval(fetchAll,3000);}else if(timer){clearInterval(timer);timer=null;}}
+
+document.querySelectorAll(".filter-bar button[data-cat]").forEach(function(btn){btn.addEventListener("click",function(){setCat(btn.dataset.cat,btn);});});
+document.getElementById("refresh-btn").addEventListener("click",fetchAll);
+document.getElementById("clear-btn").addEventListener("click",clearLogs);
+document.getElementById("auto-refresh").addEventListener("change",toggleAuto);
+toggleAuto();
+fetchAll();
+</script>
+</body>
+</html>"""
+
+
+_CONSOLE_HTML_V2 = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>memos-memory operations console</title>
+<style>
+:root{color-scheme:dark;--bg:#080d16;--panel:#0f1725;--panel2:#131d2e;--line:#263449;--line2:#1c293b;--text:#dbe7f6;--muted:#8393a9;--blue:#60a5fa;--green:#34d399;--amber:#fbbf24;--red:#f87171;--violet:#a78bfa;--pink:#f472b6;--cyan:#22d3ee}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Microsoft YaHei",monospace;background:radial-gradient(circle at 20% 0,#10213a 0,#080d16 32%,#070b12 100%);color:var(--text);padding:18px;font-size:12px;letter-spacing:0}
+.shell{max-width:1520px;margin:0 auto}.head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:14px}h1{font-size:18px;margin:0 0 6px;color:#fff;font-weight:760}.sub{font-size:12px;color:var(--muted);line-height:1.5}.top-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.top-actions a,.filter-bar button{padding:7px 12px;border:1px solid var(--line);border-radius:7px;background:var(--panel2);color:var(--text);cursor:pointer;font-size:12px;text-decoration:none}.top-actions a:hover,.filter-bar button:hover{border-color:#3b82f6;background:#17243a}
+.stats{display:grid;grid-template-columns:repeat(8,minmax(112px,1fr));gap:8px;margin-bottom:12px}.metric{background:rgba(15,23,37,.78);border:1px solid var(--line);border-radius:9px;padding:10px 12px;color:var(--muted)}.metric span{display:block;font-size:21px;line-height:1.1;margin-top:4px;color:#fff;font-weight:760;font-variant-numeric:tabular-nums}
+.grid{display:grid;grid-template-columns:1.05fr 1fr;gap:12px;margin-bottom:12px}.panel{background:rgba(15,23,37,.86);border:1px solid var(--line);border-radius:10px;padding:12px;box-shadow:0 24px 80px rgba(0,0,0,.24)}.panel-title{display:flex;justify-content:space-between;align-items:center;color:#fff;font-size:13px;font-weight:760;margin-bottom:10px}.muted{color:var(--muted)}
+.mix{display:grid;gap:8px}.mix-row{display:grid;grid-template-columns:92px 1fr 86px;gap:9px;align-items:center}.mix-name{color:#c7d2e3}.mix-val{color:#fff;text-align:right;font-variant-numeric:tabular-nums}.bar{height:9px;background:#0b1220;border:1px solid #1b293d;border-radius:999px;overflow:hidden}.fill{height:100%;width:0;background:var(--blue)}.fill.current_time{background:#f97316}.fill.semantic_state{background:#22c55e}.fill.profile{background:var(--violet)}.fill.diary{background:var(--amber)}.fill.event_core{background:#fb7185}.fill.evidence{background:#38bdf8}.fill.memory_structure{background:#94a3b8}.fill.time_insight{background:var(--cyan)}.fill.xinchao{background:#e879f9}.fill.enhancer{background:var(--green)}.fill.context{background:var(--blue)}.fill.other_extra{background:var(--pink)}
+.mini-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px}.mini{border:1px solid var(--line2);border-radius:7px;padding:8px;color:var(--muted);background:#0c1421}.mini b{display:block;color:#fff;font-size:15px;margin-top:2px;font-variant-numeric:tabular-nums}.state-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.state{border:1px solid var(--line2);border-radius:8px;background:#0c1421;padding:9px}.state strong{display:flex;align-items:center;justify-content:space-between;color:#fff;margin-bottom:6px}.dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:#64748b}.dot.on{background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.14)}.dot.off{background:#ef4444;box-shadow:0 0 0 3px rgba(239,68,68,.12)}.state pre{white-space:pre-wrap;color:#aebcd0;font-size:11px;line-height:1.45}
+.inject-table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}.inject-table th,.inject-table td{border-bottom:1px solid var(--line2);padding:7px 6px;text-align:right;white-space:nowrap}.inject-table th:first-child,.inject-table td:first-child{text-align:left}.inject-table th{color:var(--muted);font-weight:600}.inject-table td{color:#d9e5f5}
+.filter-bar{display:flex;gap:7px;margin-bottom:12px;flex-wrap:wrap;align-items:center;background:rgba(15,23,37,.72);border:1px solid var(--line);border-radius:10px;padding:10px}.filter-bar button.active{background:#1d4ed8;color:#fff;border-color:#3b82f6}label{color:var(--muted)}input[type=checkbox]{accent-color:#3b82f6}
+#log-list{background:rgba(15,23,37,.86);border-radius:10px;border:1px solid var(--line);max-height:calc(100vh - 610px);min-height:260px;overflow-y:auto;box-shadow:0 24px 80px rgba(0,0,0,.25)}.log-entry{padding:8px 12px;border-bottom:1px solid var(--line2);display:grid;grid-template-columns:86px 92px 1fr;gap:10px;align-items:flex-start;line-height:1.45}.log-entry:hover{background:#111d2f}.log-entry:last-child{border-bottom:none}.log-cat{display:inline-block;padding:2px 8px;border-radius:5px;font-size:11px;font-weight:760;min-width:72px;text-align:center;text-transform:uppercase;letter-spacing:.3px}.cat-xinchao{background:rgba(232,121,249,.12);color:#f0abfc;border:1px solid rgba(232,121,249,.26)}.cat-enhancer{background:rgba(52,211,153,.12);color:var(--green);border:1px solid rgba(52,211,153,.26)}.cat-compress{background:rgba(96,165,250,.12);color:var(--blue);border:1px solid rgba(96,165,250,.26)}.cat-inject{background:rgba(251,191,36,.12);color:var(--amber);border:1px solid rgba(251,191,36,.26)}.cat-recall{background:rgba(167,139,250,.12);color:var(--violet);border:1px solid rgba(167,139,250,.26)}.cat-sync{background:rgba(244,114,182,.12);color:var(--pink);border:1px solid rgba(244,114,182,.26)}.cat-cache{background:rgba(20,184,166,.12);color:#5eead4;border:1px solid rgba(20,184,166,.26)}.cat-system{background:rgba(148,163,184,.12);color:#cbd5e1;border:1px solid rgba(148,163,184,.24)}.log-time{color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}.log-msg{word-break:break-word;color:#d9e5f5}.log-detail{display:block;color:#93a4bb;font-size:11px;margin-top:4px;white-space:pre-wrap}.empty{padding:34px;text-align:center;color:var(--muted)}
+@media(max-width:980px){.head{display:block}.top-actions{justify-content:flex-start;margin-top:10px}.stats{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}.mini-grid,.state-grid{grid-template-columns:1fr}.log-entry{grid-template-columns:1fr;gap:4px}#log-list{max-height:none}}
+</style>
+</head>
+<body>
+<div class="shell">
+<div class="head">
+<div>
+<h1>memos-memory operations console <span class="muted" style="font-size:12px">v{{VERSION}}</span></h1>
+<div class="sub">1.10.x 风格运行控制台：查看真实注入构成、子系统状态、最近样本、检索、压缩、同步与缓存事件。</div>
+</div>
+<div class="top-actions"><a href="/">打开 WebUI</a><a href="/xinchao">心潮工作台</a><a href="/api/console/stats" target="_blank">Stats API</a><a href="/api/logs?limit=300" target="_blank">Logs API</a></div>
+</div>
+
+<div class="stats">
+<div class="metric">Total Logs <span id="total">0</span></div>
+<div class="metric">Inject <span id="cnt-inject">0</span></div>
+<div class="metric">Recall <span id="cnt-recall">0</span></div>
+<div class="metric">Provider Cache <span id="cnt-cache">0</span></div>
+<div class="metric">Xinchao <span id="cnt-xinchao">0</span></div>
+<div class="metric">Enhancer <span id="cnt-enhancer">0</span></div>
+<div class="metric">Compress <span id="cnt-compress">0</span></div>
+<div class="metric">Sync <span id="cnt-sync">0</span></div>
+</div>
+
+<div class="grid">
+<section class="panel">
+<div class="panel-title"><span>Latest Injection Mix</span><span class="muted" id="latest-time">waiting</span></div>
+<div class="mix" id="latest-mix"></div>
+<div class="mini-grid">
+<div class="mini">Total estimate<b id="latest-total">0 字</b></div>
+<div class="mini">Memory block<b id="latest-memory">0 字</b></div>
+<div class="mini">Memo count<b id="latest-count">0</b></div>
+</div>
+</section>
+<section class="panel">
+<div class="panel-title"><span>Subsystem State</span><span class="muted">current process</span></div>
+<div class="state-grid" id="state-grid"></div>
+</section>
+</div>
+
+<section class="panel" style="margin-bottom:12px">
+<div class="panel-title"><span>Recent Injection Samples</span><span class="muted">last 10</span></div>
+<div id="inject-table"></div>
+</section>
+
+<div class="filter-bar">
+<button class="active" data-cat="">All</button>
+<button data-cat="xinchao">xinchao</button>
+<button data-cat="enhancer">enhancer</button>
+<button data-cat="compress">compress</button>
+<button data-cat="inject">inject</button>
+<button data-cat="cache">cache</button>
+<button data-cat="recall">recall</button>
+<button data-cat="sync">sync</button>
+<button data-cat="system">system</button>
+<button id="refresh-btn">Refresh</button>
+<label style="display:flex;align-items:center;gap:4px;font-size:12px;margin-left:auto"><input type="checkbox" id="auto-refresh" checked> Auto</label>
+<button id="clear-btn" style="margin-left:8px">Clear</button>
+</div>
+
+<div id="log-list"><div class="empty">Loading...</div></div>
+</div>
+
+<script>
+var cat="", timer=null;
+var cats={xinchao:"cat-xinchao",enhancer:"cat-enhancer",compress:"cat-compress",inject:"cat-inject",cache:"cat-cache",recall:"cat-recall",sync:"cat-sync",system:"cat-system"};
+var labels={current_time:"当前时间",semantic_state:"滚动状态",profile:"旧画像",time_insight:"时间洞察",diary:"日记视角",event_core:"事件核心",evidence:"原文证据",memory_structure:"记忆结构",xinchao:"心潮状态",enhancer:"Enhancer",cache:"Provider缓存",context:"Astr上下文",other_extra:"其他注入"};
+var mixKeys=["current_time","semantic_state","profile","time_insight","diary","event_core","evidence","memory_structure","xinchao","enhancer","context","other_extra"];
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){if(c==="&")return"&amp;";if(c==="<")return"&lt;";if(c===">")return"&gt;";if(c==='"')return"&quot;";return"&#39;";});}
+function n(v){return Number(v||0).toLocaleString("zh-CN")}
+function pct(v,t){return t>0?Math.round((Number(v||0)*1000)/t)/10:0}
+function pretty(v){try{return JSON.stringify(v,null,2)}catch(e){return String(v)}}
+async function fetchJson(url){var r=await fetch(url);var d=await r.json();if(!d.ok)throw new Error(d.error||"request failed");return d.data}
+async function fetchAll(){await Promise.all([fetchStats(),fetchLogs()])}
+function renderMix(latest,totals){var comp=latest.composition||{},total=Number(latest.total_est_chars||0),label=latest.ts_iso||"waiting";if(latest.outcome)label+=" · "+latest.outcome;if(!total&&totals){comp=totals;total=mixKeys.reduce(function(s,k){return s+Number(comp[k]||0)},0);label=total?"累计样本":"waiting"}document.getElementById("latest-time").textContent=label;document.getElementById("latest-total").textContent=n(total)+" 字";document.getElementById("latest-memory").textContent=n(latest.chars||comp.diary||0)+" 字";document.getElementById("latest-count").textContent=n(latest.count||0);document.getElementById("latest-mix").innerHTML=total?mixKeys.map(function(k){var v=Number(comp[k]||0),p=pct(v,total);return"<div class='mix-row'><div class='mix-name'>"+labels[k]+"</div><div class='bar'><div class='fill "+k+"' style='width:"+p+"%'></div></div><div class='mix-val'>"+n(v)+" / "+p+"%</div></div>"}).join(""):"<div class='empty'>还没有请求样本。任意一次真实 LLM 对话后这里都会出现。</div>"}
+function renderStates(data){var f=data.features||{},rt=data.latest_runtime||{};var defs=[["xinchao","Xinchao",f.xinchao,rt.xinchao],["enhancer","RP enhancer",f.enhancer,rt.enhancer],["provider_cache","Provider cache",f.provider_cache,rt.provider_cache],["system_cache_guard","System guard",f.system_cache_guard,rt.system_cache_guard],["prefix_drift","Prefix drift",f.prefix_drift,rt.prefix_drift],["context","Context trim",f.context,rt.context],["archive","Context archive",f.archive,{}],["profile","Profile",f.profile,{}],["time_insight","Time insight",f.time_insight,{}]];document.getElementById("state-grid").innerHTML=defs.map(function(x){return"<div class='state'><strong>"+esc(x[1])+"<i class='dot "+(x[2]?"on":"off")+"'></i></strong><pre>"+esc(Object.keys(x[3]||{}).length?pretty(x[3]):(x[2]?"已启用，等待运行样本":"未启用"))+"</pre></div>"}).join("")}
+async function fetchStats(){try{var data=await fetchJson("/api/console/stats");renderMix(data.latest||{},data.totals||{});renderStates(data);var rows=(data.rows||[]).slice(-10).reverse();var tbl=document.getElementById("inject-table");if(!rows.length){tbl.innerHTML="<div class='empty'>还没有请求样本。任意一次真实 LLM 对话后这里都会出现。</div>"}else{tbl.innerHTML="<table class='inject-table'><thead><tr><th>time</th><th>result</th><th>total</th><th>now</th><th>ctx</th><th>story</th><th>state</th><th>evidence</th><th>profile</th><th>mind</th><th>enh</th><th>other</th></tr></thead><tbody>"+rows.map(function(x){var c=x.composition||{};return"<tr><td>"+esc(x.ts_iso||"")+"</td><td>"+esc(x.outcome||"legacy")+"</td><td>"+n(x.total_est_chars)+"</td><td>"+n(c.current_time)+"</td><td>"+n(c.context)+"</td><td>"+n(c.diary)+"</td><td>"+n(c.semantic_state)+"</td><td>"+n(c.evidence)+"</td><td>"+n(c.profile)+"</td><td>"+n(c.xinchao)+"</td><td>"+n(c.enhancer)+"</td><td>"+n(c.other_extra)+"</td></tr>"}).join("")+"</tbody></table>"}}catch(e){document.getElementById("latest-mix").innerHTML="<div class='empty'>Stats API failed: "+esc(e.message)+"</div>";document.getElementById("inject-table").innerHTML="<div class='empty'>无法读取 /api/console/stats："+esc(e.message)+"</div>"}}
+async function fetchLogs(){try{var data=await fetchJson(cat?"/api/logs?limit=300&category="+encodeURIComponent(cat):"/api/logs?limit=300");var counts=data.counts||{};document.getElementById("total").textContent=n(data.total||0);["xinchao","inject","recall","cache","enhancer","compress","sync"].forEach(function(k){var el=document.getElementById("cnt-"+k);if(el)el.textContent=n(counts[k]||0)});var logs=data.logs||[],el=document.getElementById("log-list");if(!logs.length){el.innerHTML="<div class='empty'>当前分类没有日志。只有实际触发过对应流程才会出现。</div>";return}el.innerHTML=logs.map(function(l){var detail=l.detail&&Object.keys(l.detail).length?"<span class='log-detail'>"+esc(JSON.stringify(l.detail))+"</span>":"";return"<div class='log-entry'><span class='log-time'>"+esc(l.ts_iso||"")+"</span><span class='log-cat "+(cats[l.category]||"cat-system")+"'>"+esc(l.category||"system")+"</span><span class='log-msg'>"+esc(l.message||"")+detail+"</span></div>"}).join("")}catch(e){document.getElementById("log-list").innerHTML="<div class='empty'>Load failed: "+esc(e.message)+"</div>"}}
+function setCat(c,btn){cat=c;document.querySelectorAll(".filter-bar button[data-cat]").forEach(function(b){b.classList.toggle("active",b===btn)});fetchAll()}
+async function clearLogs(){await fetch("/api/logs?clear=1");fetchAll()}
+function toggleAuto(){if(document.getElementById("auto-refresh").checked){if(!timer)timer=setInterval(fetchAll,3000)}else if(timer){clearInterval(timer);timer=null}}
+document.querySelectorAll(".filter-bar button[data-cat]").forEach(function(btn){btn.addEventListener("click",function(){setCat(btn.dataset.cat,btn)})});
+document.getElementById("refresh-btn").addEventListener("click",fetchAll);
+document.getElementById("clear-btn").addEventListener("click",clearLogs);
+document.getElementById("auto-refresh").addEventListener("change",toggleAuto);
+toggleAuto();fetchAll();
+</script>
+</body>
+</html>"""

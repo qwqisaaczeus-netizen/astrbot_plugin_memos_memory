@@ -1,0 +1,1215 @@
+{
+  "enable": {
+    "type": "bool",
+    "description": "启用插件总开关",
+    "default": true
+  },
+  "character_name": {
+    "type": "string",
+    "description": "角色名(第一人称日记的主角) — 你自己用填你的角色名, 分享给别人用填别人的",
+    "hint": "例如: 林悔儿 / 阿月 / 爱莉希雅。留空则不会压缩(压缩需要知道以谁的口吻写日记)。",
+    "default": ""
+  },
+  "memos_base_url": {
+    "type": "string",
+    "description": "memos 服务地址",
+    "hint": "external 模式使用这里；managed 模式启动后会自动使用托管端口。不要在地址里带 token。",
+    "default": "http://127.0.0.1:5230"
+  },
+  "memos_mode": {
+    "type": "string",
+    "description": "Memos 运行模式(external|managed)",
+    "hint": "external=你自己启动 Memos；managed=插件只管理指定目录里的 memos.exe，不扫描本机其他 Memos。默认 external，避免误碰多开的实例。",
+    "default": "external"
+  },
+  "managed_memos_dir": {
+    "type": "string",
+    "description": "托管 Memos 工作目录",
+    "hint": "managed 模式使用。请把 memos.exe 放到这个目录，默认在 AstrBot data 目录下。",
+    "default": "./data/astrbot_plugin_memos_memory/managed_memos"
+  },
+  "managed_memos_exe": {
+    "type": "string",
+    "description": "托管 memos.exe 路径",
+    "hint": "managed 模式只启动这个明确配置的 exe，不自动扫描系统。",
+    "default": "./data/astrbot_plugin_memos_memory/managed_memos/memos.exe"
+  },
+  "managed_memos_data_dir": {
+    "type": "string",
+    "description": "托管 Memos 数据目录",
+    "hint": "默认放在 AstrBot data 目录下。这里是 Memos 自己的数据库位置，不是插件向量库。",
+    "default": "./data/astrbot_plugin_memos_memory/managed_memos/data"
+  },
+  "managed_memos_host": {
+    "type": "string",
+    "description": "托管 Memos 监听地址",
+    "hint": "默认 127.0.0.1，只允许本机访问；需要局域网访问再改成 0.0.0.0。",
+    "default": "127.0.0.1"
+  },
+  "managed_memos_port": {
+    "type": "int",
+    "description": "托管 Memos 固定端口",
+    "hint": "0=自动从 managed_memos_port_start 开始找空闲端口；非0=使用指定端口。若指定端口已被占用，插件不会杀进程，只会标记为已有进程。",
+    "default": 0
+  },
+  "managed_memos_port_start": {
+    "type": "int",
+    "description": "托管 Memos 自动端口起点",
+    "hint": "managed_memos_port=0 时生效，默认从 5230 起找空闲端口。",
+    "default": 5230
+  },
+  "memos_token": {
+    "type": "string",
+    "description": "memos 访问令牌 (在 memos 设置 - 我的账户 - 访问令牌 里创建)",
+    "hint": "Bearer Token。私人记忆建议用 PRIVATE 可见性(插件已默认)。",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "memos_timeout": {
+    "type": "int",
+    "description": "memos 请求超时(秒)",
+    "default": 30
+  },
+  "emb_provider_id": {
+    "type": "string",
+    "description": "记忆检索用的 Embedding 模型 Provider ID(手填)",
+    "hint": "填你在 AstrBot 配好的 embedding provider 的 ID(在 AstrBot 服务提供商管理页能看到)。留空则自动用第一个可用的。换了模型后请运行 /memos-reindex 重灌。注意:AstrBot 的 provider 下拉只列聊天 LLM,不列 embedding 模型,所以这里只能手填 ID。",
+    "default": ""
+  },
+  "compress_provider_id": {
+    "type": "string",
+    "description": "压缩日记用的 LLM 模型(下拉选已配的 Provider)",
+    "hint": "下拉选择用哪个 LLM 来把对话压成日记。留空则用当前对话正在用的 LLM。建议选一个便宜稳定的模型省成本。",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "compress_llm_timeout": {
+    "type": "float",
+    "description": "日记压缩 LLM 调用超时秒数",
+    "hint": "默认 120 秒。保底压缩可能要求模型重写两篇，慢模型可调到 180；超时只保留缓冲，不会删除未压缩对话。",
+    "default": 120
+  },
+  "vec_db_path": {
+    "type": "string",
+    "description": "向量库(sqlite-vec)文件路径",
+    "hint": "默认放在 data 目录下。这是检索索引; memos 才是记忆真相源, 此库可随时 /memos-reindex 重建。",
+    "default": "./data/astrbot_plugin_memos_memory/memories.db"
+  },
+  "episodic_memory_enable": {
+    "type": "bool",
+    "description": "启用 4.x 原文证据与情景底座",
+    "hint": "建议开启。Memos 继续保存可阅读日记；独立 SQLite 保存原始对话证据、情景卡、滚动状态、版本队列和评测集。关闭后当前精简主路不可用并回退 3.x。",
+    "default": true
+  },
+  "episodic_db_path": {
+    "type": "string",
+    "description": "情景记忆与原始证据数据库路径",
+    "hint": "默认与向量库放在同一 data 目录。它不改写 Memos 数据库，也不与旧 memories.db 共用连接。修改后需重载插件。",
+    "default": "./data/astrbot_plugin_memos_memory/episodic_memory.db"
+  },
+  "evidence_first_generation_enable": {
+    "type": "bool",
+    "description": "启用证据优先双阶段记忆生成",
+    "hint": "第一阶段从带轮次编号的原始对话提取可核验证据和心理变化，第二阶段才写文学日记。失败会回退原有单阶段日记流程并保留缓冲。",
+    "default": true
+  },
+  "raw_evidence_archive_enable": {
+    "type": "bool",
+    "description": "归档已压缩对话的原始证据",
+    "hint": "建议开启。原始轮次只写入本地 episodic_memory.db，不写进 Memos 正文；同一批次按内容哈希幂等归档。",
+    "default": true
+  },
+  "episode_extraction_provider_id": {
+    "type": "string",
+    "description": "情景与证据提取模型",
+    "hint": "留空继承日记压缩 Provider。效果优先时可选择更擅长结构化抽取和角色心理理解的模型。",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "episode_extraction_timeout": {
+    "type": "float",
+    "description": "情景证据提取超时秒数",
+    "min": 10,
+    "max": 600,
+    "default": 120
+  },
+  "diary_render_provider_id": {
+    "type": "string",
+    "description": "第一人称文学日记渲染模型",
+    "hint": "留空继承日记压缩 Provider。只负责在证据边界内写完整、有文学性的角色日记。",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "diary_render_timeout": {
+    "type": "float",
+    "description": "文学日记渲染超时秒数",
+    "min": 10,
+    "max": 600,
+    "default": 150
+  },
+  "episodic_auto_migrate": {
+    "type": "bool",
+    "description": "启动后自动对接已有 Memos 日记",
+    "hint": "只建立本地情景卡和旧日记推导证据，不改 Memos 原文；重复运行幂等。",
+    "default": true
+  },
+  "episode_migration_wait_seconds": {
+    "type": "float",
+    "description": "首轮请求等待情景迁移的秒数",
+    "hint": "默认 6。重载后旧记忆桥接仍在运行时，请求最多等待该时长（shield 保护，超时不取消迁移），避免首轮错误回退旧 multi-query 注入 14 篇全文。设 0 关闭等待。",
+    "min": 0,
+    "max": 30,
+    "default": 6.0
+  },
+  "episodic_candidate_pool": {
+    "type": "int",
+    "description": "4.0 回退级联候选数",
+    "hint": "仅在关闭当前精简主路时使用：先用情景卡缩小范围，再在候选日记段落中精搜。默认 18。",
+    "min": 8,
+    "max": 60,
+    "default": 18
+  },
+  "episodic_default_inject": {
+    "type": "int",
+    "description": "4.0 回退普通注入数",
+    "min": 1,
+    "max": 12,
+    "default": 5
+  },
+  "episodic_narrative_inject": {
+    "type": "int",
+    "description": "4.0 回退叙事注入数",
+    "hint": "仅在关闭当前精简主路时使用；明确询问以前、后来、完整过程等叙事问题时扩大。",
+    "min": 1,
+    "max": 14,
+    "default": 8
+  },
+  "episodic_evidence_per_memory": {
+    "type": "int",
+    "description": "每条记忆最多注入几项查询相关证据",
+    "min": 1,
+    "max": 8,
+    "default": 3
+  },
+  "episodic_full_diary_limit": {
+    "type": "int",
+    "description": "每轮最多优先注入几篇完整日记",
+    "hint": "默认 1。其余记忆用相关段落与证据包补细节；明确需要完整过程时仍可保护必要日记。",
+    "min": 0,
+    "max": 6,
+    "default": 1
+  },
+  "episodic_min_card_score": {
+    "type": "float",
+    "description": "4.0 回退情景卡最低分",
+    "hint": "仅在关闭当前精简主路时使用。默认 0.40；过高可能漏掉隐含相关记忆。",
+    "min": 0.1,
+    "max": 0.9,
+    "step": 0.01,
+    "default": 0.4
+  },
+  "semantic_state_enable": {
+    "type": "bool",
+    "description": "启用 4.1 滚动当前状态文档",
+    "hint": "建议开启。日记记发生过什么；这份可覆盖状态只记角色现在的关系位置、承诺边界、行为倾向、近期情绪和未解决事项。",
+    "default": true
+  },
+  "semantic_state_provider_id": {
+    "type": "string",
+    "description": "滚动状态融合模型",
+    "hint": "留空继承压缩模型。状态更新需要理解新旧矛盾、承诺和关系变化，效果优先时建议使用稳定的结构化输出模型。",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "semantic_state_timeout": {
+    "type": "float",
+    "description": "滚动状态融合超时秒数",
+    "min": 20,
+    "max": 600,
+    "default": 120
+  },
+  "semantic_state_target_chars": {
+    "type": "int",
+    "description": "滚动状态目标字数",
+    "hint": "默认 1800，是融合目标而不是简单截断。超长会要求模型合并同义项；重要承诺、边界和未解决事项不能被截掉。",
+    "min": 600,
+    "max": 6000,
+    "default": 1800
+  },
+  "semantic_state_auto_bootstrap": {
+    "type": "bool",
+    "description": "从现有 4.0 数据自动初始化滚动状态",
+    "hint": "升级后读取已有画像种子、最近情景卡和高重要度旧记忆建立首版状态，不改写 Memos 和原有 4.0 数据。",
+    "default": true
+  },
+  "semantic_state_bootstrap_episode_limit": {
+    "type": "int",
+    "description": "首次状态融合最多读取多少个情景",
+    "min": 20,
+    "max": 500,
+    "default": 120
+  },
+  "semantic_state_replace_profile": {
+    "type": "bool",
+    "description": "状态就绪后接管旧画像注入",
+    "hint": "建议开启。旧画像和历史仍保留并作为首次融合种子，但不再与当前状态重复注入，也不再自动周期更新旧画像。",
+    "default": true
+  },
+  "lean_recall_enable": {
+    "type": "bool",
+    "description": "启用 4.x 当前精简检索主路",
+    "hint": "当前推荐且默认启用：同一个 query 向量并行检索事件卡、文学日记段落和原始对话轮次，叠加 BM25；只有具体时间意图才增加 temporal 候选；最后统一 rerank 一次。关闭时才回退 4.0 情景卡级联。",
+    "default": true
+  },
+  "lean_recall_candidate_k": {
+    "type": "int",
+    "description": "精简检索候选池",
+    "hint": "默认 50。召回阶段适当放宽，最终只注入少量剧情。",
+    "min": 20,
+    "max": 120,
+    "default": 50
+  },
+  "lean_event_index_enable": {
+    "type": "bool",
+    "description": "精简主路同时检索事件级索引",
+    "hint": "建议开启。与段落索引复用同一个 query embedding，让整件事和局部细节互相救回，不增加 query embedding 次数。",
+    "default": true
+  },
+  "lean_source_evidence_enable": {
+    "type": "bool",
+    "description": "精简主路同时检索原始对话证据",
+    "hint": "建议开启。原始轮次与事件卡、日记段落复用同一个 query embedding，可独立救回日记没有写进正文的细节；只对有原文档案的新记忆生效，旧日记自动兼容。",
+    "default": true
+  },
+  "lean_coverage_selection_enable": {
+    "type": "bool",
+    "description": "启用证据覆盖选择器",
+    "hint": "建议开启。保护不同日期、人物、承诺、关系变化和未解决事项；只拦截同日同事实的重复，不按相似主题删记忆。",
+    "default": true
+  },
+  "lean_adaptive_evidence_enable": {
+    "type": "bool",
+    "description": "原始证据按需展开",
+    "hint": "建议开启。普通 RP 不重复追加证据；具体日期、原话、承诺、边界或争议问题才展开 1-2 组原始证据。",
+    "default": true
+  },
+  "passage_vector_auto_migrate": {
+    "type": "bool",
+    "description": "自动迁移旧段落为纯正文向量",
+    "hint": "建议开启。升级后后台重算本地 passage 向量，不修改 Memos；完成前继续使用旧向量回退。更换 embedding 模型时仍应运行 /memos-reindex。",
+    "default": true
+  },
+  "source_turn_vector_auto_migrate": {
+    "type": "bool",
+    "description": "自动建立原始轮次向量索引",
+    "hint": "建议开启。后台为已有原文档案建立可重建索引，不修改 Memos 或原始对话；失败时继续使用事件卡和日记路线。",
+    "default": true
+  },
+  "lean_temporal_enable": {
+    "type": "bool",
+    "description": "时间问题启用独立 temporal 候选",
+    "hint": "只在问题含具体日期、月份、去年、昨天等可定位时间时触发，不使用额外 embedding。",
+    "default": true
+  },
+  "lean_story_min_inject": {
+    "type": "int",
+    "description": "精简主路最少剧情记忆数",
+    "min": 0,
+    "max": 6,
+    "default": 1
+  },
+  "lean_story_max_inject": {
+    "type": "int",
+    "description": "精简主路最多剧情记忆数",
+    "hint": "默认 6。4.5 起注入量由字符预算与资格线共同治理，条数只是硬顶；普通问题按 lean_story_normal_inject 取目标，叙事或明确时间问题可扩展到本上限，不会为了凑数绕过资格线。",
+    "min": 1,
+    "max": 10,
+    "default": 6
+  },
+  "lean_story_normal_inject": {
+    "type": "int",
+    "description": "普通问题的剧情注入目标条数",
+    "hint": "默认 3。非叙事、非明确时间问题时的目标条数；实际条数仍受资格线与证据覆盖选择约束，合格候选不足时不会凑数。",
+    "min": 1,
+    "max": 10,
+    "default": 3
+  },
+  "lean_relative_margin": {
+    "type": "float",
+    "description": "普通问题的相对分差容忍度",
+    "hint": "默认 0.24（4.4 为 0.16）。候选比最强命中低超过该值才被相对分差裁掉；调大可减少漏注入，调小注入更保守。",
+    "min": 0.08,
+    "max": 0.6,
+    "default": 0.24
+  },
+  "lean_relative_margin_broad": {
+    "type": "float",
+    "description": "叙事/时间问题的相对分差容忍度",
+    "hint": "默认 0.34（4.4 为 0.25）。叙事与明确时间问题允许更宽的分差范围，减少长线剧情被相对分差误伤。",
+    "min": 0.08,
+    "max": 0.8,
+    "default": 0.34
+  },
+  "recall_safety_net_enable": {
+    "type": "bool",
+    "description": "不漏检安全网：弱结果时自动触发旧复合链宽搜",
+    "hint": "默认开启。精简主路选择结果为空或过弱时，自动用 3.x 多路检索+月份分支补一轮候选再重新选择；只在弱结果轮次产生额外 embedding 开销。",
+    "default": true
+  },
+  "recall_safety_net_min_selected": {
+    "type": "int",
+    "description": "安全网触发的最少入选条数门槛",
+    "hint": "默认 2。入选条数低于该值且最高分同时低于分数门槛时触发宽搜救回。",
+    "min": 1,
+    "max": 4,
+    "default": 2
+  },
+  "recall_safety_net_min_top_score": {
+    "type": "float",
+    "description": "安全网触发的最高分门槛",
+    "hint": "默认 0.60。与最少入选条数联合判定：条数不足且最高注入分低于该值才触发，避免强单命中时的无谓宽搜。",
+    "min": 0.3,
+    "max": 0.9,
+    "default": 0.6
+  },
+  "inject_char_budget": {
+    "type": "int",
+    "description": "记忆注入软字符目标（0 关闭）",
+    "hint": "默认 10000。超出目标时按排名从低到高逐条降级（完整日记→相关段落→紧凑摘录），绝不丢弃已入选记忆；最高分记忆始终保持原始形态，因此必要时允许超过目标，并在 Console 明确显示超出量。设 0 关闭紧凑治理。",
+    "min": 0,
+    "max": 30000,
+    "default": 10000
+  },
+  "inject_compact_chars": {
+    "type": "int",
+    "description": "紧凑摘录的日记正文保留字数",
+    "hint": "默认 200。预算降级到紧凑摘录时保留的日记正文长度；事件核心完整保留，一手证据最多 1 条。",
+    "min": 80,
+    "max": 600,
+    "default": 200
+  },
+  "lean_texture_enable": {
+    "type": "bool",
+    "description": "允许精简主路注入日常 texture",
+    "hint": "默认关闭，避免生活碎片挤占剧情细节。日常内容仍保存在 Memos 和原文档案中，可在召回实验室查看。",
+    "default": false
+  },
+  "enable_auto_compress": {
+    "type": "bool",
+    "description": "启用自动压缩(每 N 轮把对话压成日记)",
+    "default": true
+  },
+  "compress_every_n_turns": {
+    "type": "int",
+    "description": "每多少轮 assistant 回复触发一次压缩(数轮数, 不数消息条数)",
+    "hint": "默认 30。1 轮 = 你 1 句 + 角色 1 句 = 2 条消息。太小频繁调 LLM 增加成本, 太大近期记忆入库延迟。",
+    "default": 30
+  },
+  "diary_count": {
+    "type": "int",
+    "description": "每次压缩写几篇日记",
+    "hint": "默认 2。一段 30 轮对话通常有 1-3 个独立场景, 2 篇较平衡。",
+    "default": 2
+  },
+  "compress_batch_max_messages": {
+    "type": "int",
+    "description": "单次压缩最多处理多少条持久缓冲消息",
+    "hint": "默认 60 条，约 30 轮。超过部分留在 sqlite 等下一批，避免提示词过长或旧消息未进入 prompt 却被清除。",
+    "default": 60
+  },
+  "eod_checkpoint_enable": {
+    "type": "bool",
+    "description": "启用每天 23:45 夜间记忆检查点",
+    "hint": "建议开启。只处理仍在 pending buffer 的完整轮次；成功后依次保留原文档案、Memos 文学日记、情景入口并排队更新滚动状态。",
+    "default": true
+  },
+  "eod_checkpoint_min_turns": {
+    "type": "int",
+    "description": "夜间检查点最少完整轮数",
+    "hint": "默认 1。单轮也可能包含承诺或关系变化；证据提取仍可判断没有长期价值并保留缓冲，不会虚构日记。",
+    "min": 1,
+    "max": 8,
+    "default": 1
+  },
+  "eod_checkpoint_max_diaries": {
+    "type": "int",
+    "description": "夜间单批最多情景容量",
+    "hint": "默认 6。它是提取容量而不是必须凑满的篇数；真实跨日数量可以突破该值以保证日期覆盖。",
+    "min": 1,
+    "max": 12,
+    "default": 6
+  },
+  "enable_auto_recall": {
+    "type": "bool",
+    "description": "启用自动检索注入(每次对话前召回相关记忆注入 prompt)",
+    "default": true
+  },
+  "recall_top_k": {
+    "type": "int",
+    "description": "分层召回的兼容兜底数量",
+    "hint": "1.9 以后主要由 persona_top_k / plot_top_k / texture_top_k 控制。这里作为兜底候选上限, 建议保持 6。",
+    "default": 6
+  },
+  "enable_layered_injection": {
+    "type": "bool",
+    "description": "启用分层注入：长期人格影响、剧情连续性、日常氛围分开喂给模型",
+    "hint": "建议开启。人格记忆会要求模型演出来，剧情记忆只在需要时自然提起。",
+    "default": true
+  },
+  "enable_injection_style_rules": {
+    "type": "bool",
+    "description": "启用注入风格规则",
+    "hint": "建议开启。会明确要求模型把人格记忆演出来，不机械复述；剧情只在相关时承接；日常碎片只作氛围。",
+    "default": true
+  },
+  "enable_time_insight_affiliate": {
+    "type": "bool",
+    "description": "启用内置时间洞察",
+    "hint": "主插件从已有日记构建周年、近期变化和跨年模式证据。旧附属插件仍启用时会自动让出，避免重复注入。",
+    "default": true
+  },
+  "time_insight_max_age_days": {
+    "type": "int",
+    "description": "旧附属洞察最大兼容天数",
+    "hint": "仅在检测到旧附属插件时使用。内置引擎按日期与更新间隔自行刷新。",
+    "default": 30
+  },
+  "time_insight_auto_update_hours": {
+    "type": "float",
+    "default": 12,
+    "description": "时间洞察自动重建间隔（小时）",
+    "hint": "还会在日期变化后重建；设 0 关闭后台自动重建，手动更新仍可用。"
+  },
+  "time_insight_source_memo_limit": {
+    "type": "int",
+    "default": 5000,
+    "description": "时间洞察最多读取日记数",
+    "hint": "只在后台重建时读取，不增加每轮检索候选数。"
+  },
+  "time_insight_recent_window_days": {
+    "type": "int",
+    "default": 21,
+    "description": "近期变化观察窗口（天）",
+    "hint": "用于判断关系、情绪、行为倾向是否在多个不同日期持续出现。"
+  },
+  "time_insight_anniversary_window_days": {
+    "type": "int",
+    "default": 2,
+    "description": "周年邻近窗口（天）",
+    "hint": "邻近周年只进入候选，默认不会作为无关对话里的环境洞察。"
+  },
+  "time_insight_min_importance": {
+    "type": "int",
+    "default": 3,
+    "description": "时间洞察最低记忆重要性",
+    "hint": "手动记忆和高反馈记忆可越过此门槛。"
+  },
+  "time_insight_min_evidence_score": {
+    "type": "float",
+    "default": 0.68,
+    "description": "时间证据最低分",
+    "hint": "越高越克制。日期可信度、重要性、正文质量、反馈和记忆类型共同参与。"
+  },
+  "time_insight_trend_min_distinct_days": {
+    "type": "int",
+    "default": 3,
+    "description": "近期趋势最少不同日期",
+    "hint": "同一天多篇相似日记不能冒充跨日趋势。"
+  },
+  "time_insight_trend_min_evidence": {
+    "type": "int",
+    "default": 3,
+    "description": "近期趋势最少独立证据",
+    "hint": "证据会按日记和文本相似度去重。"
+  },
+  "time_insight_seasonal_min_years": {
+    "type": "int",
+    "default": 3,
+    "description": "季节模式最少跨年数",
+    "hint": "至少三个独立年份才建立同月模式，并且只在本轮查询相关时注入。"
+  },
+  "time_insight_ambient_max_insights": {
+    "type": "int",
+    "default": 1,
+    "description": "每轮最多环境洞察数",
+    "hint": "仅允许同日周年或高置信近期趋势；默认 1 条，避免时间层抢占日记。"
+  },
+  "time_insight_ambient_max_chars": {
+    "type": "int",
+    "default": 620,
+    "description": "环境洞察字符上限",
+    "hint": "限制今日自然余韵的独立注入体积。"
+  },
+  "time_insight_repeat_cooldown_minutes": {
+    "type": "int",
+    "default": 180,
+    "description": "相同环境洞察冷却（分钟）",
+    "hint": "相同日历回声不会每轮重复；明确询问日期或旧事时允许再次出现。"
+  },
+  "time_insight_query_enable": {
+    "type": "bool",
+    "default": true,
+    "description": "启用按问题触发的时间洞察",
+    "hint": "只在本轮用词、人物或日期确实命中候选时临时注入，不调用 LLM。"
+  },
+  "time_insight_query_max_insights": {
+    "type": "int",
+    "default": 2,
+    "description": "每轮最多查询洞察数",
+    "hint": "与普通日记召回并行，不占剧情记忆数量份额。"
+  },
+  "time_insight_query_min_score": {
+    "type": "float",
+    "default": 0.42,
+    "description": "查询洞察最低匹配分",
+    "hint": "综合候选质量、词面重合、人物命中、明确日期和时间意图。"
+  },
+  "time_insight_query_max_chars": {
+    "type": "int",
+    "default": 900,
+    "description": "查询洞察字符上限",
+    "hint": "只控制时间洞察块，不改变普通日记注入预算。"
+  },
+  "time_insight_query_lookup_timeout": {
+    "type": "float",
+    "default": 0.8,
+    "description": "每轮本地查询超时（秒）",
+    "hint": "只查本地 SQLite；超时会跳过洞察并放行当前请求。"
+  },
+  "time_insight_llm_refine_enable": {
+    "type": "bool",
+    "default": true,
+    "description": "后台 LLM 证据审校",
+    "hint": "仅在周期/手动重建时调用，不在每轮聊天调用；失败保留确定性结果。"
+  },
+  "time_insight_llm_provider_id": {
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "description": "时间洞察审校模型",
+    "hint": "留空跟随最近会话模型。只能精炼已有证据，不能创造事件。"
+  },
+  "time_insight_llm_timeout": {
+    "type": "float",
+    "default": 45,
+    "description": "时间洞察审校超时（秒）",
+    "hint": "后台超时不影响聊天和确定性洞察。"
+  },
+  "time_insight_llm_min_confidence": {
+    "type": "float",
+    "default": 0.72,
+    "description": "采用 LLM 审校的最低置信度",
+    "hint": "低于门槛或引用非法证据时自动弃用模型改写。"
+  },
+  "time_insight_diagnostic_log": {
+    "type": "bool",
+    "default": true,
+    "description": "时间洞察诊断日志",
+    "hint": "在 Astr Console 记录重建来源、候选、环境/查询注入和失败降级。"
+  },
+  "persona_top_k": {
+    "type": "int",
+    "description": "每次注入最多召回几条长期人格影响记忆",
+    "hint": "偏角色内心长期塑形，推荐 3。包括关系变化、情绪锚点、行为倾向、承诺规则。",
+    "default": 3
+  },
+  "plot_top_k": {
+    "type": "int",
+    "description": "每次注入最多召回几条剧情连续性记忆",
+    "hint": "用于避免剧情穿帮，默认 2。当前话题明确相关时才自然提起。",
+    "default": 2
+  },
+  "texture_top_k": {
+    "type": "int",
+    "description": "每次注入最多召回几条日常氛围记忆",
+    "hint": "默认 1，只提供语气和生活质感，不抢主线。",
+    "default": 1
+  },
+  "min_similarity_to_inject": {
+    "type": "float",
+    "description": "相似度低于此阈值的记忆不注入(0-1, 越高越严格)",
+    "hint": "推荐 0.52。调高=只召回非常相关的, 调低=召回更宽泛。这是硬门槛, 不相关的记忆绝不会因重要性高而被召回。",
+    "default": 0.52
+  },
+  "w_relevance": {
+    "type": "float",
+    "description": "排序权重-语义相关度(推荐 0.72)",
+    "hint": "综合分 = 相关度*w_relevance + 重要性*w_importance + 新近度*w_recency。相关度是主导项。",
+    "default": 0.72
+  },
+  "w_importance": {
+    "type": "float",
+    "description": "排序权重-长期重要性(推荐 0.23)",
+    "hint": "importance 4-5 的关键剧情、关系变化、承诺和情绪锚点会排在日常琐事前。调高=更偏重大事件。",
+    "default": 0.23
+  },
+  "w_recency": {
+    "type": "float",
+    "description": "排序权重-新近度(推荐 0.03, 仅微调)",
+    "hint": "极小值。日记式记忆不做时间衰减 —— RP 初遇/定情往往最老最珍贵, 衰减会把它们埋掉。这里只在综合分接近时让新记忆略优先。",
+    "default": 0.03
+  },
+  "pin_boost": {
+    "type": "float",
+    "description": "手动钉记忆(/memos-remember)的额外加成(推荐 0.18)",
+    "hint": "你手动钉的记忆在综合分上额外 +0.18, 让关键瞬间更容易被召回。设 0 则手动记忆和自动的同等对待。",
+    "default": 0.18
+  },
+  "inject_order": {
+    "type": "string",
+    "description": "注入顺序(relevance|story_time|insert_time, 默认 relevance)",
+    "hint": "relevance=按综合分; story_time=按剧情时间(date_text)倒序; insert_time=按入库时间倒序。",
+    "default": "relevance"
+  },
+  "inject_format": {
+    "type": "string",
+    "description": "注入格式(diary|summary|quote, 默认 diary)",
+    "hint": "diary=纯原文; summary=前 N 字摘要(省 token); quote=引用体(你曾在X记下:...)。",
+    "default": "diary"
+  },
+  "summary_chars": {
+    "type": "int",
+    "description": "summary 格式的截断长度(默认 200)",
+    "hint": "inject_format=summary 时生效。",
+    "default": 200
+  },
+  "recall_dedup_window": {
+    "type": "int",
+    "description": "注入防重复窗口(最近 N 轮已注入过的 memo 不再注入, 0=关闭)",
+    "hint": "默认 6。LLM 已经看到的内容不要再灌, 省 token 也避免重复打扰。",
+    "default": 6
+  },
+  "recall_candidate_pool": {
+    "type": "int",
+    "description": "召回后处理候选池大小",
+    "hint": "先多拿候选，再由规则重排、动态数量和相似簇折叠决定最终注入。建议 20-30。",
+    "default": 24
+  },
+  "recall_context_query_messages": {
+    "type": "int",
+    "description": "召回 query 拼接最近多少条上下文消息",
+    "hint": "默认 3。会排除 system 和与当前用户输入重复的消息；设 0 只使用当前输入。",
+    "default": 3
+  },
+  "recall_context_query_max_chars": {
+    "type": "int",
+    "description": "召回 query 的上下文线索最大字符数",
+    "hint": "默认 900。防止长 RP 上下文整体进入 embedding/rerank；不影响真正发送给 LLM 的 Astr 上下文。",
+    "default": 900
+  },
+  "recall_multi_query_enable": {
+    "type": "bool",
+    "description": "启用多路意图 Query 与 RRF 融合",
+    "hint": "分别检索当前表达、上下文、人物物件、关系情绪和时间事件，再融合候选。默认开启，不额外调用 LLM。",
+    "default": true
+  },
+  "recall_rrf_k": {
+    "type": "int",
+    "description": "多路检索 RRF 平滑常数",
+    "hint": "默认 60。一般无需修改；越小越强调每一路最前面的结果。",
+    "default": 60
+  },
+  "recall_month_route_enable": {
+    "type": "bool",
+    "description": "启用并行月份路由",
+    "hint": "独立于全库检索并行运行，只补充候选，不把月份作为硬过滤条件；失败或超时不会影响原检索。",
+    "default": true
+  },
+  "recall_month_route_count": {
+    "type": "int",
+    "description": "月份路由最多展开月份数",
+    "hint": "默认 2。每月使用多向量主题索引定位，最终仍回到原始日记和段落检索。",
+    "default": 2
+  },
+  "recall_month_route_candidate_k": {
+    "type": "int",
+    "description": "月份分支候选日记数",
+    "hint": "默认 8。这里只控制月份分支的检索池，不占用原检索候选数量。",
+    "default": 8
+  },
+  "recall_month_route_inject_max": {
+    "type": "int",
+    "description": "月份分支最多额外注入篇数",
+    "hint": "默认 2。使用独立补充名额，原检索先按原规则完整选完；月份候选只能追加，不能挤掉原检索结果。设为 0 可只观察月份路由而不额外注入。",
+    "default": 2
+  },
+  "recall_month_route_timeout": {
+    "type": "float",
+    "description": "月份分支独立超时秒数",
+    "hint": "默认 6 秒。超时只放弃月份补充路线，直接全库检索继续正常工作。",
+    "default": 6
+  },
+  "recall_information_gain_enable": {
+    "type": "bool",
+    "description": "启用必要日记保护与信息增益选择",
+    "hint": "先锁定直接答案、唯一线索、事件阶段和情感变化所必需的日记，再减少真正没有新增贡献的候选。",
+    "default": true
+  },
+  "recall_necessary_can_exceed_max": {
+    "type": "bool",
+    "description": "必要日记允许突破动态最大篇数",
+    "hint": "默认开启。若当前问题确实需要更多互补日记，必要项不会被 recall_max_inject 压掉。仍受必要日记硬上限保护。",
+    "default": true
+  },
+  "recall_necessary_hard_cap": {
+    "type": "int",
+    "description": "必要日记绝对安全上限",
+    "hint": "默认 14。只限制异常情况下的候选爆炸，普通请求仍由动态数量决定。",
+    "default": 14
+  },
+  "passage_index_enable": {
+    "type": "bool",
+    "description": "启用可追溯段落索引",
+    "hint": "Memos 中仍保存完整日记；本地按语义段落建立索引，记录所属日记、段落编号和原文位置。",
+    "default": true
+  },
+  "passage_max_chars": {
+    "type": "int",
+    "description": "段落索引目标最大字符数",
+    "hint": "默认 280。只影响本地检索粒度，不截断或修改 Memos 日记。",
+    "default": 280
+  },
+  "passage_overlap_chars": {
+    "type": "int",
+    "description": "相邻段落保留的上下文字符数",
+    "hint": "默认 60，并优先按完整句边界重叠，避免情感和指代被切断。",
+    "default": 60
+  },
+  "mixed_injection_enable": {
+    "type": "bool",
+    "description": "启用整篇日记与相关段落混合注入",
+    "hint": "核心事件、完整情感弧和必要日记注入全文；仅补充局部细节的长日记可注入带日期来源的相关段落。",
+    "default": true
+  },
+  "full_diary_top_n": {
+    "type": "int",
+    "description": "至少完整注入前几篇核心日记",
+    "hint": "默认 2。必要日记、时间叙事和完整情感弧可在此之外继续使用全文。",
+    "default": 2
+  },
+  "passage_expand_chars": {
+    "type": "int",
+    "description": "局部段落向前后扩展字符数",
+    "hint": "默认 100，并会尽量扩展到完整句边界。",
+    "default": 100
+  },
+  "recall_rerank_enable": {
+    "type": "bool",
+    "description": "启用规则版注入重排器",
+    "hint": "根据触发线索、长期影响、标签、查询相关反馈、手动记忆和近期重复惩罚重新计算注入资格。",
+    "default": true
+  },
+  "recall_injection_min_score": {
+    "type": "float",
+    "description": "注入资格线",
+    "hint": "低于该分数的候选不会为了凑数量而注入。importance 5、手动、相关查询高反馈等保护记忆可放宽。",
+    "default": 0.62
+  },
+  "recall_dynamic_count_enable": {
+    "type": "bool",
+    "description": "启用动态注入数量",
+    "hint": "开启后最终注入数量由合格候选决定，不再固定 top_k。弱相关时少注入，强相关时可注入更多。",
+    "default": true
+  },
+  "recall_min_inject": {
+    "type": "int",
+    "description": "动态注入最少条数",
+    "hint": "默认 1。若没有合格候选仍然不会硬凑。",
+    "default": 1
+  },
+  "recall_max_inject": {
+    "type": "int",
+    "description": "动态注入最多条数",
+    "hint": "默认 9。最终仍会受合格线、分层和相似簇影响。",
+    "default": 9
+  },
+  "recall_cluster_fold_enable": {
+    "type": "bool",
+    "description": "启用相似簇折叠分析",
+    "hint": "开启后 WebUI 召回实验室会显示相似簇、折叠原因和入选状态。",
+    "default": true
+  },
+  "recall_cluster_fold_apply": {
+    "type": "bool",
+    "description": "把相似簇折叠应用到真实注入",
+    "hint": "默认关闭，只用于实验室观察。确认效果后再开启。",
+    "default": false
+  },
+  "recall_cluster_similarity": {
+    "type": "float",
+    "description": "相似簇阈值",
+    "hint": "默认 0.88。越高越保守，越低越容易把记忆归到同一簇。",
+    "default": 0.88
+  },
+  "recall_cluster_base_per_group": {
+    "type": "int",
+    "description": "每个相似簇默认保留篇数",
+    "hint": "默认 2。不是去重；保护记忆仍可突破。",
+    "default": 2
+  },
+  "recall_cluster_allow_protected": {
+    "type": "bool",
+    "description": "保护记忆可突破相似簇限制",
+    "hint": "手动、相关查询正反馈、importance 5、强触发命中可突破每簇默认篇数。",
+    "default": true
+  },
+  "enable_affiliate_profile": {
+    "type": "bool",
+    "description": "启用内置长期人格画像",
+    "hint": "开启后，主插件会在本地 sqlite 中维护当前长期人格画像，并在普通分层记忆前注入。1.10.1 起不再需要单独安装 affiliate 插件。",
+    "default": true
+  },
+  "affiliate_profile_max_age_days": {
+    "type": "int",
+    "description": "长期人格画像最大可用天数",
+    "hint": "默认 45 天。画像超过此天数会在 WebUI 标记为过期，且主插件不再自动注入。设为 0 表示不过期。",
+    "default": 45
+  },
+  "profile_provider_id": {
+    "type": "string",
+    "description": "生成长期人格画像用的 LLM provider",
+    "hint": "留空则使用当前对话 LLM。建议使用理解力较好的模型，因为它要融合旧画像、人格类记忆、高重要度记忆、手动钉记忆和高反馈记忆。",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "profile_auto_update_days": {
+    "type": "int",
+    "description": "长期人格画像自动更新间隔天数",
+    "hint": "默认 14 天。设 0 关闭自动更新，只用 /memos-profile-update 手动更新。",
+    "default": 14
+  },
+  "profile_recent_persona_limit": {
+    "type": "int",
+    "description": "画像更新时读取最近多少条人格类记忆",
+    "default": 120
+  },
+  "profile_anchor_limit": {
+    "type": "int",
+    "description": "画像更新时读取多少条 importance 4-5 的长期记忆",
+    "default": 40
+  },
+  "profile_manual_limit": {
+    "type": "int",
+    "description": "画像更新时读取多少条手动钉记忆",
+    "default": 30
+  },
+  "profile_feedback_limit": {
+    "type": "int",
+    "description": "画像更新时读取多少条高反馈 boost 记忆",
+    "default": 30
+  },
+  "profile_llm_timeout": {
+    "type": "float",
+    "description": "画像 LLM 调用超时秒数",
+    "hint": "默认 90 秒。画像融合会读取旧画像、人格类记忆、高重要度记忆、手动钉记忆和高反馈记忆，比普通召回更慢；慢模型或大画像可调到 120-180。设太低会出现 profile_llm timeout。",
+    "default": 90
+  },
+  "profile_target_chars": {
+    "type": "int",
+    "description": "长期人格画像目标字数，不是硬截断",
+    "hint": "默认 2600。效果优先，LLM 会尽量凝练但不强行丢关键内容。",
+    "default": 2600
+  },
+  "profile_facts_target_count": {
+    "type": "int",
+    "description": "稳定事实目标条数",
+    "default": 40
+  },
+  "context_governance_enable": {
+    "type": "bool",
+    "description": "启用请求上下文治理",
+    "hint": "按请求裁剪送往模型的历史。注意：AstrBot 会把 Agent 实际使用的消息保存回会话，因此裁剪可能持久缩短 AstrBot 原始历史（4.4 事故报告根因三）。4.5.0 起裁剪前强制写本地 JSON 备份，备份失败则本轮跳过裁剪；备份目录见 context_archive_backup_dir。",
+    "default": true
+  },
+  "context_exclude_command_turns": {
+    "type": "bool",
+    "description": "指令及其回复不进入对话上下文",
+    "hint": "默认开启。AstrBot 识别为命令的控制回合不会写入记忆缓冲或心潮，并在消息发送后从持久会话历史精确剔除；下一次请求还有并发兜底清理。不会批量扫描或删除普通角色扮演文本。",
+    "default": true
+  },
+  "context_keep_recent_messages": {
+    "type": "int",
+    "description": "每次请求最多保留最近多少条原始消息",
+    "hint": "默认 40 条，约 20 轮。长期内容交给 memos 记忆和画像，避免 Astr 原始上下文持续撑大输入。",
+    "default": 40
+  },
+  "context_min_messages_before_trim": {
+    "type": "int",
+    "description": "原始历史达到多少条后才开始请求裁剪",
+    "hint": "默认 80 条。短对话不裁剪，长对话自动控制输入规模。",
+    "default": 80
+  },
+  "context_preserve_system_messages": {
+    "type": "bool",
+    "description": "裁剪时保留 system/developer 消息",
+    "default": true
+  },
+  "context_trim_backup_enable": {
+    "type": "bool",
+    "description": "请求级裁剪前强制本地备份",
+    "hint": "默认开启。裁剪 req.contexts 前把裁剪前完整历史写入 context_archive_backup_dir 下的 JSON 备份；写入失败则本轮不裁剪。关闭即表示你接受裁剪可能被 AstrBot 持久写回且无本地备份。",
+    "default": true
+  },
+  "context_archive_enable": {
+    "type": "bool",
+    "description": "启用周期性持久上下文归档",
+    "hint": "会写回 AstrBot 当前会话历史，默认关闭。手动归档用 /memos-context-archive exec，会先生成备份。",
+    "default": false
+  },
+  "context_archive_keep_recent_messages": {
+    "type": "int",
+    "description": "持久归档后保留最近多少条原始消息",
+    "hint": "默认 120 条，约 60 轮。比请求裁剪更宽松，方便回看最近剧情。",
+    "default": 120
+  },
+  "context_archive_min_total_messages": {
+    "type": "int",
+    "description": "持久历史达到多少条才允许归档",
+    "default": 240
+  },
+  "context_archive_interval_days": {
+    "type": "int",
+    "description": "周期性持久归档间隔天数",
+    "hint": "默认 7 天。设 0 关闭周期任务；建议仅在确认 memos 同步和压缩稳定后开启。",
+    "default": 7
+  },
+  "context_archive_backup_dir": {
+    "type": "string",
+    "description": "持久归档备份目录",
+    "default": "./data/astrbot_plugin_memos_memory/context_backups"
+  },
+  "rp_enhancer_enable": {
+    "type": "bool",
+    "description": "启用内置 RP 增强器",
+    "hint": "集成原 rp_enhancer 的现实时间/节奏感知、复读提醒、镜像动作提醒。建议停用旧 rp_enhancer，避免双重注入。",
+    "default": true
+  },
+  "rp_time_enable": {
+    "type": "bool",
+    "description": "启用现实时间和对话节奏注入",
+    "default": true
+  },
+  "rp_time_strip_default": {
+    "type": "bool",
+    "description": "替换 AstrBot 默认时间注入",
+    "hint": "开启后会尝试移除 AstrBot 默认的简单日期时间块，再注入本插件的现实感知时间块，避免双重时间提示。",
+    "default": true
+  },
+  "rp_time_timezone": {
+    "type": "string",
+    "description": "现实时间注入使用的时区",
+    "hint": "默认 Asia/Shanghai。只有部署环境时区不一致时才需要改。",
+    "default": "Asia/Shanghai"
+  },
+  "rp_time_show_lunar": {
+    "type": "bool",
+    "description": "显示农历",
+    "hint": "默认关闭，避免再出现阴历/阳历混乱。",
+    "default": false
+  },
+  "rp_time_show_festival": {
+    "type": "bool",
+    "description": "显示节日/节气提示",
+    "default": true
+  },
+  "rp_time_show_rhythm": {
+    "type": "bool",
+    "description": "显示今日轮次和上次对话间隔",
+    "default": true
+  },
+  "rp_repetition_enable": {
+    "type": "bool",
+    "description": "启用复读开场和短语提醒",
+    "default": true
+  },
+  "rp_mirror_enable": {
+    "type": "bool",
+    "description": "启用镜像动作提醒",
+    "default": true
+  },
+  "rp_repetition_k_recent": {
+    "type": "int",
+    "description": "复读检测最近 assistant 消息数量",
+    "default": 20
+  },
+  "rp_repetition_opener_threshold": {
+    "type": "int",
+    "description": "同类开场重复多少次后提示",
+    "hint": "默认 2。调高会更宽松，调低会更敏感。",
+    "default": 2
+  },
+  "rp_repetition_phrase_threshold": {
+    "type": "int",
+    "description": "短语重复多少次后提示",
+    "hint": "默认 3。用于避免角色长期使用同一批句式。",
+    "default": 3
+  },
+  "rp_opener_inject_max": {
+    "type": "int",
+    "description": "每次最多注入多少条重复开场提示",
+    "default": 3
+  },
+  "rp_phrase_inject_max": {
+    "type": "int",
+    "description": "每次最多注入多少条重复短语提示",
+    "default": 3
+  },
+  "rp_mirror_k_recent": {
+    "type": "int",
+    "description": "镜像动作检测最近消息数量",
+    "default": 5
+  },
+  "rp_mirror_count_threshold": {
+    "type": "int",
+    "description": "镜像动作累计多少次后提示",
+    "default": 2
+  },
+  "rp_mirror_similarity": {
+    "type": "float",
+    "description": "镜像动作相似度阈值",
+    "hint": "默认 0.5。越高越严格，越低越容易触发。",
+    "default": 0.5
+  },
+  "rp_mirror_cooldown_turns": {
+    "type": "int",
+    "description": "镜像动作提示冷却轮数",
+    "default": 3
+  },
+  "rp_mirror_cluster_enable": {
+    "type": "bool",
+    "description": "启用镜像动作聚类检测",
+    "default": true
+  },
+  "rp_inject_max_chars": {
+    "type": "int",
+    "description": "内置 RP 增强器每次最多注入字符数",
+    "hint": "默认 1400。时间、复读、镜像提醒共享这个预算，避免表现层提示抢占长期记忆空间。",
+    "default": 1400
+  },
+  "rp_verbose": {
+    "type": "bool",
+    "description": "启用 RP 增强器详细调试",
+    "hint": "默认关闭。排查 enhancer 是否触发时可以临时开启。",
+    "default": false
+  },
+  "cache_prefix_drift_enable": {
+    "type": "bool",
+    "description": "启用缓存前缀漂移诊断",
+    "hint": "记录 system_prompt + Astr 上下文的 hash/字数/轮数，命中率不稳时可在 Console 看到是 system 还是 history 在变。",
+    "default": true
+  },
+  "cache_friendly_system_guard_enable": {
+    "type": "bool",
+    "description": "启用 system_prompt 缓存友好守门",
+    "hint": "把误入 system_prompt 的 CurrentTimeContext / HistoricalMemory 等动态块搬回临时 extra_user_content，保持 system_prompt 尽量稳定。",
+    "default": true
+  },
+  "emb_cache_size": {
+    "type": "int",
+    "description": "emb LRU 缓存容量(默认 1000, 0=关闭)",
+    "hint": "同一文本的 embedding 缓存, 避免重复调用。命中率高的场景可拉到 2000+。",
+    "default": 1000
+  },
+  "retry_max": {
+    "type": "int",
+    "description": "网络重试最大次数(默认 3)",
+    "hint": "memos / emb / 压缩 LLM 抖动时指数退避重试 3 次, 最终失败才 log warn。",
+    "default": 3
+  },
+  "retry_base_delay": {
+    "type": "float",
+    "description": "重试基础延迟秒数(默认 0.5s, 实际退避为 base * 2^i)",
+    "hint": "网络抖动 + 服务商限流时调高这个有效。",
+    "default": 0.5
+  },
+  "recall_embed_timeout": {
+    "type": "float",
+    "description": "请求期召回 embedding 超时秒数",
+    "hint": "只影响聊天前自动召回。超时会跳过本次记忆召回，避免 provider 卡住整个 AstrBot。",
+    "default": 12
+  },
+  "recall_search_timeout": {
+    "type": "float",
+    "description": "请求期召回检索超时秒数",
+    "hint": "向量/BM25/rerank 总检索保护。超时会跳过本次记忆注入，保证聊天继续。",
+    "default": 18
+  },
+  "rerank_timeout": {
+    "type": "float",
+    "description": "rerank 超时秒数",
+    "hint": "rerank provider 超时后回退粗排，不阻塞本次回复。",
+    "default": 8
+  },
+  "enable_auto_reconcile": {
+    "type": "bool",
+    "description": "启用后台对账(v1.3): 定时拉 memos 跟 vec 对比, 删除已被 memos 删的日记",
+    "hint": "默认开启。你在 memos WebUI 删记忆后, vec 自动跟上, 不用敲 /memos-sync。",
+    "default": true
+  },
+  "reconcile_interval": {
+    "type": "int",
+    "description": "后台对账间隔秒数(默认 86400 = 1 天)",
+    "hint": "默认 1 天对一次账。设 0 关闭。频率高没必要。",
+    "default": 86400
+  },
+  "webui_enable": {
+    "type": "bool",
+    "description": "启用 WebUI(v1.3): 独立端口的可视化面板(记忆列表/图表/检索/连通性测试)",
+    "hint": "浏览器访问 http://webui_host:webui_port/ 查看。默认开启。",
+    "default": true
+  },
+  "webui_host": {
+    "type": "string",
+    "description": "WebUI 监听地址(默认 127.0.0.1 仅本机)",
+    "hint": "只想本机访问填 127.0.0.1; 要局域网访问填 0.0.0.0(注意安全)。",
+    "default": "127.0.0.1"
+  },
+  "webui_port": {
+    "type": "int",
+    "description": "WebUI 端口(默认 8088, 可改)",
+    "hint": "别跟 AstrBot(6185)或 memos(5230)撞。浏览器开 http://127.0.0.1:8088/",
+    "default": 8088
+  },
+  "rerank_provider_id": {
+    "type": "string",
+    "default": "",
+    "description": "Re-rank model provider ID (v1.7). Leave empty to disable.",
+    "hint": "Enter an LLM provider ID. The model will score and re-sort search candidates for higher precision."
+  },
+  "time_boost": {
+    "type": "float",
+    "default": 0.07,
+    "description": "纪念日查询的同月日记忆加权",
+    "hint": "仅当查询明确包含纪念日、周年、去年今天等意图时生效，普通的今天/现在不会触发，避免旧日记干扰当前时间。"
+  },
+  "bm25_tokenizer": {
+    "type": "string",
+    "default": "jieba",
+    "description": "BM25 分词器 (v1.8)",
+    "hint": "jieba: 中文分词更准确（需要安装 jieba）。bigram: 字符二元组（无依赖）。"
+  },
+  "imp_tier5_keywords": {
+    "type": "string",
+    "default": "初遇,定情,告白,承诺,誓言,约定,求婚,结婚,婚礼,戒指,家人,我家的,永远,永远在一起,不会离开,不要离开,分别,离别,失去,重逢,和好,原谅,背叛,牺牲,死亡,濒死,复活,怀孕,孩子,出生,第一次见,第一次吻,第一次抱,身份揭露,真相揭露,命运改变,正式交往,告白成功,接受告白,终身承诺,约定终身,交换戒指,成为家人,接纳为家人,共同的家,生死相随,彻底决裂,永久分离,失去彼此,复合,真正原谅,严重背叛,收养,第一次见面,第一次接吻,第一次拥抱,身世揭露,记忆恢复,世界线改变,不可逆选择,核心秘密曝光,关系定义改变",
+    "description": "Tier5 关键词: 永久改变关系/人格/剧情状态，命中直接5分",
+    "hint": "逗号分隔。适合放初遇、承诺、离别、重逢、孩子、身份揭露、命运改变等长期里程碑。"
+  },
+  "imp_tier4_keywords": {
+    "type": "string",
+    "default": "信任,依赖,靠近,心软,吃醋,占有欲,害怕失去,害怕分离,安心,被接住,被记住,保护,救下,受伤,哭,崩溃,道歉,认错,秘密,真相,选择,决定,觉醒,变身,解锁,失控,封印,诅咒,契约,边界,禁忌,称呼,专属称呼,建立信任,失去信任,情感依赖,坦白脆弱,暴露软肋,被理解,获得安全感,强烈吃醋,共同面对,重病,创伤,噩梦,绝望,大哭,弥补,重要秘密,关键真相,重大选择,重大决定,能力解锁,打破契约,明确边界,越过边界,底线,原则,改口称呼,关系确认,拒绝关系,公开关系,第一次争吵,严重冲突,长期误会,解开误会,离家,归来,搬到一起,共同生活,许下愿望,重要纪念日",
+    "description": "Tier4 关键词: 强情绪、关系推进、重要剧情转折",
+    "hint": "逗号分隔。2个命中会升到5分，1个命中通常为4分。"
+  },
+  "imp_tier3_keywords": {
+    "type": "string",
+    "default": "喜欢,在意,担心,想念,陪伴,拥抱,牵手,亲吻,脸红,沉默,犹豫,试探,确认,撒娇,嘴硬,吃醋,害羞,承认,约会,礼物,纪念,习惯,下意识,靠近一点,不安,委屈,嫉妒,温柔,照顾,生病,疼,梦,房间,住处,名字,物件,信物,承认心意,共同习惯,疼痛,梦见,安慰,鼓励,吃醋反应,冷落,赌气,吃惊,尴尬,期待,失落,害怕,愧疚,心疼,依恋,珍藏物,昵称,口头禅,喜好,讨厌,食物偏好,气味,歌曲,故事,学校,工作,故乡,生日,节日,共同计划,未完成约定,日常仪式,睡前习惯,起床习惯,照顾方式,相处方式,重要朋友,重要家人,宠物,身体状况,长期目标",
+    "description": "Tier3 关键词: 中等关系、情绪、习惯和物件线索",
+    "hint": "逗号分隔。用于把有塑形价值但不是里程碑的记忆稳定保在3分左右。"
+  },
+  "imp_low_keywords": {
+    "type": "string",
+    "default": "吃饭,喝水,睡觉,起床,洗澡,洗漱,换衣服,散步,逛街,买东西,做饭,收拾,打扫,通勤,上班,下班,刷手机,看电视,天气,下雨,下雪,很热,很冷,今天,明天,昨天,早上,中午,晚上,普通聊天,闲聊,开玩笑,路过,看风景,休息,发呆,随口,寒暄,问好,重复确认,无关闲谈",
+    "description": "低重要性关键词: 纯日常噪声，命中3个以上降1分",
+    "hint": "逗号分隔。注意不要放你的角色专属日常锚点，否则可能误降权。"
+  }
+}

@@ -1,0 +1,9 @@
+# astrbot_plugin_memos_memory 依赖
+# AstrBot 本体不用写(运行环境已提供 astrbot.api)
+
+# memos REST API 调用
+aiohttp>=3.9.0
+
+# 向量检索(sqlite-vec 扩展)。装不上时插件会自动回退到纯 Python 余弦,不影响功能,只是慢些。
+sqlite-vec>=0.1.0
+jieba>=0.42

@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>心潮心理工作台</title>
+<style>
+:root{color-scheme:dark;--bg:#090d12;--rail:#0d131b;--panel:#111923;--panel2:#151f2b;--line:#293545;--line2:#202b39;--text:#e7edf5;--muted:#92a0b2;--soft:#66768a;--blue:#60a5fa;--teal:#2dd4bf;--green:#4ade80;--amber:#fbbf24;--red:#fb7185;--pink:#e879f9;--violet:#a78bfa}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text);font:13px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;letter-spacing:0}button,input,select,textarea{font:inherit}button{cursor:pointer}a{color:inherit;text-decoration:none}
+.app{display:grid;grid-template-columns:232px minmax(0,1fr);min-height:100vh}.rail{position:sticky;top:0;height:100vh;background:var(--rail);border-right:1px solid var(--line2);padding:18px 14px;display:flex;flex-direction:column;gap:18px}.brand h1{font-size:20px;line-height:1.2;margin:0;color:#fff}.brand p{margin:7px 0 0;color:var(--muted);font-size:12px}.version{display:inline-flex;margin-top:10px;padding:2px 7px;border:1px solid var(--line);border-radius:5px;color:#bdc9d7;font-family:ui-monospace,Consolas,monospace}.nav{display:grid;gap:5px}.nav button{border:0;border-radius:6px;padding:10px 11px;background:transparent;color:#bdc8d6;text-align:left}.nav button:hover{background:#172230;color:#fff}.nav button.active{background:#1d4ed8;color:#fff}.rail-state{display:grid;gap:8px}.rail-row{display:flex;justify-content:space-between;gap:8px;padding:8px 9px;border:1px solid var(--line2);background:#111923;border-radius:6px;color:var(--muted)}.rail-row b{color:var(--text)}.rail-foot{margin-top:auto;display:grid;gap:7px}.rail-foot a{padding:8px 9px;border:1px solid var(--line);border-radius:6px;color:#cbd5e1}.rail-foot a:hover{border-color:#4b6c98;background:#131d29}
+.main{min-width:0;padding:20px}.top{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;margin-bottom:14px}.top h2{margin:0 0 4px;font-size:23px}.top p{margin:0;color:var(--muted)}.actions,.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.btn{min-height:34px;padding:7px 11px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text)}.btn:hover{border-color:#4b6c98;background:#192638}.btn.primary{background:#2563eb;border-color:#3b82f6;color:#fff}.btn.danger{color:#fecdd3;border-color:#7f1d1d;background:#2b1218}.btn:disabled{opacity:.45;cursor:not-allowed}
+select,input,textarea{border:1px solid var(--line);border-radius:6px;background:#0d151f;color:var(--text);padding:8px 9px;outline:0}select:focus,input:focus,textarea:focus{border-color:#60a5fa;box-shadow:0 0 0 3px rgba(96,165,250,.12)}.scope{min-width:240px}.tab{display:none}.tab.active{display:block}
+.metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:9px;margin-bottom:10px}.metric{border:1px solid var(--line2);background:var(--panel);border-radius:7px;padding:11px}.metric label{display:block;color:var(--muted);font-size:11px;text-transform:uppercase}.metric b{display:block;margin-top:4px;font-size:22px;color:#fff;font-variant-numeric:tabular-nums}.metric small{color:var(--soft)}
+.layout{display:grid;grid-template-columns:1.12fr .88fr;gap:10px;margin-bottom:10px}.panel{border:1px solid var(--line2);background:var(--panel);border-radius:7px;padding:13px;min-width:0}.panel-head{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:11px}.panel-head h3{font-size:14px;margin:0}.muted{color:var(--muted)}.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-variant-numeric:tabular-nums}
+.drive-list{display:grid;grid-template-columns:1fr 1fr;gap:11px 15px}.drive-row{display:grid;grid-template-columns:132px minmax(80px,1fr) 44px;gap:6px 8px;align-items:center;padding-bottom:8px;border-bottom:1px solid rgba(41,53,69,.55)}.drive-name{color:#cbd5e1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.drive-name small{display:block;color:var(--soft);font-size:10px}.drive-bars{display:grid;gap:4px}.drive-track{display:grid;grid-template-columns:28px minmax(0,1fr);gap:5px;align-items:center}.drive-track label{color:var(--soft);font-size:9px}.track{height:8px;border-radius:999px;background:#0a1018;border:1px solid #1e2a38;overflow:hidden}.track span{display:block;height:100%;background:var(--blue)}.drive-track.activation .track span{background:var(--pink)}.drive-value{text-align:right;color:#dce6f2}.drive-reason{grid-column:1/-1;color:var(--soft);font-size:10px;line-height:1.35;min-height:14px;overflow-wrap:anywhere}.drive-row.affect .drive-name{color:#fda4af}.drive-row.affect .drive-track.pressure .track span{background:var(--amber)}
+.split{display:grid;grid-template-columns:1fr 1fr;gap:10px}.list{display:grid;gap:7px;max-height:410px;overflow:auto}.item{border:1px solid var(--line2);background:#0e1620;border-radius:6px;padding:9px}.item-head{display:flex;justify-content:space-between;gap:8px;margin-bottom:4px}.item-title{font-weight:700;color:#f3f7fb}.item-time{font-size:11px;color:var(--soft);white-space:nowrap}.item p{margin:0;color:#b8c5d4;white-space:pre-wrap;word-break:break-word}.badge{display:inline-flex;padding:1px 6px;border-radius:5px;background:#1e293b;color:#cbd5e1;font-size:11px}.badge.flash{color:#67e8f9}.badge.obsession{color:#f0abfc}.badge.llm{color:#86efac}.empty{padding:25px 10px;text-align:center;color:var(--muted)}
+.preview{padding:11px;border:1px solid var(--line2);background:#0a1119;border-radius:6px;white-space:pre-wrap;max-height:330px;overflow:auto;color:#c9d5e3;line-height:1.65}.diag{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:9px}.diag div{border:1px solid var(--line2);background:#0d151f;border-radius:6px;padding:8px;color:var(--muted)}.diag b{display:block;color:#fff;margin-top:2px}
+.settings-sections{display:grid;gap:12px}.settings-band{border-top:1px solid var(--line);padding-top:13px}.settings-band:first-child{border-top:0;padding-top:0}.settings-head{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;margin-bottom:8px}.settings-head h3{margin:0;font-size:15px}.settings-head p{margin:2px 0 0;color:var(--muted);font-size:12px}.setting-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--line2);border:1px solid var(--line2);border-radius:7px;overflow:hidden}.setting{display:grid;grid-template-columns:minmax(0,1fr) minmax(150px,210px);gap:12px;align-items:center;background:var(--panel);padding:11px;min-height:82px}.setting.changed{background:#13223a}.setting-name{font-weight:700}.setting-key{font-size:10px;color:var(--soft);font-family:ui-monospace,Consolas,monospace}.setting-hint{font-size:11px;color:var(--muted);margin-top:4px}.setting input:not([type=checkbox]),.setting select{width:100%;min-width:0}.toggle{display:flex;justify-content:flex-end;align-items:center;gap:8px;color:var(--muted)}.toggle input{width:18px;height:18px;accent-color:#3b82f6}.savebar{position:sticky;bottom:10px;margin-top:12px;padding:10px;border:1px solid var(--line);border-radius:7px;background:rgba(13,19,27,.96);display:flex;align-items:center;gap:9px;z-index:3}.savebar span{margin-left:auto;color:var(--muted)}
+.lab{display:grid;grid-template-columns:.78fr 1.22fr;gap:10px}.form{display:grid;gap:9px}.form label{color:var(--muted);font-size:12px}.form textarea{width:100%;min-height:92px;resize:vertical}.form .row{display:grid;grid-template-columns:1fr 1fr;gap:8px}.lab-result{display:grid;gap:10px}.delta{display:grid;grid-template-columns:repeat(4,1fr);gap:7px}.delta div{border:1px solid var(--line2);border-radius:6px;background:#0d151f;padding:8px;color:var(--muted)}.delta b{display:block;color:#fff}.notice{display:none;border-left:3px solid var(--blue);padding:9px 11px;background:#102038;color:#bfdbfe;margin-bottom:10px}.notice.show{display:block}.notice.error{border-left-color:var(--red);background:#2a121a;color:#fecdd3}
+.body-hero{display:grid;grid-template-columns:230px minmax(0,1fr);gap:10px;margin-bottom:10px}.body-day{display:grid;align-content:center;min-height:190px;border:1px solid var(--line2);background:#0e1620;border-radius:7px;padding:18px}.body-day label{color:var(--muted);font-size:11px;text-transform:uppercase}.body-day b{font-size:34px;line-height:1.15;margin:6px 0;color:#fff}.body-day small{color:var(--soft)}.phase-track{display:grid;grid-template-columns:5fr 6fr 3fr 14fr;gap:4px;margin:14px 0 9px}.phase-segment{height:44px;border:1px solid var(--line2);background:#0d151f;border-radius:5px;padding:6px 8px;color:var(--soft);font-size:11px;overflow:hidden}.phase-segment.active{border-color:#60a5fa;background:#152943;color:#dbeafe}.phase-segment b{display:block;color:inherit;font-size:12px}.body-signals{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px 15px}.body-signal{display:grid;grid-template-columns:88px 1fr 42px;gap:8px;align-items:center}.body-signal .track span{background:var(--teal)}.body-signal:nth-child(3n+2) .track span{background:var(--amber)}.body-signal:nth-child(3n) .track span{background:var(--pink)}.body-note{border-left:3px solid var(--teal);padding:9px 11px;background:#0d1f22;color:#b8d8d4;border-radius:0 6px 6px 0}.body-empty{min-height:190px;display:grid;place-content:center;text-align:center;color:var(--muted)}.body-empty b{display:block;color:#fff;font-size:18px;margin-bottom:5px}
+.insight-list{display:grid;gap:7px}.insight-row{display:grid;grid-template-columns:118px minmax(0,1fr) 72px;gap:10px;align-items:start;border:1px solid var(--line2);background:#0d151f;border-radius:6px;padding:10px}.insight-row strong{color:#dbeafe}.insight-row p{margin:2px 0 0;color:#aebccd}.insight-score{text-align:right;color:var(--teal)}.insight-evidence{margin-top:5px;color:var(--soft);font-size:11px}.mode-ok{color:var(--green)}.mode-warn{color:var(--amber)}
+@media(max-width:1100px){.app{grid-template-columns:1fr}.rail{position:relative;height:auto}.nav{grid-template-columns:repeat(3,1fr)}.rail-state{grid-template-columns:repeat(3,1fr)}.rail-foot{grid-template-columns:1fr 1fr}.metrics{grid-template-columns:repeat(2,1fr)}.layout,.lab{grid-template-columns:1fr}.setting-grid{grid-template-columns:1fr}}
+@media(max-width:900px){.body-hero{grid-template-columns:1fr}.body-day{min-height:130px}.body-signals{grid-template-columns:1fr}}
+@media(max-width:680px){.main{padding:13px}.top{display:block}.actions{margin-top:10px}.scope{width:100%;min-width:0}.nav{grid-template-columns:1fr 1fr}.rail-state{grid-template-columns:1fr}.metrics,.drive-list,.split,.diag,.delta,.setting .form .row{grid-template-columns:1fr}.setting{grid-template-columns:1fr}.toggle{justify-content:flex-start}.savebar{position:static}.drive-row{grid-template-columns:120px 1fr 42px}.phase-track{grid-template-columns:1fr 1fr}.body-signal{grid-template-columns:82px 1fr 40px}.insight-row{grid-template-columns:1fr}.insight-score{text-align:left}}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="rail">
+    <div class="brand"><h1>心潮心理工作台</h1><p>Dynamic Mind / Memos Memory</p><span class="version" id="version">4.5.4</span></div>
+    <nav class="nav">
+      <button class="active" data-tab="overview">状态总览</button>
+      <button data-tab="body">身体节律</button>
+      <button data-tab="activity">心理轨迹</button>
+      <button data-tab="lab">模拟实验</button>
+      <button data-tab="time-insight">时间洞察</button>
+      <button data-tab="settings">心潮设置</button>
+    </nav>
+    <div class="rail-state">
+      <div class="rail-row"><span>引擎</span><b id="rail-engine">-</b></div>
+      <div class="rail-row"><span>感知</span><b id="rail-perception">-</b></div>
+      <div class="rail-row"><span>注入</span><b id="rail-injection">-</b></div>
+    </div>
+    <div class="rail-foot"><a href="/">返回 WebUI</a><a href="/console">专业 Console</a></div>
+  </aside>
+  <main class="main">
+    <div class="top">
+      <div><h2 id="title">状态总览</h2><p id="subtitle">角色当前的持续心理状态与实际注入。</p></div>
+      <div class="actions"><select id="scope" class="scope" title="状态范围"></select><button class="btn" id="settle">立即结算</button><button class="btn primary" id="refresh">刷新</button></div>
+    </div>
+    <div class="notice" id="notice"></div>
+
+    <section id="overview" class="tab active">
+      <div class="metrics">
+        <div class="metric"><label>意识节律</label><b id="m-consciousness">-</b><small id="m-last">-</small></div>
+        <div class="metric"><label>当前意向</label><b id="m-intent">-</b><small id="m-intent-value">-</small></div>
+        <div class="metric"><label>精神负荷</label><b id="m-fatigue">-</b><small>内部上限 0.30</small></div>
+        <div class="metric"><label>状态版本</label><b id="m-revision">-</b><small>每次有效变化递增</small></div>
+        <div class="metric"><label>本次注入</label><b id="m-injection">-</b><small id="m-injection-time">等待样本</small></div>
+      </div>
+      <div class="layout">
+        <section class="panel"><div class="panel-head"><h3>十二维心理动力</h3><span class="muted">积累 / 激活 / 综合</span></div><div class="drive-list" id="drives"></div></section>
+        <section class="panel"><div class="panel-head"><h3>注入诊断</h3><span class="muted" id="inject-source">真实请求</span></div><div class="diag" id="diag"></div><div class="preview" id="injection-preview">等待首个真实请求。</div></section>
+      </div>
+      <div class="split">
+        <section class="panel"><div class="panel-head"><h3>闪念与执念</h3><span class="muted" id="thought-count">0</span></div><div class="list" id="thoughts"></div></section>
+        <section class="panel"><div class="panel-head"><h3>最近感知</h3><span class="muted" id="perception-source">暂无</span></div><div id="perception" class="preview">等待一次完整对话。</div></section>
+      </div>
+    </section>
+
+    <section id="body" class="tab">
+      <div class="body-hero">
+        <section class="body-day" id="body-day">
+          <label>当前身体节律</label>
+          <b id="body-phase">等待锚点</b>
+          <small id="body-cycle-meta">设置最近一次周期首日后开始计算</small>
+        </section>
+        <section class="panel" id="body-state-panel">
+          <div class="panel-head"><h3>当日身体信号</h3><span class="muted" id="body-date">-</span></div>
+          <div class="phase-track" id="body-phase-track"></div>
+          <div class="body-signals" id="body-signals"></div>
+        </section>
+      </div>
+      <div class="layout">
+        <section class="panel">
+          <div class="panel-head"><h3>当日身体体验</h3><span class="muted" id="body-layer-meta">阶段底色与时段修正</span></div>
+          <div class="list" id="body-tendencies"></div>
+          <div class="body-note" style="margin-top:10px">身体节律只改变当下节奏、感受与注意力，不自动制造情绪、欲望或关系结论。</div>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><h3>身体层实际注入</h3><span class="muted" id="body-injection-meta">与心潮共用一个临时块</span></div>
+          <div class="preview" id="body-injection-preview">设置锚点并产生一次真实请求后显示。</div>
+        </section>
+      </div>
+      <section class="panel">
+        <div class="panel-head"><h3>身体节律设置</h3><span class="muted">独立保存在心潮设置，不进入主插件配置</span></div>
+        <div class="settings-sections" id="body-settings-sections"></div>
+      </section>
+      <div class="savebar"><button class="btn primary" id="save-body-settings">保存身体节律设置</button><span id="body-save-status">未修改</span></div>
+    </section>
+
+    <section id="activity" class="tab">
+      <div class="layout">
+        <section class="panel"><div class="panel-head"><h3>互动事件</h3><span class="muted">最近 20 条</span></div><div class="list" id="events"></div></section>
+        <section class="panel"><div class="panel-head"><h3>梦境与醒后余韵</h3><span class="muted">最近 20 次</span></div><div class="list" id="dreams"></div></section>
+      </div>
+      <div class="split">
+        <section class="panel"><div class="panel-head"><h3>真实主动消息</h3><span class="muted">跨类型统一记录</span></div><div class="list" id="active-messages"></div></section>
+        <section class="panel"><div class="panel-head"><h3>梦境呼吸上下文</h3><span class="muted">最近 18 小时</span></div><div class="list" id="dream-context"></div></section>
+      </div>
+      <section class="panel"><div class="panel-head"><h3>心理变化证据</h3><span class="muted">积累、激活与满足的真实状态变更</span></div><div class="list" id="drive-history"></div></section>
+      <section class="panel"><div class="panel-head"><h3>运行轨迹</h3><span class="muted">当前进程</span></div><div class="list" id="logs"></div></section>
+    </section>
+
+    <section id="lab" class="tab">
+      <div class="lab">
+        <section class="panel">
+          <div class="panel-head"><h3>未来结算模拟</h3><span class="muted">不写入状态</span></div>
+          <div class="form">
+            <label>经过小时数<input id="sim-hours" type="number" min="0" max="720" step="0.5" value="6"></label>
+            <div class="row"><label>满足的驱动力<select id="sim-satisfied"><option value="">无</option></select></label><label>情绪变化<select id="sim-delta-key"><option value="">无</option><option value="grieve">难过与失落</option><option value="anger">生气与不满</option></select></label></div>
+            <label>变化幅度<input id="sim-delta" type="number" min="-0.2" max="0.2" step="0.02" value="0.1"></label>
+            <label>留下的闪念<textarea id="sim-thought" maxlength="120" placeholder="可留空"></textarea></label>
+            <button class="btn primary" id="simulate">运行模拟</button>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><h3>模拟结果</h3><span class="muted" id="sim-meta">尚未运行</span></div>
+          <div class="delta" id="sim-drives"></div>
+          <div class="preview" id="sim-preview">模拟后的心理注入会显示在这里。</div>
+        </section>
+      </div>
+      <div class="split" style="margin-top:10px">
+        <section class="panel"><div class="panel-head"><h3>人工反馈</h3><span class="muted">写入当前状态</span></div><div class="form"><div class="row"><select id="feedback-drive"></select><input id="feedback-delta" type="number" min="-0.5" max="0.5" step="0.05" value="0.1"></div><button class="btn" id="feedback">应用反馈</button></div></section>
+        <section class="panel"><div class="panel-head"><h3>加入闪念</h3><span class="muted">写入当前状态</span></div><div class="form"><div class="row"><select id="thought-drive"></select><input id="thought-intensity" type="number" min="0.1" max="1" step="0.05" value="0.6"></div><textarea id="thought-text" maxlength="180" placeholder="念头内容"></textarea><button class="btn" id="add-thought">加入闪念</button></div></section>
+      </div>
+    </section>
+
+    <section id="time-insight" class="tab">
+      <div class="metrics">
+        <div class="metric"><label>运行模式</label><b id="ti-mode">-</b><small id="ti-mode-note">主插件内置</small></div>
+        <div class="metric"><label>候选洞察</label><b id="ti-candidates">0</b><small>证据门槛后</small></div>
+        <div class="metric"><label>有效日期记忆</label><b id="ti-dated">0</b><small id="ti-source">来源 0</small></div>
+        <div class="metric"><label>今日环境回声</label><b id="ti-ambient">0</b><small>独立于普通召回</small></div>
+        <div class="metric"><label>最近更新</label><b id="ti-age">-</b><small id="ti-llm">LLM -</small></div>
+      </div>
+      <div class="layout">
+        <section class="panel">
+          <div class="panel-head"><h3>当前环境洞察</h3><span class="muted">只有高置信同日周年或近期趋势</span></div>
+          <div class="preview" id="ti-block">尚未生成。可先运行无写入预览。</div>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><h3>证据候选</h3><span class="muted" id="ti-runtime">最近按问题补充 0 条</span></div>
+          <div class="insight-list" id="ti-candidate-list"><div class="empty">暂无候选</div></div>
+        </section>
+      </div>
+      <section class="panel">
+        <div class="panel-head"><div><h3>时间洞察设置</h3><span class="muted">后台重建可调用 LLM；每轮查询只读本地 SQLite</span></div><div class="toolbar"><button class="btn" id="ti-preview">无写入预览</button><button class="btn primary" id="ti-update">立即重建</button></div></div>
+        <div class="settings-sections" id="time-insight-settings"></div>
+      </section>
+      <div class="savebar"><button class="btn primary" id="save-time-insight">保存时间洞察设置</button><span id="ti-save-status">未修改</span></div>
+    </section>
+
+    <section id="settings" class="tab">
+      <div class="settings-sections" id="settings-sections"></div>
+      <div class="savebar"><button class="btn primary" id="save-settings">保存心潮设置</button><button class="btn danger" id="reset-state">重置当前状态</button><span id="save-status">未修改</span></div>
+    </section>
+  </main>
+</div>
+<script>
+var currentKey="", currentState=null, settings={}, providerOptions=[], baseline="", insightSettings={}, insightProviderOptions=[], insightBaseline="";
+var driveLabels={possess:"亲密、占有与靠近",monitor:"牵挂对方近况",crave:"依恋与身体接近",share:"分享发现和感受",libido:"身体欲望",curiosity:"好奇与探索",boredom:"打破停滞",social:"交流与连接",duty:"责任与推进",reflection:"沉淀与自我理解",grieve:"难过与失落",anger:"生气与不满"};
+var tabs={overview:["状态总览","角色当前的持续心理状态与实际注入。"],body:["身体节律","确定性的身体底色，由心潮统一解释并注入。"],activity:["心理轨迹","对话感知、梦境与状态变化记录。"],lab:["模拟实验","预览未来结算，或对当前状态做明确反馈。"],"time-insight":["时间洞察","有日期证据的历史回声、查询触发与运行诊断。"],settings:["心潮设置","只管理心潮模块，不改动 Memos Token、角色名或主插件设置。"]};
+var settingGroups=[
+ {title:"核心状态",sub:"生命周期、范围与影子运行",keys:["enable","shadow_mode","scope","settle_interval_minutes","sleep_after_minutes","time_zone","dawn_freeze_start","dawn_freeze_end"]},
+ {title:"对话感知",sub:"即时评估与后台结算使用独立模型、超时和熔断",keys:["live_appraisal_enable","perception_mode","live_perception_provider_id","live_perception_timeout_seconds","perception_provider_id","post_perception_timeout_seconds","perception_min_confidence","perception_store_summary"]},
+ {title:"角色表达注入",sub:"将状态作为私密倾向交给当前回复模型",keys:["injection_enable","injection_max_drives","injection_min_drive","injection_include_thought","injection_include_fatigue","injection_max_chars"]},
+ {title:"睡眠与梦境",sub:"离线结算梦境和醒后余韵",keys:["dream_enable","dream_provider_id","dream_memory_enable","dream_memory_items","dream_min_interval_hours","dream_max_per_day","dream_timeout_seconds"]},
+ {title:"主动表达",sub:"通过 Astr 主动发送，所有真实发送共用总开关",keys:["proactive_enable","proactive_provider_id","active_message_max_per_day","proactive_min_idle_hours","proactive_cooldown_hours","proactive_max_per_day","proactive_min_drive","proactive_timeout_seconds","proactive_duplicate_threshold","proactive_duplicate_attempts"]},
+ {title:"梦境消息与白天浮现",sub:"移植原版的梦境余韵推送与白天记忆自然浮现",keys:["dream_push_enable","dream_push_min_idle_hours","dream_push_cooldown_hours","daytime_emergence_enable","daytime_start_hour","daytime_end_hour","daytime_min_interval_hours","daytime_max_interval_hours","daytime_max_per_day","daytime_memory_items","daytime_memory_cooldown_hours"]},
+ {title:"诊断",sub:"Astr Console 与本页运行记录",keys:["diagnostic_log"]}
+];
+var bodySettingGroups=[
+ {title:"周期基础",sub:"锚点是最近一次周期首日，留空时身体节律不注入",keys:["body_rhythm_enable","body_anchor_date","body_cycle_length","body_period_length","body_ovulation_day","body_ovulation_window"]},
+ {title:"体验合成",sub:"连续阶段底色、日内修正与显著信号共同决定本轮身体体验",keys:["body_expression_mode","body_effect_strength","body_daily_variation","body_time_modulation"]},
+ {title:"个体差异",sub:"只缩放身体信号，不直接规定情绪和行为",keys:["body_energy_scale","body_discomfort_scale","body_sensitivity_scale","body_closeness_influence","body_closeness_scale"]}
+];
+var settingMeta={
+ enable:["启用心潮","总开关。关闭后不结算、不感知、不注入。","bool"],shadow_mode:["影子模式","继续计算和记录，但不注入、不生成梦境或主动消息。","bool"],scope:["状态范围","character 为同一角色共享；session 为每个会话独立。","select",["character","session"]],settle_interval_minutes:["结算间隔（分钟）","后台驱动力增长与睡眠检查频率。","number"],sleep_after_minutes:["进入睡眠（分钟）","距离最近对话达到该时间后进入睡眠。","number"],time_zone:["时区","用于清晨静默和昼夜节律。","text"],dawn_freeze_start:["静默开始小时","当地时间，闭区间起点。","number"],dawn_freeze_end:["静默结束小时","当地时间，开区间终点。","number"],
+ live_appraisal_enable:["本轮即时评估","开启后先评估当前用户输入，再把即时反应与长期状态一起注入本轮回复。","bool"],perception_mode:["感知模式","rules 零调用；hybrid 对长消息或明显情绪调用；llm 每轮调用。请求前和回答后都遵循此模式。","select",["rules","hybrid","llm"]],live_perception_provider_id:["即时评估模型","优先选择快速模型；留空跟随当前会话。只影响回答前的心理判断。","provider"],live_perception_timeout_seconds:["即时评估超时（秒）","默认 10 秒。超时立即使用规则，不影响后台结算通道。","number"],perception_provider_id:["后台结算模型","可选择理解力较强的模型；留空跟随当前会话。只在回答后后台运行。","provider"],post_perception_timeout_seconds:["后台结算超时（秒）","默认 60 秒。慢模型可调至 75；不会阻塞当前回复。","number"],perception_min_confidence:["最低置信度","低于阈值时弃用 LLM 结果。","number"],perception_store_summary:["保存互动摘要","仅保存短摘要，不保存完整原始对话。","bool"],
+ injection_enable:["注入心理状态","作为临时 user content 注入，不改 system prompt。","bool"],injection_max_drives:["最多注入倾向数","只选当前最显著的若干维度。","number"],injection_min_drive:["最低注入强度","低于阈值的倾向不会进入提示。","number"],injection_include_thought:["包含最强念头","允许闪念或执念影响联想。","bool"],injection_include_fatigue:["包含精神负荷","让表达节奏随疲劳轻微变化。","bool"],injection_max_chars:["注入字符上限","心潮块的独立硬上限。","number"],
+ dream_enable:["启用梦境结算","睡眠中按冷却生成梦境余韵。","bool"],dream_provider_id:["梦境模型","跟随最后会话模型，或从 AstrBot 已启用的 LLM Provider 中选择。","provider"],dream_memory_enable:["读取长期记忆入梦","从本地日记索引选取重要片段作为梦境材料。","bool"],dream_memory_items:["梦境记忆片段数","优先重要、手动与较新的日记片段。","number"],dream_min_interval_hours:["梦境最短间隔（小时）","限制梦境结算频率。","number"],dream_max_per_day:["每日梦境上限","按 UTC 日期统计。","number"],dream_timeout_seconds:["梦境超时（秒）","失败使用确定性余韵。","number"],
+ proactive_enable:["启用主动消息","真实发送总开关。关闭时梦境消息、后台念头和白天浮现都不会发送。","bool"],proactive_provider_id:["主动消息模型","跟随最后会话模型，或从 AstrBot 已启用的 LLM Provider 中选择。","provider"],active_message_max_per_day:["主动消息每日总上限","梦境消息和自主念头共用的总上限。","number"],proactive_min_idle_hours:["自主念头最短离线时间","距离最后互动达到该值才考虑自主念头。","number"],proactive_cooldown_hours:["自主念头冷却","两次自主念头的最短间隔。","number"],proactive_max_per_day:["自主念头每日上限","同时受主动消息每日总上限约束。","number"],proactive_min_drive:["主动表达最低强度","最强驱动力达到阈值才生成自主念头。","number"],proactive_timeout_seconds:["主动生成超时（秒）","失败直接跳过。","number"],proactive_duplicate_threshold:["跨类型重复阈值","梦境、念头与白天浮现之间统一去重。","number"],proactive_duplicate_attempts:["重复重试次数","候选过近时最多重新生成几次。","number"],dream_push_enable:["发送梦境余韵","需同时开启主动消息总开关；只发送尚未表达过的新梦余韵。","bool"],dream_push_min_idle_hours:["梦境消息最短离线时间","离线达到该时长后才可能发送梦境余韵。","number"],dream_push_cooldown_hours:["梦境消息冷却","两次梦境余韵消息的最短间隔。","number"],daytime_emergence_enable:["白天记忆浮现","需同时开启主动消息总开关和长期记忆读取。默认关闭。","bool"],daytime_start_hour:["白天窗口开始","按心潮时区计算，闭区间起点。","number"],daytime_end_hour:["白天窗口结束","按心潮时区计算，开区间终点。","number"],daytime_min_interval_hours:["白天浮现最短间隔","每次完成后随机安排下一次。","number"],daytime_max_interval_hours:["白天浮现最长间隔","与最短间隔形成随机窗口。","number"],daytime_max_per_day:["白天浮现每日上限","独立限制白天记忆消息数量。","number"],daytime_memory_items:["白天候选记忆数","从本地 Memos 日记索引抽取的历史片段数。","number"],daytime_memory_cooldown_hours:["同源日记冷却（小时）","一篇日记被白天浮现采用后，在冷却结束前不会再次作为候选；默认 72 小时。","number"],
+ body_rhythm_enable:["启用身体节律","开启后仍需填写周期锚点才会实际注入。","bool"],body_anchor_date:["最近周期首日","公历日期，格式 YYYY-MM-DD；这是身体节律唯一时间锚点。","date"],body_cycle_length:["周期长度","允许 21 至 45 天。","number"],body_period_length:["经期长度","允许 2 至 10 天。","number"],body_ovulation_day:["活跃中心日","周期中段身体状态较活跃的中心位置。","number"],body_ovulation_window:["活跃窗口","围绕中心日持续的天数。","number"],body_expression_mode:["身体呈现模式","显著信号接近旧版按阈值注入；均衡呈现加入阶段主体感受和时段修正；沉浸呈现保留更多显著细节。","select",["significant","balanced","immersive"],{significant:"仅显著信号",balanced:"均衡呈现",immersive:"沉浸呈现"}],body_effect_strength:["总体影响强度","0 完全回到中性，1 使用完整阶段差异；默认 0.72。","number"],body_daily_variation:["每日个体变化","同一天固定不跳变，跨天产生克制的小幅变化。","number"],body_time_modulation:["阶段化时段修正","按当前阶段分别计算早晨、午后、傍晚和深夜的身体感受与信号变化。","bool"],body_energy_scale:["精力差异倍率","只放大或缩小身体精力相对中性的偏移。","number"],body_discomfort_scale:["不适差异倍率","控制身体不适的表现幅度。","number"],body_sensitivity_scale:["敏感差异倍率","控制触碰、声音和语气感知的身体敏感度。","number"],body_closeness_influence:["允许亲近感知","只表示对身体距离更有感知，始终服从角色边界和关系阶段。","bool"],body_closeness_scale:["亲近感知倍率","默认较保守，不等同于自动产生欲望。","number"],diagnostic_log:["诊断日志","在 Astr Console 记录心潮事件。","bool"]
+};
+var insightGroups=[
+ {title:"引擎与证据",sub:"定时重建候选；旧附属插件运行时自动兼容让出",keys:["enable_time_insight_affiliate","time_insight_auto_update_hours","time_insight_source_memo_limit","time_insight_min_importance","time_insight_min_evidence_score"]},
+ {title:"时间模式",sub:"分别约束近期跨日趋势、周年邻近与跨年季节模式",keys:["time_insight_recent_window_days","time_insight_anniversary_window_days","time_insight_trend_min_distinct_days","time_insight_trend_min_evidence","time_insight_seasonal_min_years"]},
+ {title:"今日环境回声",sub:"只允许最可信的日历余韵，并抑制逐轮重复",keys:["time_insight_ambient_max_insights","time_insight_ambient_max_chars","time_insight_repeat_cooldown_minutes"]},
+ {title:"按问题补充",sub:"独立于普通日记召回，不占剧情记忆数量份额",keys:["time_insight_query_enable","time_insight_query_max_insights","time_insight_query_min_score","time_insight_query_max_chars","time_insight_query_lookup_timeout"]},
+ {title:"后台证据审校",sub:"只在重建时调用；失败自动保留确定性候选",keys:["time_insight_llm_refine_enable","time_insight_llm_provider_id","time_insight_llm_timeout","time_insight_llm_min_confidence","time_insight_diagnostic_log"]}
+];
+var insightMeta={
+ enable_time_insight_affiliate:["启用内置时间洞察","关闭后不重建、不查询、不注入。","bool"],time_insight_auto_update_hours:["自动重建间隔（小时）","跨日也会触发重建；0 仅保留手动更新。","number"],time_insight_source_memo_limit:["最多读取日记数","只影响后台重建范围。","number"],time_insight_min_importance:["最低重要性","手动与正反馈记忆可以越过。","number"],time_insight_min_evidence_score:["最低证据分","越高越克制。","number"],
+ time_insight_recent_window_days:["近期观察窗口（天）","统计多个不同日期的关系和心理变化。","number"],time_insight_anniversary_window_days:["周年邻近窗口（天）","邻近候选仍需本轮问题相关才注入。","number"],time_insight_trend_min_distinct_days:["趋势最少不同日期","同一天多篇不能冒充趋势。","number"],time_insight_trend_min_evidence:["趋势最少独立证据","会按日记与内容相似度去重。","number"],time_insight_seasonal_min_years:["季节模式最少年份","默认至少三个独立年份。","number"],
+ time_insight_ambient_max_insights:["环境洞察上限","默认每轮最多 1 条。","number"],time_insight_ambient_max_chars:["环境洞察字符上限","限制今日余韵体积。","number"],time_insight_repeat_cooldown_minutes:["重复冷却（分钟）","明确问日期或旧事时可再次触发。","number"],
+ time_insight_query_enable:["启用按问题补充","只读本地候选，不在每轮调用 LLM。","bool"],time_insight_query_max_insights:["查询洞察上限","与普通日记召回并行。","number"],time_insight_query_min_score:["查询最低匹配分","人物、日期、词面和候选质量共同决定。","number"],time_insight_query_max_chars:["查询洞察字符上限","不改变日记注入预算。","number"],time_insight_query_lookup_timeout:["本地查询超时（秒）","超时直接跳过并放行请求。","number"],
+ time_insight_llm_refine_enable:["启用后台 LLM 审校","只能精炼既有证据，不能创造事件。","bool"],time_insight_llm_provider_id:["审校模型","留空跟随最近会话模型。","provider"],time_insight_llm_timeout:["审校超时（秒）","不会阻塞聊天。","number"],time_insight_llm_min_confidence:["审校最低置信度","非法引用或低置信改写会被拒绝。","number"],time_insight_diagnostic_log:["诊断日志","记录重建和真实注入。","bool"]
+};
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
+function fmtTime(v){if(!v)return"-";var d=new Date(v);return isNaN(d)?String(v):d.toLocaleString("zh-CN",{hour12:false})}
+function pct(v){return Math.max(0,Math.min(100,Number(v||0)*100))}
+function notify(message,error){var el=document.getElementById("notice");el.textContent=message;el.className="notice show"+(error?" error":"");clearTimeout(el._t);el._t=setTimeout(function(){el.className="notice"},4200)}
+async function api(url,opt){var r=await fetch(url,opt);var d=await r.json();if(!d.ok)throw new Error(d.error||"请求失败");return d.data}
+async function post(url,body){return api(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})}
+function renderScopes(items,selected){var el=document.getElementById("scope"),keys=(items||[]).map(function(x){return x.key});if(selected&&!keys.includes(selected))keys.unshift(selected);el.innerHTML=keys.length?keys.map(function(k){return"<option value='"+esc(k)+"'"+(k===selected?" selected":"")+">"+esc(k)+"</option>"}).join(""):"<option value='"+esc(selected||"")+"'>"+esc(selected||"默认状态")+"</option>"}
+function renderState(s){
+ currentState=s||{};currentKey=s.key||currentKey;
+ document.getElementById("m-consciousness").textContent=s.consciousness==="sleeping"?"睡眠":"清醒";
+ document.getElementById("m-last").textContent="最近互动 "+fmtTime(s.lastConversationAt);
+ document.getElementById("m-intent").textContent=(s.intent&&s.intent.label)||"未形成";
+ document.getElementById("m-intent-value").textContent=s.intent?"强度 "+Number(s.intent.value||0).toFixed(2):"等待状态增长";
+ document.getElementById("m-fatigue").textContent=Number(s.fatigue||0).toFixed(3);
+ document.getElementById("m-revision").textContent=String(s.revision||0);
+ var inj=s.lastInjection||{};document.getElementById("m-injection").textContent=inj.chars?inj.chars+" 字":"0 字";document.getElementById("m-injection-time").textContent=inj.ts?fmtTime(inj.ts*1000):"等待样本";
+ document.getElementById("drives").innerHTML=(s.drives||[]).map(function(x){var p=x.pressure==null?Number(x.value||0):Number(x.pressure||0),a=Number(x.activation||0),m=x.meta||{},kind=x.kind==="affect"?"情绪余波":"需要压力",reason=[m.reason,m.delta!=null?(Number(m.delta)>=0?"+":"")+Number(m.delta).toFixed(3):"",m.at?fmtTime(m.at):""].filter(Boolean).join(" · ");return"<div class='drive-row "+(x.kind==="affect"?"affect":"need")+"' title='"+esc(x.key)+"'><div class='drive-name'>"+esc(x.label)+"<small>"+kind+"</small></div><div class='drive-bars'><div class='drive-track pressure'><label>积累</label><div class='track'><span style='width:"+pct(p)+"%'></span></div></div><div class='drive-track activation'><label>激活</label><div class='track'><span style='width:"+pct(a)+"%'></span></div></div></div><div class='drive-value mono'>"+Number(x.value||0).toFixed(2)+"</div><div class='drive-reason'>"+esc(reason||"等待变化证据")+"</div></div>"}).join("");
+ var dg=inj.diagnostics||{};document.getElementById("diag").innerHTML=["意向|"+(dg.intent||"-"),"长期倾向|"+((dg.drives||[]).length),"本轮即时|"+((dg.live_drives||[]).length),"身体节律|"+(dg.body_available?"已合成":"未注入"),"意识|"+(dg.consciousness||s.consciousness||"-")].map(function(v){var p=v.split("|");return"<div>"+esc(p[0])+"<b>"+esc(p[1])+"</b></div>"}).join("");
+ document.getElementById("injection-preview").textContent=inj.preview||"等待首个真实请求。";document.getElementById("inject-source").textContent=inj.ts?fmtTime(inj.ts*1000):"真实请求";
+ var pool=s.thoughtPool||{},thoughts=[...(pool.obsessions||[]).map(function(x){return Object.assign({kind:"obsession"},x)}),...(pool.flash||[]).map(function(x){return Object.assign({kind:"flash"},x)})];document.getElementById("thought-count").textContent=thoughts.length+" 条";document.getElementById("thoughts").innerHTML=thoughts.length?thoughts.map(function(x){return"<div class='item'><div class='item-head'><span class='badge "+x.kind+"'>"+(x.kind==="obsession"?"执念":"闪念")+"</span><span class='mono'>"+Number(x.intensity||0).toFixed(2)+"</span></div><p>"+esc(x.text||"")+"</p></div>"}).join(""):"<div class='empty'>暂无闪念或执念</div>";
+ var lp=s.lastPerception||{},ev=lp.event||{},live=lp.liveAppraisal||{},phs=s.perceptionHealthByStage||{},lh=phs.live||{},ph=phs.post||s.perceptionHealth||{},ld=live._diagnostics||{},pd=lp.diagnostics||{},healthLabels={idle:"尚未调用",healthy:"正常",degraded:"近期失败",circuit_open:"暂时熔断"};function healthLine(label,h){return label+": "+(healthLabels[h.state]||h.state||"-")+(h.provider?" · "+h.provider:"")+(h.consecutive_failures?" · 连续失败 "+h.consecutive_failures+" 次":"")+(h.state==="circuit_open"?" · "+Number(h.circuit_remaining_seconds||0).toFixed(0)+" 秒后恢复":"")+(h.last_error?" · "+(h.last_error_kind||"unknown")+" · "+h.last_error:"")}document.getElementById("perception-source").textContent=lp.source||"暂无";document.getElementById("perception").textContent=lp.ts?[healthLine("即时通道",lh),healthLine("后台通道",ph),"请求前即时来源: "+(live._source||"-")+(ld.reason?" · "+ld.reason:""),"请求前激活: "+(Object.entries(live.activationLevels||{}).map(function(x){return x[0]+" "+Number(x[1]).toFixed(2)}).join(", ")||"无"),live.guidance?"即时侧重: "+live.guidance:"","回答后结算来源: "+(lp.source||"-")+(pd.reason?" · "+pd.reason:""),"回答后置信度: "+Number(ev.confidence||0).toFixed(2),"实际满足程度: "+(Object.entries(ev.satisfactionLevels||{}).map(function(x){return x[0]+" "+Number(x[1]).toFixed(2)}).join(", ")||"无"),"留下的即时激活: "+(Object.entries(ev.activationLevels||{}).map(function(x){return x[0]+" "+Number(x[1]).toFixed(2)}).join(", ")||"无"),"持续余波: "+(Object.entries(ev.driveDeltas||{}).map(function(x){return x[0]+" "+Number(x[1]).toFixed(2)}).join(", ")||"无"),"精神负荷变化: "+Number(ev.fatigueDelta||0).toFixed(3),ev.summary?"摘要: "+ev.summary:""].filter(Boolean).join("\n"):"等待一次完整对话。";
+ renderActivity(s);renderBody(s);document.getElementById("rail-engine").textContent=settings.enable?"运行中":"已关闭";document.getElementById("rail-perception").textContent=settings.perception_mode||"-";document.getElementById("rail-injection").textContent=settings.shadow_mode?"影子":(settings.injection_enable?"开启":"关闭");
+}
+function renderBody(s){
+ var b=(s&&s.bodyState)||{},available=!!b.available,phaseLabels={menstrual:"经期",follicular:"恢复期",ovulatory:"活跃期",luteal:"缓降期"};
+ document.getElementById("body-phase").textContent=available?(b.phaseLabel||phaseLabels[b.phase]||b.phase):"等待锚点";
+ document.getElementById("body-cycle-meta").textContent=available?("周期第 "+b.cycleDay+" 天 · 阶段第 "+b.phaseDay+"/"+b.phaseDuration+" 天 · 距下周期 "+b.daysToNextCycle+" 天"):(b.reason==="disabled"?"身体节律已关闭":"填写最近周期首日后开始计算");
+ document.getElementById("body-date").textContent=available?(b.date+" · 周期 "+b.cycleLength+" 天"):"未运行";
+ var phases=["menstrual","follicular","ovulatory","luteal"];document.getElementById("body-phase-track").innerHTML=phases.map(function(k){return"<div class='phase-segment "+(b.phase===k?"active":"")+"'><b>"+phaseLabels[k]+"</b>"+(b.phase===k?("第 "+b.phaseDay+" 天"):"")+"</div>"}).join("");
+ var labels=b.signalLabels||{energy:"身体精力",discomfort:"身体不适",sensitivity:"感官敏感",social_energy:"社交余量",comfort_need:"安稳偏好",closeness:"亲近感知"},signals=b.signals||{},keys=["energy","discomfort","sensitivity","social_energy","comfort_need","closeness"];
+ document.getElementById("body-signals").innerHTML=available?keys.map(function(k){var v=Number(signals[k]||0);return"<div class='body-signal'><span>"+esc(labels[k]||k)+"</span><div class='track'><span style='width:"+pct(v)+"%'></span></div><b class='mono'>"+v.toFixed(2)+"</b></div>"}).join(""):"<div class='body-empty'><div><b>没有身体状态</b>锚点留空时不会产生任何身体注入</div></div>";
+ var tendencies=b.tendencies||[],layers=[];if(b.phaseExperience)layers.push(["主体感受",b.phaseExperience]);if(b.timeExperience)layers.push([b.timeLabel||"时段修正",b.timeExperience]);tendencies.forEach(function(x){layers.push(["显著信号",x])});document.getElementById("body-tendencies").innerHTML=available&&layers.length?layers.map(function(x){return"<div class='item'><div class='item-head'><span class='badge'>"+esc(x[0])+"</span></div><p>"+esc(x[1])+"</p></div>"}).join(""):(available?"<div class='empty'>当前影响强度为零，身体层不会改变本轮表达。</div>":"<div class='empty'>设置有效锚点后显示当日身体体验</div>");
+ var modeLabels={significant:"仅显著信号",balanced:"均衡呈现",immersive:"沉浸呈现"};document.getElementById("body-layer-meta").textContent=available?((modeLabels[b.expressionMode]||b.expressionMode||"均衡呈现")+" · "+(b.timeLabel||"-")):"阶段底色与时段修正";
+ var inj=(s&&s.lastInjection)||{},dg=inj.diagnostics||{},real=!!dg.body_injected,preview=real?(dg.body_context||b.injectionPreview||""):(b.injectionPreview||"");document.getElementById("body-injection-preview").textContent=preview||(available?"当前呈现模式没有生成身体注入。":"身体节律未参与注入。");document.getElementById("body-injection-meta").textContent=real?("上次真实请求 · "+Number(dg.body_chars||0)+" 字"):(available?"当前计算预览 · 尚无真实请求":"与心潮共用一个临时块");
+}
+function renderActivity(s){
+ var events=(s.recentEvents||[]).slice().reverse();document.getElementById("events").innerHTML=events.length?events.map(function(x){return"<div class='item'><div class='item-head'><span class='item-title'>互动摘要</span><span class='item-time'>"+esc(fmtTime(x.at))+"</span></div><p>"+esc(x.summary||"")+"</p></div>"}).join(""):"<div class='empty'>暂无互动摘要</div>";
+ var dreams=(s.recentDreams||[]).slice().reverse();document.getElementById("dreams").innerHTML=dreams.length?dreams.map(function(x){return"<div class='item'><div class='item-head'><span class='item-title'>梦境余韵</span><span class='item-time'>"+esc(fmtTime(x.createdAt))+"</span></div>"+(x.dream?"<p>"+esc(x.dream)+"</p>":"")+"<p>"+esc(x.residue||"")+"</p>"+(x.awareness?"<p class='muted'>"+esc(x.awareness)+"</p>":"")+"</div>"}).join(""):"<div class='empty'>暂无梦境</div>";
+ var active=(s.recentActiveMessages||[]).slice().reverse();document.getElementById("active-messages").innerHTML=active.length?active.map(function(x){return"<div class='item'><div class='item-head'><span class='badge'>"+esc(x.kind||"message")+"</span><span class='item-time'>"+esc(fmtTime(x.at))+"</span></div><p>"+esc(x.message||"")+"</p></div>"}).join(""):"<div class='empty'>暂无真实主动消息；总开关默认关闭</div>";
+ var breath=((s.dreamBreathContext||{}).dreams||[]).slice().reverse();document.getElementById("dream-context").innerHTML=breath.length?breath.map(function(x){return"<div class='item'><div class='item-head'><span class='item-title'>"+esc(fmtTime(x.createdAt))+"</span></div><p>"+esc(x.summary||x.residue||"")+"</p></div>"}).join(""):"<div class='empty'>没有可供近期心理连续性使用的梦境余韵</div>";
+ var history=(s.driveHistory||[]).slice().reverse();document.getElementById("drive-history").innerHTML=history.length?history.map(function(x){var pp=Number(x.pressureBefore||0),pn=Number(x.pressureAfter||0),ap=Number(x.activationBefore||0),an=Number(x.activationAfter||0),delta=Number(x.delta||0);return"<div class='item'><div class='item-head'><span class='item-title'>"+esc(driveLabels[x.key]||x.key||"心理状态")+"</span><span class='badge'>"+esc(x.source||"engine")+"</span><span class='item-time'>"+esc(fmtTime(x.at))+"</span></div><p>积累 "+pp.toFixed(3)+" → "+pn.toFixed(3)+"　激活 "+ap.toFixed(3)+" → "+an.toFixed(3)+"　总变化 "+(delta>=0?"+":"")+delta.toFixed(3)+"</p><p class='muted'>"+esc(x.reason||"状态变化")+"</p></div>"}).join(""):"<div class='empty'>尚无达到记录阈值的心理变化</div>";
+ var logs=(s.logs||[]).slice().reverse();document.getElementById("logs").innerHTML=logs.length?logs.map(function(x){return"<div class='item'><div class='item-head'><span class='badge'>"+esc(x.category||"event")+"</span><span class='item-time'>"+esc(x.time||"")+"</span></div><p>"+esc(x.message||"")+"</p></div>"}).join(""):"<div class='empty'>暂无运行轨迹</div>";
+}
+function fillDriveSelects(){var html=Object.keys(driveLabels).map(function(k){return"<option value='"+k+"'>"+esc(driveLabels[k])+" ("+k+")</option>"}).join("");["feedback-drive","thought-drive"].forEach(function(id){document.getElementById(id).innerHTML=html});document.getElementById("sim-satisfied").innerHTML="<option value=''>无</option>"+html}
+function control(key,value,meta){var type=meta[2];if(type==="bool")return"<label class='toggle'><span>"+(value?"开启":"关闭")+"</span><input data-key='"+key+"' type='checkbox' "+(value?"checked":"")+"></label>";if(type==="select"){var optionLabels=meta[4]||{};return"<select data-key='"+key+"'>"+meta[3].map(function(v){return"<option value='"+esc(v)+"' "+(String(value)===v?"selected":"")+">"+esc(optionLabels[v]||v)+"</option>"}).join("")+"</select>"}if(type==="provider"){var current=String(value||""),items=[{id:"",label:"跟随当前会话模型"}].concat(providerOptions||[]);if(current&&!items.some(function(x){return x.id===current}))items.push({id:current,label:current+" · 当前不可用"});return"<select data-key='"+key+"'>"+items.map(function(x){return"<option value='"+esc(x.id)+"' "+(current===x.id?"selected":"")+">"+esc(x.label||x.id)+"</option>"}).join("")+"</select>"}return"<input data-key='"+key+"' type='"+(type==="number"?"number":(type==="date"?"date":"text"))+"' value='"+esc(value)+"' "+(type==="number"?"step='any'":"")+">"}
+function settingsBands(groups){return groups.map(function(group){var rows=group.keys.map(function(key){var m=settingMeta[key]||[key,"","text"];return"<div class='setting' data-row='"+key+"'><div><div class='setting-name'>"+esc(m[0])+"</div><div class='setting-key'>"+esc(key)+"</div><div class='setting-hint'>"+esc(m[1])+"</div></div><div>"+control(key,settings[key],m)+"</div></div>"}).join("");return"<section class='settings-band'><div class='settings-head'><div><h3>"+esc(group.title)+"</h3><p>"+esc(group.sub)+"</p></div></div><div class='setting-grid'>"+rows+"</div></section>"}).join("")}
+function renderSettings(){
+ var root=document.getElementById("settings-sections"),bodyRoot=document.getElementById("body-settings-sections");root.innerHTML=settingsBands(settingGroups);bodyRoot.innerHTML=settingsBands(bodySettingGroups);
+ document.querySelectorAll("[data-key]").forEach(function(el){el.addEventListener("input",settingsChanged);el.addEventListener("change",settingsChanged)});baseline=JSON.stringify(settings);document.getElementById("save-status").textContent="未修改";document.getElementById("body-save-status").textContent="未修改";
+}
+function insightControl(key,value,meta){var type=meta[2],attr="data-insight-key='"+key+"'";if(type==="bool")return"<label class='toggle'><span>"+(value?"开启":"关闭")+"</span><input "+attr+" type='checkbox' "+(value?"checked":"")+"></label>";if(type==="provider"){var current=String(value||""),items=[{id:"",label:"跟随最近会话模型"}].concat(insightProviderOptions||[]);if(current&&!items.some(function(x){return x.id===current}))items.push({id:current,label:current+" · 当前不可用"});return"<select "+attr+">"+items.map(function(x){return"<option value='"+esc(x.id)+"' "+(current===x.id?"selected":"")+">"+esc(x.label||x.id)+"</option>"}).join("")+"</select>"}return"<input "+attr+" type='"+(type==="number"?"number":"text")+"' value='"+esc(value)+"' "+(type==="number"?"step='any'":"")+">"}
+function renderInsightSettings(){var root=document.getElementById("time-insight-settings");root.innerHTML=insightGroups.map(function(group){var rows=group.keys.map(function(key){var m=insightMeta[key]||[key,"","text"];return"<div class='setting' data-insight-row='"+key+"'><div><div class='setting-name'>"+esc(m[0])+"</div><div class='setting-key'>"+esc(key)+"</div><div class='setting-hint'>"+esc(m[1])+"</div></div><div>"+insightControl(key,insightSettings[key],m)+"</div></div>"}).join("");return"<section class='settings-band'><div class='settings-head'><div><h3>"+esc(group.title)+"</h3><p>"+esc(group.sub)+"</p></div></div><div class='setting-grid'>"+rows+"</div></section>"}).join("");document.querySelectorAll("[data-insight-key]").forEach(function(el){el.addEventListener("input",insightChanged);el.addEventListener("change",insightChanged)});insightBaseline=JSON.stringify(insightSettings);document.getElementById("ti-save-status").textContent="未修改"}
+function readInsightSettings(){var out=Object.assign({},insightSettings);document.querySelectorAll("[data-insight-key]").forEach(function(el){var key=el.dataset.insightKey,m=insightMeta[key],type=m&&m[2];out[key]=type==="bool"?el.checked:(type==="number"?Number(el.value):el.value)});return out}
+function insightChanged(e){var row=e.target.closest(".setting");if(row)row.classList.add("changed");document.getElementById("ti-save-status").textContent="有未保存修改"}
+function renderInsight(data){data=data||{};var stats=data.stats||{},runtime=(data.last_runtime||{}).stats||{},mode=data.external_affiliate_active?"附属兼容":(data.enabled?"内置运行":"已关闭");var modeEl=document.getElementById("ti-mode");modeEl.textContent=mode;modeEl.className=data.external_affiliate_active?"mode-warn":"mode-ok";document.getElementById("ti-mode-note").textContent=data.external_affiliate_active?"已自动避免重复注入":"主插件直接管理";document.getElementById("ti-candidates").textContent=String(data.candidate_count||0);document.getElementById("ti-dated").textContent=String(stats.dated_memories||0);document.getElementById("ti-source").textContent="来源 "+String(stats.source_memories||0);document.getElementById("ti-ambient").textContent=String(stats.static_selected||0);document.getElementById("ti-age").textContent=data.generated?(Number(data.age_hours||0).toFixed(1)+"h"):"未生成";document.getElementById("ti-llm").textContent="LLM "+String(stats.llm_status||"-");document.getElementById("ti-runtime").textContent="最近按问题补充 "+String(runtime.selected||0)+" 条";document.getElementById("ti-block").textContent=data.block||"当前没有达到环境注入门槛的洞察。";var items=data.candidates||[];document.getElementById("ti-candidate-list").innerHTML=items.length?items.map(function(x){var evidence=x.evidence||[];return"<div class='insight-row'><div><span class='badge'>"+esc(x.kind||"candidate")+"</span>"+(x.static_selected?"<div class='mode-ok'>今日环境</div>":"")+"</div><div><strong>"+esc(x.title||"")+"</strong><p>"+esc(x.claim||"")+"</p><div class='insight-evidence'>证据 "+evidence.length+(evidence[0]?(" · "+esc(evidence[0].date||"")):"")+"</div></div><div class='insight-score mono'>"+Number(x.score||0).toFixed(2)+"<br><span class='muted'>置信 "+Number(x.confidence||0).toFixed(2)+"</span></div></div>"}).join(""):"<div class='empty'>暂无合格候选</div>"}
+async function loadTimeInsight(){try{var data=await api("/api/time-insight/settings");insightSettings=data.settings||{};insightProviderOptions=data.providerOptions||[];renderInsightSettings();renderInsight(data.status||{})}catch(e){notify(e.message,true)}}
+function readSettings(){var out=Object.assign({},settings);document.querySelectorAll("[data-key]").forEach(function(el){var key=el.dataset.key,m=settingMeta[key],type=m&&m[2];out[key]=type==="bool"?el.checked:(type==="number"?Number(el.value):el.value)});return out}
+function settingsChanged(e){var row=e.target.closest(".setting");if(row)row.classList.add("changed");document.getElementById("save-status").textContent="有未保存修改";document.getElementById("body-save-status").textContent="有未保存修改"}
+async function load(){
+ try{var data=await api("/api/xinchao/overview"+(currentKey?"?key="+encodeURIComponent(currentKey):""));settings=data.settings||{};providerOptions=data.providerOptions||[];currentKey=data.selected||"";document.getElementById("version").textContent=data.version||"4.5.4";renderScopes(data.states||[],currentKey);renderState(data.state||{});renderSettings();await loadTimeInsight()}catch(e){notify(e.message,true)}
+}
+async function refreshState(){try{var s=await api("/api/xinchao/state?key="+encodeURIComponent(currentKey));renderState(s)}catch(e){notify(e.message,true)}}
+document.querySelectorAll(".nav button").forEach(function(b){b.addEventListener("click",function(){document.querySelectorAll(".nav button").forEach(function(x){x.classList.toggle("active",x===b)});document.querySelectorAll(".tab").forEach(function(x){x.classList.toggle("active",x.id===b.dataset.tab)});document.getElementById("title").textContent=tabs[b.dataset.tab][0];document.getElementById("subtitle").textContent=tabs[b.dataset.tab][1];if(b.dataset.tab==="time-insight")loadTimeInsight()})});
+document.getElementById("scope").addEventListener("change",function(){currentKey=this.value;refreshState()});
+document.getElementById("refresh").addEventListener("click",refreshState);
+document.getElementById("settle").addEventListener("click",async function(){try{renderState(await post("/api/xinchao/settle",{key:currentKey}));notify("结算完成")}catch(e){notify(e.message,true)}});
+document.getElementById("feedback").addEventListener("click",async function(){try{renderState(await post("/api/xinchao/feedback",{key:currentKey,drive:document.getElementById("feedback-drive").value,delta:Number(document.getElementById("feedback-delta").value)}));notify("反馈已写入")}catch(e){notify(e.message,true)}});
+document.getElementById("add-thought").addEventListener("click",async function(){try{renderState(await post("/api/xinchao/thought",{key:currentKey,drive:document.getElementById("thought-drive").value,intensity:Number(document.getElementById("thought-intensity").value),text:document.getElementById("thought-text").value}));document.getElementById("thought-text").value="";notify("闪念已加入")}catch(e){notify(e.message,true)}});
+document.getElementById("simulate").addEventListener("click",async function(){try{var sat=document.getElementById("sim-satisfied").value,dk=document.getElementById("sim-delta-key").value,thought=document.getElementById("sim-thought").value,event={satisfiedDrives:sat?[sat]:[],driveDeltas:dk?{[dk]:Number(document.getElementById("sim-delta").value)}:{},flashThoughts:thought?[{key:sat||dk||"reflection",text:thought,intensity:.6}]:[],summary:""};var d=await post("/api/xinchao/simulate",{key:currentKey,hours:Number(document.getElementById("sim-hours").value),event:event});document.getElementById("sim-meta").textContent="经过 "+Number(d.simulation.hours||0)+" 小时";document.getElementById("sim-drives").innerHTML=(d.topDrives||[]).slice(0,4).map(function(x){return"<div>"+esc(x.label)+"<b>"+Number(x.value||0).toFixed(2)+"</b></div>"}).join("");document.getElementById("sim-preview").textContent=d.simulation.injection||"没有可注入倾向"}catch(e){notify(e.message,true)}});
+async function saveAllSettings(message){var d=await post("/api/xinchao/settings/save",{settings:readSettings()});settings=d.settings||{};renderSettings();await refreshState();notify(message)}
+document.getElementById("save-settings").addEventListener("click",async function(){try{await saveAllSettings("心潮设置已保存")}catch(e){notify(e.message,true)}});
+document.getElementById("save-body-settings").addEventListener("click",async function(){try{await saveAllSettings("身体节律设置已保存")}catch(e){notify(e.message,true)}});
+document.getElementById("save-time-insight").addEventListener("click",async function(){try{var data=await post("/api/time-insight/settings/save",{settings:readInsightSettings()});insightSettings=data.settings||{};renderInsightSettings();await loadTimeInsight();notify("时间洞察设置已保存并热应用")}catch(e){notify(e.message,true)}});
+document.getElementById("ti-update").addEventListener("click",async function(){var b=this;b.disabled=true;b.textContent="重建中...";try{var data=await post("/api/time-insight/update",{});if(data.updated===false)throw new Error(data.reason||"未更新");await loadTimeInsight();notify("时间洞察已重建")}catch(e){notify(e.message,true)}finally{b.disabled=false;b.textContent="立即重建"}});
+document.getElementById("ti-preview").addEventListener("click",async function(){var b=this;b.disabled=true;try{var data=await post("/api/time-insight/preview",{}),current=await api("/api/time-insight/status");current.block=data.ambient_block||"预览没有达到环境注入门槛的洞察。";current.candidates=data.candidates||[];current.candidate_count=data.candidate_count||0;current.stats=Object.assign({},current.stats||{},data);renderInsight(current);notify("预览完成，未写数据库")}catch(e){notify(e.message,true)}finally{b.disabled=false}});
+document.getElementById("reset-state").addEventListener("click",async function(){var typed=prompt("输入 RESET 确认重置当前心潮状态");if(typed!=="RESET")return;try{renderState(await post("/api/xinchao/reset",{key:currentKey,confirm:"RESET"}));notify("当前状态已重置")}catch(e){notify(e.message,true)}});
+fillDriveSelects();load();
+</script>
+</body>
+</html>

@@ -40,4 +40,4 @@
 - 5.0 专项：14/14。
 - 源码与 ZIP 双环境审计通过。
 
-完整说明见 [5.0.0-test0 实现与验收报告](5.0-test0-implementation-report.md)。
+完整说明见 [5.0.0-test0 实现与验收报告](https://github.com/qwqisaaczeus-netizen/astrbot_plugin_memos_memory/blob/v5.0.0-test0/docs/5.0-test0-implementation-report.md)。

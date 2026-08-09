@@ -43,7 +43,7 @@
     <div class="brand">
       <h1>memos-memory</h1>
       <p>长期记忆、画像、召回诊断与运行观测</p>
-      <span class="version" id="side-version">WebUI 4.6.2</span>
+      <span class="version" id="side-version">WebUI 5.0.0-test0</span>
     </div>
     <div class="status">
       <div class="status-row"><span><i class="dot" id="dot-memos"></i>memos</span><b id="txt-memos">-</b></div>
@@ -67,7 +67,8 @@
       <button data-tab="backups"><span class="ico">13</span>备份管理</button>
     </nav>
     <div class="side-foot">
-      <div id="side-foot-version">WebUI 4.6.2</div>
+      <div id="side-foot-version">WebUI 5.0.0-test0</div>
+      <div><a href="/access">打开记忆可达性</a></div>
       <div><a href="/xinchao">打开心潮工作台</a></div>
       <div><a href="/console">打开专业控制台</a></div>
     </div>
@@ -75,7 +76,7 @@
   <main class="main">
     <div class="top">
       <div><h2 id="page-title">概览</h2><p id="page-sub">观察插件连接、记忆规模、召回质量和注入运行情况。</p></div>
-      <div class="actions"><a class="btn" href="/production">记忆生产</a><a class="btn" href="/xinchao">心潮工作台</a><a class="btn" href="/console">专业控制台</a><button class="btn primary" id="refresh-page" onclick="refreshCurrent(true)">刷新当前页</button></div>
+      <div class="actions"><a class="btn" href="/production">记忆生产</a><a class="btn" href="/access">记忆可达性</a><a class="btn" href="/xinchao">心潮工作台</a><a class="btn" href="/console">专业控制台</a><button class="btn primary" id="refresh-page" onclick="refreshCurrent(true)">刷新当前页</button></div>
     </div>
 
     <section id="overview" class="tab active">
@@ -324,8 +325,8 @@ async function loadOverview(){
     var st=await api("/api/status");
     renderSideStatus(st);
     document.getElementById("st-version").textContent=st.plugin_version||"-";
-    document.getElementById("side-version").textContent="WebUI "+(st.plugin_version||"4.6.2");
-    document.getElementById("side-foot-version").textContent="WebUI "+(st.plugin_version||"4.6.2");
+    document.getElementById("side-version").textContent="WebUI "+(st.plugin_version||"5.0.0-test0");
+    document.getElementById("side-foot-version").textContent="WebUI "+(st.plugin_version||"5.0.0-test0");
     document.getElementById("st-emb").textContent=(st.emb_cache_used!=null?n(st.emb_cache_used)+"/"+n(st.emb_cache_size):"-");
     document.getElementById("st-compress").textContent=n(st.compress_count||0);
     document.getElementById("st-profile").textContent=st.profile&&st.profile.connected?"已接入":(st.rp_enhancer_enable?"可用":"-");

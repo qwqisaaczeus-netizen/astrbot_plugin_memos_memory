@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 from .archive_guard import ArchiveGuard
 from .episode_repo import EpisodeRepo, SUPPORTED_TIERS, normalize_tier
+from .memory_access import MemoryAccessRepository
 from .preview_store import PreviewStore
 from .source_archive import SourceArchive
 from .store_utils import (
@@ -46,7 +47,7 @@ class EpisodicStore:
     orthogonal to the layering and stable since 4.5.4.
     """
 
-    SCHEMA_VERSION = 6
+    SCHEMA_VERSION = 7
 
     def __init__(self, db_path: str, emb_dim: Optional[int], emb_model_id: Optional[str]):
         self.db_path = db_path
@@ -60,6 +61,7 @@ class EpisodicStore:
         self._eps: EpisodeRepo | None = None
         self._guard: ArchiveGuard | None = None
         self._previews: PreviewStore | None = None
+        self._access: MemoryAccessRepository | None = None
         self._snapshot_keep = 3
         self._preview_keep = 20
 
@@ -93,6 +95,7 @@ class EpisodicStore:
         self._guard = ArchiveGuard(self.db_path, self._connect, self._lock,
                                     snapshot_keep=self._snapshot_keep)
         self._previews = PreviewStore(self._connect, self._lock, keep=self._preview_keep)
+        self._access = MemoryAccessRepository(self._connect, self._lock)
         # Capture an older schema before any Repository CREATE/ALTER statement.
         pre_migration = self._guard.capture_pre_migration(conn, self.SCHEMA_VERSION)
         self._init_schema(conn, pre_migration=pre_migration)
@@ -106,6 +109,8 @@ class EpisodicStore:
         self._guard.init_schema(conn)
         self._src.init_schema(conn)
         self._eps.init_schema(conn)
+        assert self._access is not None
+        self._access.init_schema(conn)
         assert self._previews is not None
         self._previews.init_schema(conn)
         conn.execute(
@@ -295,8 +300,51 @@ class EpisodicStore:
         )
 
     def delete_by_memo_name(self, memo_name: str) -> int:
-        assert self._eps is not None
+        assert self._eps is not None and self._access is not None
+        self._access.delete_memo(memo_name)
         return self._eps.delete_by_memo_name(memo_name)
+
+    # ---- 5.0 memory accessibility forwards --------------------------
+
+    def sync_memory_access(self, episode: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.sync_episode(episode, **kwargs)
+
+    def rebuild_memory_access(self, episodes: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.rebuild(episodes, **kwargs)
+
+    def maintain_memory_access(self, **kwargs: Any) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.maintain(**kwargs)
+
+    def evaluate_memory_access(self, **kwargs: Any) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.evaluate(**kwargs)
+
+    def record_memory_response_use(self, **kwargs: Any) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.record_response_use(**kwargs)
+
+    def memory_access_overview(self) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.overview()
+
+    def list_memory_access_states(self, **kwargs: Any) -> list[dict[str, Any]]:
+        assert self._access is not None
+        return self._access.list_states(**kwargs)
+
+    def memory_access_detail(self, memo_name: str) -> dict[str, Any] | None:
+        assert self._access is not None
+        return self._access.detail(memo_name)
+
+    def list_memory_interference(self, **kwargs: Any) -> list[dict[str, Any]]:
+        assert self._access is not None
+        return self._access.list_edges(**kwargs)
+
+    def list_memory_access_events(self, **kwargs: Any) -> list[dict[str, Any]]:
+        assert self._access is not None
+        return self._access.list_events(**kwargs)
 
     def memo_names(self) -> set[str]:
         assert self._eps is not None
@@ -490,6 +538,7 @@ class EpisodicStore:
         ).fetchone()["n"])
         db_uuid_row = conn.execute("SELECT value FROM meta WHERE key='database_uuid'").fetchone()
         db_uuid = str(db_uuid_row["value"]) if db_uuid_row else ""
+        access = self._access.overview() if self._access is not None else {}
         return {
             "episodes": eps.get("episodes", 0),
             "source_grounded": eps.get("source_grounded", 0),
@@ -529,6 +578,11 @@ class EpisodicStore:
             "path_conflict": conn.execute(
                 "SELECT value FROM meta WHERE key='path_conflict'").fetchone()["value"]
             if conn.execute("SELECT value FROM meta WHERE key='path_conflict'").fetchone() else "",
+            "memory_access_total": int(access.get("total") or 0),
+            "memory_access_states": access.get("states") or {},
+            "memory_interference_edges": int(access.get("edges") or 0),
+            "memory_interference_groups": int(access.get("groups") or 0),
+            "memory_access_shadow_requests": int(access.get("shadow_requests") or 0),
         }
 
     # ---- 8.3.A/B/E guard forwards -----------------------------------
@@ -564,6 +618,7 @@ class EpisodicStore:
             self._eps = None
             self._guard = None
             self._previews = None
+            self._access = None
             self._connect()
         return guard.restore_snapshot(file_name, live_store_close=_close, live_store_reopen=_reopen)
 
@@ -593,6 +648,7 @@ class EpisodicStore:
             self._eps = None
             self._guard = None
             self._previews = None
+            self._access = None
 
     def batch_status(self, limit: int = 30) -> list[dict[str, Any]]:
         rows = self._connect().execute(

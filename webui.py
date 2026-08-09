@@ -91,6 +91,7 @@ def _make_handler(
     console_html: str,
     xinchao_html: str,
     production_html: str,
+    access_html: str,
 ):
     """Create a request handler class bound to the plugin instance."""
 
@@ -186,6 +187,16 @@ def _make_handler(
             "data_backup_enable", "data_backup_interval_days",
             "data_backup_keep", "data_backup_dir",
         },
+        "5.0 记忆可达性（test0）": {
+            "memory_forgetting_enable", "memory_forgetting_shadow_mode",
+            "memory_access_decay_enable", "memory_access_deep_rescue_enable",
+            "memory_interference_enable", "memory_reconsolidation_enable",
+            "memory_psychological_bias_enable", "memory_psychological_bias_strength",
+            "memory_access_vivid_threshold", "memory_access_deep_threshold",
+            "memory_access_decay_days", "memory_access_exact_cue_relief",
+            "memory_access_max_neighbors", "memory_access_maintenance_hours",
+            "memory_access_event_keep",
+        },
         "重要性规则": {
             "imp_tier5_keywords", "imp_tier4_keywords", "imp_tier3_keywords", "imp_low_keywords",
         },
@@ -228,6 +239,13 @@ def _make_handler(
         "lean_source_evidence_enable": True,
         "lean_coverage_selection_enable": True,
         "lean_adaptive_evidence_enable": True,
+        "memory_forgetting_enable": True,
+        "memory_forgetting_shadow_mode": True,
+        "memory_access_decay_enable": True,
+        "memory_access_deep_rescue_enable": True,
+        "memory_interference_enable": True,
+        "memory_reconsolidation_enable": True,
+        "memory_psychological_bias_enable": True,
         "passage_vector_auto_migrate": True,
         "source_turn_vector_auto_migrate": True,
         "lean_temporal_enable": True,
@@ -538,6 +556,8 @@ def _make_handler(
                 _html_response(self, xinchao_html)
             elif path == "/production":
                 _html_response(self, production_html)
+            elif path == "/access":
+                _html_response(self, access_html)
             elif path == "/api/status":
                 self._api_status()
             elif path == "/api/stats":
@@ -548,6 +568,16 @@ def _make_handler(
                 self._api_episodic_status()
             elif path == "/api/production/overview":
                 self._api_production_overview(qs)
+            elif path == "/api/access/overview":
+                self._api_access_overview()
+            elif path == "/api/access/memories":
+                self._api_access_memories(qs)
+            elif path.startswith("/api/access/detail/"):
+                self._api_access_detail(unquote(path[len("/api/access/detail/"):]))
+            elif path == "/api/access/interference":
+                self._api_access_interference(qs)
+            elif path == "/api/access/events":
+                self._api_access_events(qs)
             elif path == "/api/production/episodes":
                 self._api_production_episodes(qs)
             elif path == "/api/production/snapshots":
@@ -671,6 +701,7 @@ def _make_handler(
                 "/api/production/long_diary_discard",
                 "/api/production/generation_switch",
                 "/api/production/generation_rollback",
+                "/api/access/rebuild", "/api/access/maintenance", "/api/access/simulate",
                 "/api/data-backup/run",
                 "/api/data-backup/restore",
                 "/api/data-backup/cancel-restore",
@@ -721,6 +752,12 @@ def _make_handler(
                     self._api_production_generation_switch()
                 elif path == "/api/production/generation_rollback":
                     self._api_production_generation_rollback()
+                elif path == "/api/access/rebuild":
+                    self._api_access_rebuild()
+                elif path == "/api/access/maintenance":
+                    self._api_access_maintenance()
+                elif path == "/api/access/simulate":
+                    self._api_access_simulate(body)
                 elif path == "/api/data-backup/run":
                     self._api_data_backup_run()
                 elif path == "/api/data-backup/restore":
@@ -729,7 +766,7 @@ def _make_handler(
                     self._api_data_backup_cancel_restore()
                 elif path == "/api/data-backup/delete":
                     self._api_data_backup_delete(body)
-                elif path.startswith("/api/time-insight/"): 
+                elif path.startswith("/api/time-insight/"):
                     self._api_time_insight_write(path, body)
                 else:
                     self._api_xinchao_write(path, body)
@@ -1050,6 +1087,163 @@ def _make_handler(
             if not callable(helper):
                 raise RuntimeError(f"记忆生产能力不可用: {name}")
             return helper
+
+        def _access_store(self):
+            return getattr(plugin, "_episodes", None)
+
+        def _api_access_overview(self):
+            store = self._access_store()
+            if store is None:
+                return self._json_ok({
+                    "ready": False,
+                    "reason": "情景记忆库尚未就绪；4.6 召回不受影响",
+                    "runtime": dict(getattr(plugin, "_memory_access_state", {}) or {}),
+                })
+            try:
+                overview = dict(store.memory_access_overview() or {})
+                overview.update({
+                    "ready": True,
+                    "plugin_version": getattr(plugin, "_PLUGIN_VERSION", "?"),
+                    "runtime": dict(getattr(plugin, "_memory_access_state", {}) or {}),
+                    "settings": {
+                        "enable": bool(getattr(plugin, "memory_forgetting_enable", True)),
+                        "shadow_mode": bool(getattr(plugin, "memory_forgetting_shadow_mode", True)),
+                        "decay_days": float(getattr(plugin, "memory_access_decay_days", 45.0)),
+                        "vivid_threshold": float(getattr(plugin, "memory_access_vivid_threshold", 0.68)),
+                        "deep_threshold": float(getattr(plugin, "memory_access_deep_threshold", 0.32)),
+                        "exact_cue_relief": float(getattr(plugin, "memory_access_exact_cue_relief", 0.85)),
+                    },
+                    "contract": {
+                        "source_of_truth": "Memos 日记 + 原文档案 + 情景卡",
+                        "destructive": False,
+                        "changes_live_recall": False,
+                        "test0_policy": "test0 固定 Shadow，只观察，不改变 4.6.2 注入名单",
+                    },
+                })
+                self._json_ok(overview)
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_access_memories(self, qs):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            try:
+                state = str(qs.get("state", [""])[0] or "")
+                query = str(qs.get("q", [""])[0] or "")[:100]
+                limit = max(1, min(500, int(qs.get("limit", ["120"])[0] or 120)))
+                offset = max(0, int(qs.get("offset", ["0"])[0] or 0))
+                items = store.list_memory_access_states(
+                    state=state, query=query, limit=limit, offset=offset,
+                )
+                self._json_ok({"items": items, "count": len(items), "state": state, "query": query})
+            except Exception as exc:
+                self._json_err(str(exc), 400)
+
+        def _api_access_detail(self, memo_name: str):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            try:
+                detail = store.memory_access_detail(memo_name)
+                if not detail:
+                    return self._json_err("未找到该记忆的可达状态", 404)
+                episode = store.episode_detail(memo_name)
+                self._json_ok({"access": detail, "episode": episode})
+            except Exception as exc:
+                self._json_err(str(exc), 400)
+
+        def _api_access_interference(self, qs):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            try:
+                memo_name = str(qs.get("memo", [""])[0] or "")
+                edge_type = str(qs.get("type", [""])[0] or "")
+                limit = max(1, min(1000, int(qs.get("limit", ["240"])[0] or 240)))
+                items = store.list_memory_interference(
+                    memo_name=memo_name, edge_type=edge_type, limit=limit,
+                )
+                self._json_ok({"items": items, "count": len(items)})
+            except Exception as exc:
+                self._json_err(str(exc), 400)
+
+        def _api_access_events(self, qs):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            try:
+                memo_name = str(qs.get("memo", [""])[0] or "")
+                limit = max(1, min(1000, int(qs.get("limit", ["120"])[0] or 120)))
+                items = store.list_memory_access_events(memo_name=memo_name, limit=limit)
+                self._json_ok({"items": items, "count": len(items)})
+            except Exception as exc:
+                self._json_err(str(exc), 400)
+
+        def _api_access_rebuild(self):
+            try:
+                import asyncio
+                loop = getattr(getattr(plugin, "_webui", None), "_loop", None)
+                if not loop or not loop.is_running():
+                    return self._json_err("event loop not available", 503)
+                future = asyncio.run_coroutine_threadsafe(
+                    plugin._memory_access_rebuild("webui_manual"), loop,
+                )
+                self._json_ok(future.result(timeout=180))
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_access_maintenance(self):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            try:
+                result = store.maintain_memory_access(
+                    config=plugin._memory_access_config(), reason="webui_manual",
+                )
+                plugin._memory_access_state = {
+                    "status": "ready", "updated_ts": time.time(),
+                    "reason": "webui_manual", **result,
+                }
+                self._json_ok(result)
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_access_simulate(self, body):
+            query = str(body.get("query") or "").strip()
+            if not query:
+                return self._json_err("请输入检索问题", 400)
+            try:
+                import asyncio
+                loop = getattr(getattr(plugin, "_webui", None), "_loop", None)
+                if not loop or not loop.is_running():
+                    return self._json_err("event loop not available", 503)
+                future = asyncio.run_coroutine_threadsafe(
+                    plugin._eval_recall_query(query, top_k=body.get("top_k")), loop,
+                )
+                baseline = future.result(timeout=90)
+                candidates = list(baseline.get("hits") or [])
+                selected = [str(item.get("memo_name") or "") for item in candidates if item.get("selected")]
+                store = self._access_store()
+                if store is None:
+                    return self._json_err("情景记忆库未就绪", 503)
+                access = store.evaluate_memory_access(
+                    query=query, candidates=candidates, selected_names=selected,
+                    request_id=f"lab-{time.time_ns():x}", config=plugin._memory_access_config(),
+                    psychological_bias=0.0, record=False,
+                )
+                self._json_ok({
+                    "query": query,
+                    "baseline": {
+                        "architecture": baseline.get("recall_architecture"),
+                        "candidate_count": baseline.get("candidate_count"),
+                        "selected_count": baseline.get("selected_count"),
+                        "selected": selected,
+                    },
+                    "access": access,
+                })
+            except Exception as exc:
+                self._json_err(str(exc))
 
         def _api_production_overview(self, qs):
             """Return one coherent production snapshot for the dedicated dashboard tab."""
@@ -3328,6 +3522,11 @@ class WebUIServer:
                 if (here / "production.html").exists()
                 else "<h1>production.html missing</h1>"
             )
+            access_html = (
+                (here / "access.html").read_text(encoding="utf-8")
+                if (here / "access.html").exists()
+                else "<h1>access.html missing</h1>"
+            )
 
             handler_cls = _make_handler(
                 self.plugin,
@@ -3335,6 +3534,7 @@ class WebUIServer:
                 console_html,
                 xinchao_html,
                 production_html,
+                access_html,
             )
             self._server = ThreadingHTTPServer(
                 (self.plugin.webui_host, self.plugin.webui_port),

@@ -1747,6 +1747,9 @@ class WebUIRouteTests(unittest.IsolatedAsyncioTestCase):
                 embedding=[1.0, 0.0, 0.0],
                 evidence_quality="diary_derived",
             )
+            plugin._episodes.rebuild_memory_access([
+                plugin._episodes.get_episode("memos/calendar-test")
+            ])
             plugin._episode_migration_ready = True
             plugin._episode_migration_state = {"status": "ready"}
             plugin._initialized = True
@@ -1800,9 +1803,44 @@ class WebUIRouteTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
                 self.assertTrue(overview["ok"])
-                self.assertEqual(overview["data"]["version"], "4.6.2")
+                self.assertEqual(overview["data"]["version"], "5.0.0-test0")
                 self.assertIn("providerOptions", overview["data"])
                 self.assertEqual(overview["data"]["providerOptions"][0]["id"], "chat_main")
+                access_html = await asyncio.to_thread(
+                    lambda: urllib.request.urlopen(base + "/access", timeout=3).read().decode("utf-8"),
+                )
+                self.assertIn("记忆可达性", access_html)
+                self.assertIn("Shadow 对照", access_html)
+                access_overview = await asyncio.to_thread(
+                    lambda: json.loads(
+                        urllib.request.urlopen(base + "/api/access/overview", timeout=3).read().decode("utf-8")
+                    ),
+                )
+                self.assertTrue(access_overview["ok"])
+                self.assertEqual(access_overview["data"]["total"], 1)
+                self.assertTrue(access_overview["data"]["settings"]["shadow_mode"])
+                access_memories = await asyncio.to_thread(
+                    lambda: json.loads(
+                        urllib.request.urlopen(base + "/api/access/memories?limit=20", timeout=3).read().decode("utf-8")
+                    ),
+                )
+                self.assertEqual(access_memories["data"]["count"], 1)
+                access_detail = await asyncio.to_thread(
+                    lambda: json.loads(
+                        urllib.request.urlopen(
+                            base + "/api/access/detail/memos%2Fcalendar-test", timeout=3
+                        ).read().decode("utf-8")
+                    ),
+                )
+                self.assertEqual(access_detail["data"]["access"]["memo_name"], "memos/calendar-test")
+                maintenance_request = urllib.request.Request(
+                    base + "/api/access/maintenance",
+                    data=b"{}", headers={"Content-Type": "application/json"}, method="POST",
+                )
+                maintenance = await asyncio.to_thread(
+                    lambda: json.loads(urllib.request.urlopen(maintenance_request, timeout=3).read().decode("utf-8")),
+                )
+                self.assertTrue(maintenance["ok"])
                 insight = await asyncio.to_thread(
                     lambda: json.loads(
                         urllib.request.urlopen(base + "/api/time-insight/settings", timeout=3).read().decode("utf-8")

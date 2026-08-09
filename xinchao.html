@@ -29,7 +29,7 @@ select,input,textarea{border:1px solid var(--line);border-radius:7px;background:
 <body>
 <div class="app">
   <aside class="rail">
-    <div class="brand"><h1>心潮心理工作台</h1><p>Dynamic Mind / Memos Memory</p><span class="version" id="version">4.6.2</span></div>
+    <div class="brand"><h1>心潮心理工作台</h1><p>Dynamic Mind / Memos Memory</p><span class="version" id="version">5.0.0-test0</span></div>
     <nav class="nav">
       <button class="active" data-tab="overview">状态总览</button>
       <button data-tab="body">身体节律</button>
@@ -44,7 +44,7 @@ select,input,textarea{border:1px solid var(--line);border-radius:7px;background:
       <div class="rail-row"><span>注入</span><b id="rail-injection">-</b></div>
       <div class="rail-row"><span>后台通道</span><b id="rail-channel">-</b></div>
     </div>
-    <div class="rail-foot"><a href="/">返回 WebUI</a><a href="/console">专业 Console</a></div>
+    <div class="rail-foot"><a href="/">返回 WebUI</a><a href="/access">记忆可达性</a><a href="/console">专业 Console</a></div>
   </aside>
   <main class="main">
     <div class="top">
@@ -316,7 +316,7 @@ async function loadTimeInsight(){try{var data=await api("/api/time-insight/setti
 function readSettings(){var out=Object.assign({},settings);document.querySelectorAll("[data-key]").forEach(function(el){var key=el.dataset.key,m=settingMeta[key],type=m&&m[2];out[key]=type==="bool"?el.checked:(type==="number"?Number(el.value):el.value)});return out}
 function settingsChanged(e){var row=e.target.closest(".setting");if(row)row.classList.add("changed");document.getElementById("save-status").textContent="有未保存修改";document.getElementById("body-save-status").textContent="有未保存修改"}
 async function load(){
- try{var data=await api("/api/xinchao/overview"+(currentKey?"?key="+encodeURIComponent(currentKey):""));settings=data.settings||{};providerOptions=data.providerOptions||[];currentKey=data.selected||"";document.getElementById("version").textContent=data.version||"4.6.2";renderScopes(data.states||[],currentKey);renderState(data.state||{});renderSettings();await loadTimeInsight()}catch(e){notify(e.message,true)}
+ try{var data=await api("/api/xinchao/overview"+(currentKey?"?key="+encodeURIComponent(currentKey):""));settings=data.settings||{};providerOptions=data.providerOptions||[];currentKey=data.selected||"";document.getElementById("version").textContent=data.version||"5.0.0-test0";renderScopes(data.states||[],currentKey);renderState(data.state||{});renderSettings();await loadTimeInsight()}catch(e){notify(e.message,true)}
 }
 async function refreshState(){try{var s=await api("/api/xinchao/state?key="+encodeURIComponent(currentKey));renderState(s)}catch(e){notify(e.message,true)}}
 document.querySelectorAll(".nav button").forEach(function(b){b.addEventListener("click",function(){document.querySelectorAll(".nav button").forEach(function(x){x.classList.toggle("active",x===b)});document.querySelectorAll(".tab").forEach(function(x){x.classList.toggle("active",x.id===b.dataset.tab)});document.getElementById("title").textContent=tabs[b.dataset.tab][0];document.getElementById("subtitle").textContent=tabs[b.dataset.tab][1];if(b.dataset.tab==="time-insight")loadTimeInsight()})});

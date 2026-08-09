@@ -58,11 +58,11 @@ class StoreTestCase(unittest.IsolatedAsyncioTestCase):
             evidence_quality="source_grounded",
         )
 
-    async def test_facade_schema_version_is_six(self):
-        self.assertEqual(EpisodicStore.SCHEMA_VERSION, 6)
+    async def test_facade_schema_version_is_seven(self):
+        self.assertEqual(EpisodicStore.SCHEMA_VERSION, 7)
         self.assertEqual(SourceArchive.SCHEMA_VERSION, 5)
         row = self.store._connect().execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-        self.assertEqual(row["value"], "6")
+        self.assertEqual(row["value"], "7")
 
     async def test_source_archive_preserves_complete_text_without_truncation(self):
         text = "开" + ("甲乙丙丁" * 6000) + "终"

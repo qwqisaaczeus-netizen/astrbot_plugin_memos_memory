@@ -135,7 +135,7 @@ def random_episodes(rng: random.Random, messages: list[dict]) -> list[dict]:
             evidence.append({
                 "kind": kind,
                 "actor": rng.choice(["user", "assistant", "双方"]),
-                "detail": f"{rng.choice(NAMES)}{rng.choice(EVENTS)}的关键细节{_}", 
+                "detail": f"{rng.choice(NAMES)}{rng.choice(EVENTS)}的关键细节{_}",
                 "quote": quote,
                 "turn_indexes": [idx],
                 "tier": tier,

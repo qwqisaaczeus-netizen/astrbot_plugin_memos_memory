@@ -86,7 +86,7 @@ class ProductionWebTests(unittest.IsolatedAsyncioTestCase):
             _episodes=self.store,
             _emb_dim=4,
             _emb_model_id="model-b",
-            _PLUGIN_VERSION="4.6.2",
+            _PLUGIN_VERSION="5.0.0-test0",
             _log_events=[],
             _last_injection_stats=[],
             _long_diaries_list=lambda: [{"episode_id": "ep-web-one", "memo_name": "memos/web-one",

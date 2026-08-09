@@ -1,5 +1,4 @@
 name: astrbot_plugin_memos_memory
 author: yjcmode
-version: 4.6.2
-description: full-memory fusion recall across episodes, diaries and archived source turns with convergent role state
-repo: https://github.com/qwqisaaczeus-netizen/astrbot_plugin_memos_memory
+version: 5.0.0-test0
+description: 面向长期角色扮演的 Memos 分层记忆、证据检索、滚动人格与非破坏式可达系统

@@ -1448,5 +1448,95 @@
     "default": "吃饭,喝水,睡觉,起床,洗澡,洗漱,换衣服,散步,逛街,买东西,做饭,收拾,打扫,通勤,上班,下班,刷手机,看电视,天气,下雨,下雪,很热,很冷,今天,明天,昨天,早上,中午,晚上,普通聊天,闲聊,开玩笑,路过,看风景,休息,发呆,随口,寒暄,问好,重复确认,无关闲谈",
     "description": "低重要性关键词: 纯日常噪声，命中3个以上降1分",
     "hint": "逗号分隔。注意不要放你的角色专属日常锚点，否则可能误降权。"
+  },
+  "memory_forgetting_enable": {
+    "type": "bool",
+    "default": true,
+    "description": "5.0 非破坏式记忆遗忘总开关",
+    "hint": "只管理记忆的自然可达性，不删除 Memos 日记、原文档案或情景卡。test0 默认只做 Shadow 对照。"
+  },
+  "memory_forgetting_shadow_mode": {
+    "type": "bool",
+    "default": true,
+    "description": "记忆可达性 Shadow 模式",
+    "hint": "5.0.0-test0 固定为 Shadow 观察模式：完整计算和记录建议，但绝不改变 4.6.2 的真实召回与注入名单。此值为后续版本预留。"
+  },
+  "memory_access_decay_enable": {
+    "type": "bool",
+    "default": true,
+    "description": "启用自然可达性衰减",
+    "hint": "时间只降低无强线索时的自然浮现概率；明确日期、人物、原话和事件线索仍可穿透。"
+  },
+  "memory_access_deep_rescue_enable": {
+    "type": "bool",
+    "default": true,
+    "description": "启用深层记忆线索救回",
+    "hint": "精确日期、人物、原话、场景词命中时允许深层记忆重新进入建议名单。"
+  },
+  "memory_interference_enable": {
+    "type": "bool",
+    "default": true,
+    "description": "启用类型化记忆干扰关系",
+    "hint": "区分同一事件复述、同主题不同事件、矛盾阶段和因果链；不会把相似日记直接去重或删除。"
+  },
+  "memory_reconsolidation_enable": {
+    "type": "bool",
+    "default": true,
+    "description": "启用成功使用后的再巩固",
+    "hint": "只有模型回答确实使用了该记忆才增加巩固；Shadow 模式只记录，不修改可达状态。"
+  },
+  "memory_psychological_bias_enable": {
+    "type": "bool",
+    "default": true,
+    "description": "允许心潮提供有界显著性线索",
+    "hint": "心潮只能提供很小的当前心理偏置，不能单独否决事实、日期或原文证据。"
+  },
+  "memory_psychological_bias_strength": {
+    "type": "float",
+    "default": 0.08,
+    "description": "心潮显著性最大影响",
+    "hint": "建议 0.05-0.10，运行时硬限制为 0-0.20。test0 中仅进入 Shadow 分数。"
+  },
+  "memory_access_vivid_threshold": {
+    "type": "float",
+    "default": 0.68,
+    "description": "鲜明记忆阈值",
+    "hint": "高于该值视为无需强线索即可自然想起；状态切换带迟滞，避免在阈值附近反复跳变。"
+  },
+  "memory_access_deep_threshold": {
+    "type": "float",
+    "default": 0.32,
+    "description": "深层记忆阈值",
+    "hint": "低于该值转为深层，但记忆与索引都仍完整保留，明确线索仍可救回。"
+  },
+  "memory_access_decay_days": {
+    "type": "float",
+    "default": 45.0,
+    "description": "自然可达性基础半衰期（天）",
+    "hint": "实际半衰期还会按持久性、关系意义和再巩固自适应，不是到期遗忘。"
+  },
+  "memory_access_exact_cue_relief": {
+    "type": "float",
+    "default": 0.85,
+    "description": "精确线索穿透比例",
+    "hint": "精确日期、实体或原话命中后，抵消多少访问成本。建议保持 0.80-0.95，防止漏掉明确询问的旧记忆。"
+  },
+  "memory_access_max_neighbors": {
+    "type": "int",
+    "default": 12,
+    "description": "每篇记忆最多保留的干扰邻居",
+    "hint": "只限制派生图的边数，不限制召回候选或注入条数。建议 8-16。"
+  },
+  "memory_access_maintenance_hours": {
+    "type": "int",
+    "default": 24,
+    "description": "可达状态维护间隔（小时）",
+    "hint": "后台只重算本地派生值，不调用 LLM、不访问 Memos 网络。"
+  },
+  "memory_access_event_keep": {
+    "type": "int",
+    "default": 4000,
+    "description": "可达性事件保留条数",
+    "hint": "用于 Shadow 对照、响应使用和再巩固诊断；超出后只删除最旧派生事件，不动记忆。"
   }
 }

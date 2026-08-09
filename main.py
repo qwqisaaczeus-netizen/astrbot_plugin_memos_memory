@@ -1,5 +1,5 @@
 """
-AstrBot Memos 长期记忆插件 v4.6.2。
+AstrBot Memos 长期记忆插件 v5.0.0-test0。
 
 时间模型严格区分事件发生时间、Memos 来源时间、本地索引时间和本轮当前时间。
 
@@ -88,7 +88,7 @@ try:
 except Exception:  # aiohttp 缺失等极端情况不阻塞主插件
     WebUIServer = None
 
-_PLUGIN_VERSION = "4.6.2"
+_PLUGIN_VERSION = "5.0.0-test0"
 _PASSAGE_VECTOR_STRATEGY = "local_passage_v2"
 _DEFAULT_CHUNK_CHARS = 120
 _DEFAULT_OVERLAP_CHARS = 30
@@ -1082,6 +1082,45 @@ class MemosMemoryPlugin(Star):
         self.cache_friendly_system_guard_enable: bool = bool(config.get("cache_friendly_system_guard_enable", True))
         self.cache_prefix_drift_enable: bool = bool(config.get("cache_prefix_drift_enable", True))
 
+        # v5.0 test0: non-destructive forgetting observes the complete 4.6
+        # candidate pool. Shadow mode is intentionally the default: it records
+        # access-state decisions without changing the proven injection path.
+        self.memory_forgetting_enable: bool = bool(config.get("memory_forgetting_enable", True))
+        # 5.0.0-test0 is deliberately observation-only. The setting is kept in
+        # persisted config so a later release can activate the proven policy
+        # without changing the configuration contract.
+        self.memory_forgetting_shadow_mode: bool = True
+        self.memory_access_decay_enable: bool = bool(config.get("memory_access_decay_enable", True))
+        self.memory_access_deep_rescue_enable: bool = bool(config.get("memory_access_deep_rescue_enable", True))
+        self.memory_interference_enable: bool = bool(config.get("memory_interference_enable", True))
+        self.memory_reconsolidation_enable: bool = bool(config.get("memory_reconsolidation_enable", True))
+        self.memory_psychological_bias_enable: bool = bool(config.get("memory_psychological_bias_enable", True))
+        self.memory_psychological_bias_strength: float = max(
+            0.0, min(0.20, float(config.get("memory_psychological_bias_strength", 0.08)))
+        )
+        self.memory_access_vivid_threshold: float = max(
+            0.45, min(0.90, float(config.get("memory_access_vivid_threshold", 0.68)))
+        )
+        self.memory_access_deep_threshold: float = max(
+            0.10, min(self.memory_access_vivid_threshold - 0.10,
+                      float(config.get("memory_access_deep_threshold", 0.32)))
+        )
+        self.memory_access_decay_days: float = max(
+            7.0, min(730.0, float(config.get("memory_access_decay_days", 45.0)))
+        )
+        self.memory_access_exact_cue_relief: float = max(
+            0.0, min(1.0, float(config.get("memory_access_exact_cue_relief", 0.85)))
+        )
+        self.memory_access_max_neighbors: int = max(
+            2, min(40, int(config.get("memory_access_max_neighbors", 12)))
+        )
+        self.memory_access_maintenance_hours: int = max(
+            1, min(168, int(config.get("memory_access_maintenance_hours", 24)))
+        )
+        self.memory_access_event_keep: int = max(
+            200, min(50000, int(config.get("memory_access_event_keep", 4000)))
+        )
+
         # 内部状态
         self._memos: MemosClient | None = None
         self._vec: VectorStore | None = None
@@ -1145,6 +1184,8 @@ class MemosMemoryPlugin(Star):
         self._passage_vector_migration_state: dict[str, Any] = {"status": "pending"}
         self._source_turn_vector_migration_state: dict[str, Any] = {"status": "pending"}
         self._semantic_state_task = None
+        self._memory_access_task = None
+        self._memory_access_state: dict[str, Any] = {"status": "pending"}
         self._semantic_state_lock = asyncio.Lock()
         self._semantic_state_pending_tasks: set[asyncio.Task] = set()
         self._semantic_state_last_defer_key = ""
@@ -1365,6 +1406,8 @@ class MemosMemoryPlugin(Star):
                 self._source_turn_vector_migration_state = {"status": "manual"}
             if self._episodes is not None and self.semantic_state_enable:
                 self._semantic_state_task = asyncio.create_task(self._semantic_state_maintenance_loop())
+            if self._episodes is not None and self.memory_forgetting_enable:
+                self._memory_access_task = asyncio.create_task(self._memory_access_maintenance_loop())
 
             # 启动后台对账任务(v1.3)
             if self.enable_auto_reconcile and self.reconcile_interval > 0:
@@ -1391,6 +1434,189 @@ class MemosMemoryPlugin(Star):
             self._init_error = f"init failed: {e}"
             logger.exception("[memos-memory] %s", self._init_error)
             return False
+
+    # ---------- 5.0 non-destructive memory accessibility ----------
+
+    def _memory_access_config(self) -> dict[str, Any]:
+        return {
+            "enable": self.memory_forgetting_enable,
+            "shadow_mode": self.memory_forgetting_shadow_mode,
+            "decay_enable": self.memory_access_decay_enable,
+            "deep_rescue_enable": self.memory_access_deep_rescue_enable,
+            "interference_enable": self.memory_interference_enable,
+            "reconsolidation_enable": self.memory_reconsolidation_enable,
+            "psychological_bias_enable": self.memory_psychological_bias_enable,
+            "psychological_bias_strength": self.memory_psychological_bias_strength,
+            "vivid_threshold": self.memory_access_vivid_threshold,
+            "deep_threshold": self.memory_access_deep_threshold,
+            "decay_days": self.memory_access_decay_days,
+            "exact_cue_relief": self.memory_access_exact_cue_relief,
+            "max_neighbors": self.memory_access_max_neighbors,
+            "event_keep": self.memory_access_event_keep,
+        }
+
+    def _all_episode_records(self) -> list[dict[str, Any]]:
+        if self._episodes is None:
+            return []
+        output: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            rows = self._episodes.list_episodes(limit=500, offset=offset)
+            output.extend(rows)
+            if len(rows) < 500:
+                break
+            offset += len(rows)
+        return output
+
+    async def _memory_access_rebuild(self, reason: str = "manual") -> dict[str, Any]:
+        if self._episodes is None:
+            return {"updated": 0, "reason": "episode_store_unavailable"}
+        episodes = self._all_episode_records()
+        result = await asyncio.to_thread(
+            self._episodes.rebuild_memory_access,
+            episodes,
+            config=self._memory_access_config(),
+            reason=reason,
+        )
+        self._memory_access_state = {
+            "status": "ready", "updated_ts": time.time(), "reason": reason, **result,
+        }
+        self._log_event(
+            "access",
+            f"可达性派生层已重建: {result.get('updated', 0)} 条 / {result.get('edges', 0)} 条干扰边",
+            self._memory_access_state,
+        )
+        return result
+
+    async def _memory_access_maintenance_loop(self) -> None:
+        try:
+            migration = self._episode_migration_task
+            if migration is not None:
+                try:
+                    await asyncio.shield(migration)
+                except Exception as exc:
+                    logger.warning("[memos-memory][access] episode bridge incomplete; rebuilding current rows: %s", exc)
+            await self._memory_access_rebuild("startup_backfill")
+            while True:
+                await asyncio.sleep(max(3600, self.memory_access_maintenance_hours * 3600))
+                if self._episodes is None:
+                    continue
+                try:
+                    result = await asyncio.to_thread(
+                        self._episodes.maintain_memory_access,
+                        config=self._memory_access_config(),
+                        reason="scheduled",
+                    )
+                    self._memory_access_state = {
+                        "status": "ready", "updated_ts": time.time(),
+                        "reason": "scheduled", **result,
+                    }
+                except Exception as exc:
+                    self._memory_access_state = {
+                        "status": "failed_open", "updated_ts": time.time(), "error": str(exc)[:300],
+                    }
+                    logger.warning("[memos-memory][access] maintenance failed open: %s", exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._memory_access_state = {
+                "status": "failed_open", "updated_ts": time.time(), "error": str(exc)[:300],
+            }
+            logger.warning("[memos-memory][access] bootstrap failed open; 4.6 recall remains active: %s", exc)
+
+    @staticmethod
+    def _memory_access_psychological_bias(event: AstrMessageEvent) -> float:
+        try:
+            appraisal = event.get_extra("xinchao_live_appraisal", {}) or {}
+        except Exception:
+            appraisal = {}
+        if not isinstance(appraisal, dict):
+            return 0.0
+        levels = appraisal.get("activationLevels") or {}
+        if not isinstance(levels, dict):
+            return 0.0
+        values = []
+        for value in levels.values():
+            try:
+                values.append(float(value))
+            except (TypeError, ValueError):
+                continue
+        # This is only a bounded salience hint in test0. It cannot veto or
+        # rescue a memory by itself and remains observational in Shadow mode.
+        return max(0.0, min(1.0, max(values or [0.0]))) * 0.05
+
+    def _evaluate_memory_access_shadow(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        candidates: list[dict[str, Any]],
+        selected_hits: list[dict[str, Any]],
+        request_stat: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not self.memory_forgetting_enable or self._episodes is None:
+            return {"enabled": False, "shadow": True, "reason": "disabled_or_unavailable"}
+        try:
+            selected_names = [
+                str(item.get("memo_name") or "") for item in selected_hits
+                if str(item.get("memo_name") or "")
+            ]
+            result = self._episodes.evaluate_memory_access(
+                query=query,
+                candidates=candidates,
+                selected_names=selected_names,
+                request_id=str(request_stat.get("request_id") or ""),
+                config=self._memory_access_config(),
+                psychological_bias=(
+                    self._memory_access_psychological_bias(event)
+                    if self.memory_psychological_bias_enable else 0.0
+                ),
+                record=True,
+            )
+            self._log_event(
+                "access",
+                (
+                    f"Shadow 对照: candidates={result.get('candidate_count', 0)} "
+                    f"selected={result.get('selected_count', 0)} deep_rescue={result.get('deep_rescue_count', 0)} "
+                    f"would_change={bool(result.get('would_change'))}"
+                ),
+                {key: value for key, value in result.items() if key != "items"},
+            )
+            return result
+        except Exception as exc:
+            logger.warning("[memos-memory][access] request evaluation failed open: %s", exc)
+            return {"enabled": True, "shadow": True, "failed_open": True, "error": str(exc)[:300]}
+
+    def _record_memory_access_response(self, event: AstrMessageEvent, response_text: str) -> None:
+        if not self.memory_forgetting_enable or self._episodes is None or not response_text:
+            return
+        try:
+            request_id = str(event.get_extra("memos_memory_request_id", "") or "")
+        except Exception:
+            request_id = ""
+        if not request_id:
+            return
+        stat = next((
+            item for item in reversed(self._last_injection_stats)
+            if str(item.get("request_id") or "") == request_id
+        ), None)
+        if not stat:
+            return
+        memo_names = [str(item) for item in stat.get("memos") or [] if str(item)]
+        if not memo_names:
+            return
+        try:
+            result = self._episodes.record_memory_response_use(
+                request_id=request_id,
+                response_text=response_text,
+                memo_names=memo_names,
+                shadow=self.memory_forgetting_shadow_mode,
+                reconsolidate=self.memory_reconsolidation_enable,
+                event_keep=self.memory_access_event_keep,
+            )
+            stat["memory_access_response"] = result
+            self._remember_injection_stats(stat)
+        except Exception as exc:
+            logger.debug("[memos-memory][access] response observation failed open: %s", exc)
 
     # ---------- 工具 ----------
     @staticmethod
@@ -4083,8 +4309,8 @@ class MemosMemoryPlugin(Star):
             diary["_direct_quote_ratio"] = round(report["direct_quote_ratio"], 4)
             diary["_compression_ratio"] = round(report["compression_ratio"], 4)
             diary["_render_retry_reason"] = fallback_reasons.get(key, retry_reasons.get(key, ""))
-            diary["_render_version"] = "4.6.2"
-            diary["_diary_render_version"] = "4.6.2"
+            diary["_render_version"] = _PLUGIN_VERSION
+            diary["_diary_render_version"] = _PLUGIN_VERSION
             diary["_render_missing"] = list(report["missing"])[:8]
             diary["_render_fallback"] = key in fallback_keys
             if key in missing_keys:
@@ -4700,6 +4926,17 @@ class MemosMemoryPlugin(Star):
             compression_ratio=float(diary.get("_compression_ratio", -1.0)),
             render_fallback=bool(diary.get("_render_fallback", False)),
         )
+        if self.memory_forgetting_enable:
+            try:
+                stored_episode = self._episodes.get_episode(memo_name)
+                if stored_episode:
+                    self._episodes.sync_memory_access(
+                        stored_episode,
+                        vivid_threshold=self.memory_access_vivid_threshold,
+                        deep_threshold=self.memory_access_deep_threshold,
+                    )
+            except Exception as exc:
+                logger.debug("[memos-memory][access] new episode sync failed open: %s", exc)
         return True
 
     # ---------- 4.6.0-test3 persistent long-diary workflow ----------
@@ -4808,8 +5045,8 @@ class MemosMemoryPlugin(Star):
             diary["_source_batch_id"] = source_batch_id
             diary["_evidence_quality"] = "source_grounded"
             diary["_original_memo_version"] = old_card_text[:60000]
-            diary["_render_version"] = "4.6.2-rewrite"
-            diary["_diary_render_version"] = "4.6.2-rewrite"
+            diary["_render_version"] = f"{_PLUGIN_VERSION}-rewrite"
+            diary["_diary_render_version"] = f"{_PLUGIN_VERSION}-rewrite"
             diary["_must_coverage"] = float(
                 diary.get("_must_coverage", diary.get("must_coverage", -1.0))
             )
@@ -5241,6 +5478,11 @@ class MemosMemoryPlugin(Star):
             await self._xinchao.on_response(event, response)
         except Exception as e:
             logger.warning("[memos-memory][xinchao] response perception scheduling failed: %s", e)
+        try:
+            response_text = (getattr(response, "completion_text", "") or "").strip()
+            self._record_memory_access_response(event, response_text)
+        except Exception as e:
+            logger.debug("[memos-memory][access] response hook failed open: %s", e)
         if not self.enable_auto_compress:
             return
         if not await self._ensure_init() or self._vec is None:
@@ -6944,6 +7186,10 @@ class MemosMemoryPlugin(Star):
             logger.debug("[memos-memory] cache prefix snapshot failed: %s", e)
         request_stat = self._request_injection_stat(event, req)
         self._remember_injection_stats(request_stat)
+        try:
+            event.set_extra("memos_memory_request_id", request_stat["request_id"])
+        except Exception:
+            pass
         state_chars = self._inject_semantic_state_for_request(req, request_stat)
         time_insight_result: dict[str, Any] = {"chars": 0, "selected": 0, "mode": "disabled"}
         try:
@@ -7599,6 +7845,26 @@ class MemosMemoryPlugin(Star):
         recall_diag["context_ready"] = context_ready
         recall_diag["context_used"] = route_context_used
         recall_diag["context_used_reason"] = route_context_reason
+        access_result = self._evaluate_memory_access_shadow(
+            event,
+            retrieval_user_query,
+            hits,
+            selected_hits,
+            request_stat,
+        )
+        access_summary = {key: value for key, value in access_result.items() if key != "items"}
+        access_summary["top"] = [
+            {
+                key: item.get(key)
+                for key in (
+                    "memo_name", "rank", "selected", "access_state", "base_score",
+                    "access_score", "exact_cue", "rescued", "presentation",
+                )
+            }
+            for item in (access_result.get("items") or [])[:12]
+        ]
+        recall_diag["memory_access"] = access_summary
+        request_stat["memory_access"] = access_summary
         self._log_event(
             "recall",
             f"postprocess: pool={recall_diag.get('candidate_pool')} qualified={recall_diag.get('qualified')} "
@@ -10837,7 +11103,18 @@ class MemosMemoryPlugin(Star):
         if not await self._ensure_init():
             yield event.plain_result("[记忆] 初始化失败")
             return
-        yield event.plain_result(f"[记忆] 正在重建{label}...")
+        if self.memory_forgetting_enable and self._episodes is not None:
+            yield event.plain_result("[记忆] 正在重建 5.0 可达性与类型化干扰图...")
+            try:
+                stats = await self._memory_access_rebuild("command_compat_alias")
+                yield event.plain_result(
+                    f"[记忆] 可达性派生层重建完成: {stats.get('updated', 0)} 篇, "
+                    f"{stats.get('groups', 0)} 个干扰组, {stats.get('edges', 0)} 条类型化边。"
+                )
+            except Exception as e:
+                yield event.plain_result(f"[记忆] 可达性派生层重建失败，4.6 召回未受影响: {e}")
+            return
+        yield event.plain_result(f"[记忆] 正在重建兼容{label}...")
         try:
             stats = self._build_similarity_cluster_index()
             yield event.plain_result(
@@ -11194,6 +11471,7 @@ class MemosMemoryPlugin(Star):
             "_context_archive_task", "_data_backup_task", "_episode_migration_task", "_passage_vector_migration_task",
             "_source_turn_vector_migration_task",
             "_semantic_state_task",
+            "_memory_access_task",
         ):
             t = getattr(self, tn, None)
             if t is not None:

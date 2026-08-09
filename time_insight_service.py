@@ -8,7 +8,7 @@ import json
 import re
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -31,8 +31,8 @@ from .time_insight_engine import (
 )
 
 
-_ENGINE_VERSION = "3.0.0-integrated"
-_SCHEMA_VERSION = 3
+_ENGINE_VERSION = "4.0.0-integrated"
+_SCHEMA_VERSION = 4
 
 
 def _bounded_int(value: Any, low: int, high: int, default: int) -> int:
@@ -68,6 +68,9 @@ class IntegratedTimeInsightService:
         self.enable = bool(config.get("enable", True))
         self.vec_db_path = str(
             config.get("vec_db_path", "./data/astrbot_plugin_memos_memory/memories.db")
+        ).strip()
+        self.episodic_db_path = str(
+            config.get("episodic_db_path", "./data/astrbot_plugin_memos_memory/episodic_memory.db")
         ).strip()
         self.timezone = str(config.get("timezone", "Asia/Shanghai") or "Asia/Shanghai").strip()
         try:
@@ -149,6 +152,11 @@ class IntegratedTimeInsightService:
         return {
             "enable": source.get("enable_time_insight_affiliate", True),
             "vec_db_path": getattr(host, "vec_db_path", "./data/astrbot_plugin_memos_memory/memories.db"),
+            "episodic_db_path": getattr(
+                host,
+                "episodic_db_path",
+                "./data/astrbot_plugin_memos_memory/episodic_memory.db",
+            ),
             "timezone": getattr(host, "rp_time_timezone", "Asia/Shanghai"),
             "auto_update_hours": value("auto_update_hours", 12),
             "source_memo_limit": value("source_memo_limit", 5000),
@@ -209,8 +217,28 @@ class IntegratedTimeInsightService:
     def _now(self) -> datetime:
         return datetime.now(ZoneInfo(self.timezone))
 
+    def _coerce_now(self, value: datetime | None) -> datetime:
+        current = value or self._now()
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        return current.astimezone(ZoneInfo(self.timezone))
+
     def _db_file(self) -> Path:
         return Path(self.vec_db_path).expanduser()
+
+    def _episode_db_file(self) -> Path:
+        return Path(self.episodic_db_path).expanduser()
+
+    def _semantic_state_context(self) -> str:
+        reader = getattr(self.host, "_semantic_state_status", None)
+        if not callable(reader):
+            return ""
+        try:
+            status = reader()
+            state = status.get("state") if isinstance(status, dict) else {}
+            return clean_text((state or {}).get("rendered_text"), 1600)
+        except Exception:
+            return ""
 
     def _connect(self) -> sqlite3.Connection:
         path = self._db_file()
@@ -441,7 +469,10 @@ class IntegratedTimeInsightService:
         return None
 
     async def _refine_candidates(
-        self, candidates: list[dict[str, Any]], umo: str,
+        self,
+        candidates: list[dict[str, Any]],
+        umo: str,
+        now: datetime | None = None,
     ) -> dict[str, dict[str, Any]]:
         if not self.llm_refine_enable or not candidates:
             return {}
@@ -462,13 +493,19 @@ class IntegratedTimeInsightService:
                         "date": item["date"],
                         "type": item["type"],
                         "text": item["text"],
+                        "evidence_quality": item.get("evidence_quality", "diary_derived"),
+                        "source_recoverable": bool(item.get("source_recoverable")),
                     }
                     for item in candidate["evidence"][:5]
                 ],
             })
+        reference_now = self._coerce_now(now)
+        semantic_state = self._semantic_state_context()
         prompt = f"""你是长期角色记忆的时间证据审校器。你只能精炼已经由确定性算法建立的候选，不能创造新事件、日期、人物、关系或因果。
 
-当前日期：{self._now().date().isoformat()}
+当前现实时间：{reference_now.strftime('%Y-%m-%d %H:%M:%S')}（{self.timezone}）
+当前滚动人格状态（只用于判断哪些历史影响仍有解释价值，不是日期证据，也不能创造事件）：
+{semantic_state or "无可用滚动状态"}
 候选证据：
 {json.dumps(payload, ensure_ascii=False, separators=(",", ":"))}
 
@@ -490,6 +527,7 @@ class IntegratedTimeInsightService:
 3. mixed=true 时必须保留“方向并存、仍在变化”的含义，不能总结成单向关系。
 4. confidence 衡量证据支持度，不是情绪强度；证据不足可不返回该候选。
 5. 不输出 Markdown、推理过程或额外说明。
+6. source_recoverable=true 表示可回原始对话取证；它提高证据可信度，但不能改变 evidence 中明确写出的历史日期。
 """
         response = await asyncio.wait_for(
             provider.text_chat(
@@ -526,7 +564,7 @@ class IntegratedTimeInsightService:
                 continue
             allowed_dates = {
                 evidence["date"] for evidence in candidate["evidence"]
-            } | {self._now().date().isoformat()}
+            } | {reference_now.date().isoformat()}
             dates_in_claim = set(re.findall(r"(?:19|20)\d{2}-\d{2}-\d{2}", claim))
             if dates_in_claim - allowed_dates:
                 continue
@@ -618,7 +656,7 @@ class IntegratedTimeInsightService:
                 (
                     now_ts,
                     "ok",
-                    f"{reason}: temporal insight v2 updated",
+                    f"{reason}: integrated temporal insight v4 updated",
                     json.dumps(stats, ensure_ascii=False),
                 ),
             )
@@ -659,7 +697,7 @@ class IntegratedTimeInsightService:
                 llm_applied = 0
                 if self.llm_refine_enable and candidates:
                     try:
-                        refinements = await self._refine_candidates(candidates, umo)
+                        refinements = await self._refine_candidates(candidates, umo, now=now)
                         llm_applied = self._apply_refinements(candidates, refinements)
                         llm_status = "refined" if llm_applied else (
                             "no_provider" if self._provider(umo) is None else "no_valid_refinement"
@@ -699,11 +737,13 @@ class IntegratedTimeInsightService:
                 )
                 if self.diagnostic_log:
                     logger.info(
-                        "[memos-insight] update=%s source=%d dated=%d candidates=%d "
-                        "static=%d chars=%d llm=%s",
+                        "[memos-insight] update=%s source=%d dated=%d grounded=%d "
+                        "recoverable=%d candidates=%d static=%d chars=%d llm=%s",
                         reason,
                         stats["source_memories"],
                         stats["dated_memories"],
+                        stats.get("source_grounded_memories", 0),
+                        stats.get("source_recoverable_memories", 0),
                         stats["candidate_count"],
                         len(selected),
                         len(block),
@@ -768,6 +808,19 @@ class IntegratedTimeInsightService:
                         "selected": len(selected),
                         "candidate_ids": [item["candidate_id"] for item in selected],
                         "query_scores": [item.get("query_score", 0) for item in selected],
+                        "source_recoverable": sum(
+                            1 for item in selected
+                            if any(
+                                bool(evidence.get("source_recoverable"))
+                                for evidence in list(item.get("evidence") or [])
+                            )
+                        ),
+                        "evidence_memos": sorted({
+                            str(evidence.get("memo_name") or "")
+                            for item in selected
+                            for evidence in list(item.get("evidence") or [])
+                            if str(evidence.get("memo_name") or "")
+                        }),
                     }, ensure_ascii=False),
                 ),
             )
@@ -814,7 +867,12 @@ class IntegratedTimeInsightService:
         if matched:
             parts[:] = remaining + matched
 
-    async def on_request(self, event: AstrMessageEvent, req: ProviderRequest) -> dict[str, Any]:
+    async def on_request(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+        request_now: datetime | None = None,
+    ) -> dict[str, Any]:
         result = {"chars": 0, "selected": 0, "ambient": 0, "query": 0, "mode": "disabled"}
         if not self.enable:
             return result
@@ -848,7 +906,7 @@ class IntegratedTimeInsightService:
             scope_key = self._last_umo or "default"
             if not self._allow_ambient(scope_key, ambient, query):
                 ambient = []
-            now = self._now()
+            now = self._coerce_now(request_now)
             ambient_block = render_static_block(ambient, now, self.engine_config)
             query_block = render_query_block(query_selected, now, self.engine_config)
             sections = []
@@ -859,9 +917,12 @@ class IntegratedTimeInsightService:
             if not sections:
                 return result
             block = (
-                f'<IntegratedHistoricalTimeInsight current_date="{now.date().isoformat()}" '
+                f'<IntegratedHistoricalTimeInsight current_datetime="{now.strftime("%Y-%m-%d %H:%M:%S")}" '
+                f'timezone="{self.timezone}" '
                 'temporal_role="historical_evidence">\n'
-                "这是有日期证据的历史联想层，不是当前事件，也不能覆盖本轮对话事实。\n"
+                "这是有日期证据的历史联想层，不是当前事件，也不能覆盖本轮对话事实。"
+                "上面的 current_datetime 是唯一当前现实基准；证据中的日期是历史发生时间。"
+                "当前身体节律只描述此刻，不得套用到历史日记。\n"
                 + "\n\n".join(sections)
                 + "\n</IntegratedHistoricalTimeInsight>"
             )
@@ -879,9 +940,20 @@ class IntegratedTimeInsightService:
                 "query": len(query_selected),
                 "candidate_ids": [item["candidate_id"] for item in selected],
                 "kinds": [item["kind"] for item in selected],
+                "evidence_memos": sorted({
+                    str(evidence.get("memo_name") or "")
+                    for item in selected
+                    for evidence in list(item.get("evidence") or [])
+                    if str(evidence.get("memo_name") or "")
+                }),
+                "source_recoverable": sum(
+                    1 for item in selected
+                    if any(bool(evidence.get("source_recoverable")) for evidence in list(item.get("evidence") or []))
+                ),
             })
             try:
                 event.set_extra("memos_time_insight_v3", result)
+                event.set_extra("memos_time_insight_v4", result)
             except Exception:
                 pass
             try:
@@ -899,11 +971,12 @@ class IntegratedTimeInsightService:
                 pass
             if self.diagnostic_log:
                 logger.info(
-                    "[memos-memory][time-insight] 注入 %d 条，%d 字 | ambient=%d query=%d kinds=%s",
+                    "[memos-memory][time-insight] 注入 %d 条，%d 字 | ambient=%d query=%d recoverable=%d kinds=%s",
                     len(selected),
                     len(block),
                     len(ambient),
                     len(query_selected),
+                    int(result.get("source_recoverable") or 0),
                     [item["kind"] for item in selected],
                 )
             return result
@@ -1078,6 +1151,53 @@ class IntegratedTimeInsightService:
             return f"{aggregate}({name}) AS {name}"
         return f"{default} AS {name}"
 
+    def _load_episode_context_sync(self) -> dict[str, dict[str, Any]]:
+        path = self._episode_db_file()
+        if not path.is_file():
+            return {}
+        conn = sqlite3.connect(path, timeout=5, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            if not self._table_exists(conn, "episodes"):
+                return {}
+            has_links = self._table_exists(conn, "episode_turn_links")
+            has_evidence = self._table_exists(conn, "episode_evidence")
+            link_join = (
+                "LEFT JOIN (SELECT episode_id,COUNT(*) AS turn_link_count "
+                "FROM episode_turn_links GROUP BY episode_id) l ON l.episode_id=e.episode_id"
+                if has_links else ""
+            )
+            evidence_join = (
+                "LEFT JOIN (SELECT episode_id,COUNT(*) AS evidence_count,"
+                "SUM(CASE WHEN grounded=1 THEN 1 ELSE 0 END) AS grounded_evidence_count "
+                "FROM episode_evidence GROUP BY episode_id) v ON v.episode_id=e.episode_id"
+                if has_evidence else ""
+            )
+            sql = f"""SELECT e.memo_name,e.episode_id,e.source_kind,e.evidence_quality,
+                              e.occurred_at,e.event_ts,e.time_basis,e.memory_type,e.importance,
+                              e.scene_anchor,e.retrieval_key,e.state_change,e.long_effect,
+                              e.trigger_hint,e.entities_json,
+                              {('COALESCE(l.turn_link_count,0)' if has_links else '0')} AS turn_link_count,
+                              {('COALESCE(v.evidence_count,0)' if has_evidence else '0')} AS evidence_count,
+                              {('COALESCE(v.grounded_evidence_count,0)' if has_evidence else '0')} AS grounded_evidence_count
+                       FROM episodes e
+                       {link_join}
+                       {evidence_join}
+                       WHERE COALESCE(e.active,1)=1"""
+            result: dict[str, dict[str, Any]] = {}
+            for row in conn.execute(sql).fetchall():
+                item = dict(row)
+                memo_name = str(item.get("memo_name") or "")
+                if not memo_name:
+                    continue
+                item["entities"] = item.pop("entities_json", "[]")
+                item["source_recoverable"] = int(item.get("turn_link_count") or 0) > 0
+                result[memo_name] = item
+            return result
+        finally:
+            conn.close()
+
     def _load_memories_sync(self) -> list[dict[str, Any]]:
         conn = self._connect()
         try:
@@ -1127,10 +1247,23 @@ class IntegratedTimeInsightService:
                         "feedback_effect": float(row["effect"] or 0),
                         "feedback_actions": row["actions"] or "",
                     }
+            episode_context = self._load_episode_context_sync()
             memories = []
             for row in rows:
                 item = dict(row)
                 item.update(feedback.get(str(item.get("memo_name") or ""), {}))
+                episode = episode_context.get(str(item.get("memo_name") or ""), {})
+                if episode:
+                    for field in (
+                        "episode_id", "source_kind", "evidence_quality", "occurred_at",
+                        "event_ts", "time_basis", "memory_type", "importance",
+                        "scene_anchor", "retrieval_key", "state_change", "long_effect",
+                        "trigger_hint", "entities", "turn_link_count", "evidence_count",
+                        "grounded_evidence_count", "source_recoverable",
+                    ):
+                        value = episode.get(field)
+                        if value not in (None, ""):
+                            item[field] = value
                 memories.append(item)
             return memories
         finally:

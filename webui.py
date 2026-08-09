@@ -22,6 +22,33 @@ from urllib.parse import urlparse, parse_qs, unquote
 logger = logging.getLogger(__name__)
 
 
+def _is_preset_protected_setting(key: str) -> bool:
+    """Keep presets away from identity, providers and deployment-specific values."""
+    name = str(key or "").strip().lower()
+    if not name:
+        return True
+    if name.endswith("_provider_id"):
+        return True
+    if name in {"character_name", "memos_mode", "rp_time_timezone"}:
+        return True
+    return any(
+        token in name
+        for token in ("token", "password", "secret", "api_key")
+    ) or name.endswith((
+        "_url", "_host", "_port", "_port_start", "_path", "_dir", "_exe", "_keywords",
+    ))
+
+
+def _safe_preset_values(values: Any) -> dict[str, Any]:
+    if not isinstance(values, dict):
+        return {}
+    return {
+        str(key): value
+        for key, value in values.items()
+        if not _is_preset_protected_setting(str(key))
+    }
+
+
 def _strip_internal_metadata(text: str) -> str:
     import re
     return re.sub(r"(?m)^\s*<!--\s*memos-memory:[\s\S]*?-->\s*$", "", text or "").strip()
@@ -58,7 +85,13 @@ def _html_response(handler: BaseHTTPRequestHandler, html: str) -> None:
     handler.wfile.write(body)
 
 
-def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_html: str):
+def _make_handler(
+    plugin: Any,
+    dashboard_html: str,
+    console_html: str,
+    xinchao_html: str,
+    production_html: str,
+):
     """Create a request handler class bound to the plugin instance."""
 
     settings_lock = threading.RLock()
@@ -78,10 +111,18 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
             "raw_evidence_archive_enable", "episode_extraction_provider_id",
             "episode_extraction_timeout", "diary_render_provider_id", "diary_render_timeout",
             "episodic_auto_migrate", "episode_migration_wait_seconds",
+            "raw_archive_index_chunk_chars", "raw_archive_prompt_view_max_chars",
+            "scene_split_enable", "scene_split_gap_seconds", "diary_count_max_cap",
+            "evidence_tier_enable", "diary_literary_mode", "diary_transcript_check_enable",
+            "diary_first_person_check_enable", "diary_must_coverage_threshold",
+            "diary_rewrite_preview_min_chars", "db_snapshot_keep",
         },
         "滚动当前状态": {
             "semantic_state_enable", "semantic_state_provider_id", "semantic_state_timeout",
-            "semantic_state_target_chars", "semantic_state_auto_bootstrap",
+            "semantic_state_target_chars", "semantic_state_update_policy",
+            "semantic_state_batch_threshold", "semantic_state_max_wait_hours",
+            "semantic_state_significance_threshold", "semantic_state_merge_max_batches",
+            "semantic_state_auto_bootstrap",
             "semantic_state_bootstrap_episode_limit", "semantic_state_replace_profile",
         },
         "4.x 当前精简召回": {
@@ -93,6 +134,9 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
             "lean_story_normal_inject", "lean_relative_margin", "lean_relative_margin_broad",
             "recall_safety_net_enable", "recall_safety_net_min_selected",
             "recall_safety_net_min_top_score",
+            "recall_cross_layer_consistency_enable", "recall_temporal_constraints_enable",
+            "recall_intent_layer_weights_enable", "recall_observation_enable",
+            "recall_auto_eval_limit",
             "lean_texture_enable", "min_similarity_to_inject", "w_relevance",
             "w_importance", "w_recency", "pin_boost", "recall_injection_min_score",
             "recall_context_query_messages", "recall_context_query_max_chars",
@@ -100,13 +144,15 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
             "bm25_tokenizer",
         },
         "剧情注入与原文证据": {
-            "inject_order", "inject_format", "summary_chars", "enable_injection_style_rules",
+            "inject_order",
             "inject_char_budget", "inject_compact_chars",
             "episodic_evidence_per_memory", "episodic_full_diary_limit",
             "passage_index_enable", "passage_max_chars", "passage_overlap_chars",
             "mixed_injection_enable", "full_diary_top_n", "passage_expand_chars",
         },
         "兼容回退（不参与当前主路）": {
+            "inject_format", "summary_chars", "enable_injection_style_rules",
+            "raw_archive_full_assistant_text", "raw_archive_assistant_max_chars",
             "recall_top_k", "persona_top_k", "plot_top_k", "texture_top_k",
             "enable_layered_injection", "time_boost", "recall_candidate_pool",
             "recall_multi_query_enable", "recall_rrf_k", "recall_month_route_enable",
@@ -120,7 +166,7 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
             "recall_cluster_similarity", "recall_cluster_base_per_group",
             "recall_cluster_allow_protected",
         },
-        "画像与洞察": {
+        "历史画像兼容与洞察": {
             "enable_affiliate_profile", "affiliate_profile_max_age_days", "profile_provider_id",
             "profile_auto_update_days", "profile_recent_persona_limit", "profile_anchor_limit",
             "profile_manual_limit", "profile_feedback_limit", "profile_llm_timeout",
@@ -136,7 +182,10 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
         },
         "角色增强": set(),
         "缓存诊断": set(),
-        "运行与维护": set(),
+        "运行与维护": {
+            "data_backup_enable", "data_backup_interval_days",
+            "data_backup_keep", "data_backup_dir",
+        },
         "重要性规则": {
             "imp_tier5_keywords", "imp_tier4_keywords", "imp_tier3_keywords", "imp_low_keywords",
         },
@@ -156,17 +205,117 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
         "time_insight_diagnostic_log",
     }
 
+    preset_common_values = {
+        "enable_auto_compress": True,
+        "eod_checkpoint_enable": True,
+        "eod_checkpoint_min_turns": 1,
+        "episodic_memory_enable": True,
+        "episodic_auto_migrate": True,
+        "evidence_first_generation_enable": True,
+        "raw_evidence_archive_enable": True,
+        "scene_split_enable": True,
+        "evidence_tier_enable": True,
+        "diary_literary_mode": True,
+        "diary_transcript_check_enable": True,
+        "diary_first_person_check_enable": True,
+        "semantic_state_enable": True,
+        "semantic_state_update_policy": "adaptive",
+        "semantic_state_auto_bootstrap": True,
+        "semantic_state_replace_profile": True,
+        "enable_auto_recall": True,
+        "lean_recall_enable": True,
+        "lean_event_index_enable": True,
+        "lean_source_evidence_enable": True,
+        "lean_coverage_selection_enable": True,
+        "lean_adaptive_evidence_enable": True,
+        "passage_vector_auto_migrate": True,
+        "source_turn_vector_auto_migrate": True,
+        "lean_temporal_enable": True,
+        "recall_safety_net_enable": True,
+        "recall_cross_layer_consistency_enable": True,
+        "recall_temporal_constraints_enable": True,
+        "recall_intent_layer_weights_enable": True,
+        "recall_observation_enable": True,
+        "lean_texture_enable": False,
+        "passage_index_enable": True,
+        "mixed_injection_enable": True,
+        "context_governance_enable": True,
+        "context_exclude_command_turns": True,
+        "context_preserve_system_messages": True,
+        "context_trim_backup_enable": True,
+        "rp_enhancer_enable": True,
+        "rp_time_enable": True,
+        "rp_time_strip_default": True,
+        "rp_time_show_lunar": False,
+        "rp_time_show_festival": True,
+        "rp_time_show_rhythm": True,
+        "enable_time_insight_affiliate": True,
+        "time_insight_query_enable": True,
+        "time_insight_diagnostic_log": True,
+        "data_backup_enable": True,
+        "data_backup_interval_days": 14,
+    }
+
     preset_definitions = {
         "deep_roleplay": {
-            "name": "深度角色塑形",
-            "summary": "长篇 RP 与年月级人格塑形，细节、情感弧和召回覆盖优先。",
-            "cost": "较高",
+            "name": "长线灵魂塑形",
+            "summary": "年月级 RP、人格收敛和跨阶段剧情覆盖最大化；完整证据与文学日记优先。",
+            "cost": "最高",
             "values": {
-                "compress_every_n_turns": 16, "diary_count": 3, "compress_batch_max_messages": 36,
+                **preset_common_values,
+                "compress_every_n_turns": 30, "diary_count": 2, "compress_batch_max_messages": 60,
                 "eod_checkpoint_enable": True, "eod_checkpoint_min_turns": 1,
-                "eod_checkpoint_max_diaries": 8,
+                "eod_checkpoint_max_diaries": 6,
                 "evidence_first_generation_enable": True, "raw_evidence_archive_enable": True,
-                "semantic_state_enable": True, "semantic_state_target_chars": 2200,
+                "diary_must_coverage_threshold": 0.94, "diary_rewrite_preview_min_chars": 2800,
+                "semantic_state_enable": True, "semantic_state_target_chars": 2400,
+                "semantic_state_update_policy": "adaptive", "semantic_state_batch_threshold": 4,
+                "semantic_state_max_wait_hours": 96, "semantic_state_significance_threshold": 0.70,
+                "semantic_state_merge_max_batches": 8,
+                "semantic_state_auto_bootstrap": True, "semantic_state_replace_profile": True,
+                "lean_recall_enable": True, "lean_recall_candidate_k": 80,
+                "lean_event_index_enable": True, "lean_source_evidence_enable": True,
+                "lean_coverage_selection_enable": True,
+                "lean_adaptive_evidence_enable": True, "passage_vector_auto_migrate": True,
+                "source_turn_vector_auto_migrate": True,
+                "lean_temporal_enable": True, "lean_story_min_inject": 1,
+                "lean_story_max_inject": 10, "lean_story_normal_inject": 4,
+                "lean_relative_margin": 0.30, "lean_relative_margin_broad": 0.46,
+                "recall_safety_net_enable": True, "recall_safety_net_min_selected": 2,
+                "recall_safety_net_min_top_score": 0.62,
+                "inject_char_budget": 14000, "inject_compact_chars": 240,
+                "lean_texture_enable": False,
+                "episodic_evidence_per_memory": 4, "episodic_full_diary_limit": 2,
+                "recall_context_query_messages": 5, "recall_context_query_max_chars": 1500,
+                "min_similarity_to_inject": 0.48, "recall_injection_min_score": 0.58,
+                "recall_dedup_window": 3, "recall_rerank_enable": True,
+                "passage_index_enable": True, "passage_max_chars": 220,
+                "passage_overlap_chars": 90, "mixed_injection_enable": True,
+                "full_diary_top_n": 3, "passage_expand_chars": 160,
+                "time_insight_auto_update_hours": 8, "time_insight_recent_window_days": 45,
+                "time_insight_anniversary_window_days": 3, "time_insight_min_importance": 2,
+                "time_insight_min_evidence_score": 0.62, "time_insight_query_max_insights": 3,
+                "time_insight_query_min_score": 0.38, "time_insight_query_max_chars": 1100,
+                "time_insight_llm_refine_enable": True, "time_insight_llm_min_confidence": 0.68,
+                "context_keep_recent_messages": 60, "context_min_messages_before_trim": 120,
+                "data_backup_keep": 8,
+            },
+        },
+        "quality": {
+            "name": "全维效果优先（推荐）",
+            "summary": "自动兼顾日常、精确取证与长线叙事，保留较宽召回和充分注入细节。",
+            "cost": "中高",
+            "values": {
+                **preset_common_values,
+                "compress_every_n_turns": 30, "diary_count": 2, "compress_batch_max_messages": 60,
+                "eod_checkpoint_enable": True, "eod_checkpoint_min_turns": 1,
+                "eod_checkpoint_max_diaries": 6,
+                "evidence_first_generation_enable": True, "raw_evidence_archive_enable": True,
+                "diary_must_coverage_threshold": 0.92, "diary_rewrite_preview_min_chars": 2400,
+                "semantic_state_enable": True, "semantic_state_target_chars": 2100,
+                "semantic_state_update_policy": "adaptive", "semantic_state_batch_threshold": 4,
+                "semantic_state_max_wait_hours": 96, "semantic_state_significance_threshold": 0.72,
+                "semantic_state_merge_max_batches": 6,
                 "semantic_state_auto_bootstrap": True, "semantic_state_replace_profile": True,
                 "lean_recall_enable": True, "lean_recall_candidate_k": 70,
                 "lean_event_index_enable": True, "lean_source_evidence_enable": True,
@@ -174,66 +323,43 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
                 "lean_adaptive_evidence_enable": True, "passage_vector_auto_migrate": True,
                 "source_turn_vector_auto_migrate": True,
                 "lean_temporal_enable": True, "lean_story_min_inject": 1,
-                "lean_story_max_inject": 8, "lean_story_normal_inject": 4,
-                "lean_relative_margin": 0.28, "lean_relative_margin_broad": 0.40,
-                "recall_safety_net_enable": True, "recall_safety_net_min_selected": 2,
-                "recall_safety_net_min_top_score": 0.62,
-                "inject_char_budget": 12000, "inject_compact_chars": 240,
-                "lean_texture_enable": False,
-                "episodic_evidence_per_memory": 4, "episodic_full_diary_limit": 2,
-                "recall_context_query_messages": 6, "recall_context_query_max_chars": 1800,
-                "min_similarity_to_inject": 0.50, "recall_injection_min_score": 0.60,
-                "recall_dedup_window": 4, "recall_rerank_enable": True,
-                "passage_index_enable": True, "passage_max_chars": 220,
-                "passage_overlap_chars": 90, "mixed_injection_enable": True,
-                "full_diary_top_n": 4, "passage_expand_chars": 160,
-                "profile_recent_persona_limit": 160, "profile_anchor_limit": 50,
-                "context_keep_recent_messages": 56, "context_min_messages_before_trim": 100,
-            },
-        },
-        "quality": {
-            "name": "效果优先",
-            "summary": "完整日记和高质量召回优先，适合稳定的日常角色扮演。",
-            "cost": "中高",
-            "values": {
-                "compress_every_n_turns": 20, "diary_count": 2, "compress_batch_max_messages": 40,
-                "eod_checkpoint_enable": True, "eod_checkpoint_min_turns": 1,
-                "eod_checkpoint_max_diaries": 6,
-                "evidence_first_generation_enable": True, "raw_evidence_archive_enable": True,
-                "semantic_state_enable": True, "semantic_state_target_chars": 1800,
-                "semantic_state_auto_bootstrap": True, "semantic_state_replace_profile": True,
-                "lean_recall_enable": True, "lean_recall_candidate_k": 60,
-                "lean_event_index_enable": True, "lean_source_evidence_enable": True,
-                "lean_coverage_selection_enable": True,
-                "lean_adaptive_evidence_enable": True, "passage_vector_auto_migrate": True,
-                "source_turn_vector_auto_migrate": True,
-                "lean_temporal_enable": True, "lean_story_min_inject": 1,
-                "lean_story_max_inject": 6, "lean_story_normal_inject": 3,
-                "lean_relative_margin": 0.24, "lean_relative_margin_broad": 0.34,
+                "lean_story_max_inject": 9, "lean_story_normal_inject": 4,
+                "lean_relative_margin": 0.28, "lean_relative_margin_broad": 0.42,
                 "recall_safety_net_enable": True, "recall_safety_net_min_selected": 2,
                 "recall_safety_net_min_top_score": 0.60,
-                "inject_char_budget": 10000, "inject_compact_chars": 200,
+                "inject_char_budget": 12000, "inject_compact_chars": 210,
                 "lean_texture_enable": False,
                 "episodic_evidence_per_memory": 3, "episodic_full_diary_limit": 2,
                 "recall_context_query_messages": 4, "recall_context_query_max_chars": 1200,
-                "min_similarity_to_inject": 0.51, "recall_injection_min_score": 0.61,
-                "recall_dedup_window": 5, "recall_rerank_enable": True,
-                "passage_index_enable": True, "passage_max_chars": 250,
-                "passage_overlap_chars": 75, "mixed_injection_enable": True,
-                "full_diary_top_n": 3, "passage_expand_chars": 130,
-                "context_keep_recent_messages": 48, "context_min_messages_before_trim": 90,
+                "min_similarity_to_inject": 0.50, "recall_injection_min_score": 0.60,
+                "recall_dedup_window": 4, "recall_rerank_enable": True,
+                "passage_index_enable": True, "passage_max_chars": 240,
+                "passage_overlap_chars": 80, "mixed_injection_enable": True,
+                "full_diary_top_n": 3, "passage_expand_chars": 140,
+                "time_insight_auto_update_hours": 12, "time_insight_recent_window_days": 30,
+                "time_insight_anniversary_window_days": 3, "time_insight_min_importance": 3,
+                "time_insight_min_evidence_score": 0.65, "time_insight_query_max_insights": 3,
+                "time_insight_query_min_score": 0.40, "time_insight_query_max_chars": 1000,
+                "time_insight_llm_refine_enable": True, "time_insight_llm_min_confidence": 0.70,
+                "context_keep_recent_messages": 48, "context_min_messages_before_trim": 96,
+                "data_backup_keep": 8,
             },
         },
         "balanced": {
             "name": "均衡推荐",
-            "summary": "效果、延迟和调用成本平衡，适合作为长期默认配置。",
+            "summary": "保留 4.6 全部核心机制，以默认规模平衡长期效果、延迟和调用成本。",
             "cost": "中等",
             "values": {
-                "compress_every_n_turns": 24, "diary_count": 2, "compress_batch_max_messages": 48,
+                **preset_common_values,
+                "compress_every_n_turns": 30, "diary_count": 2, "compress_batch_max_messages": 60,
                 "eod_checkpoint_enable": True, "eod_checkpoint_min_turns": 1,
-                "eod_checkpoint_max_diaries": 5,
+                "eod_checkpoint_max_diaries": 6,
                 "evidence_first_generation_enable": True, "raw_evidence_archive_enable": True,
-                "semantic_state_enable": True, "semantic_state_target_chars": 1600,
+                "diary_must_coverage_threshold": 0.90, "diary_rewrite_preview_min_chars": 2200,
+                "semantic_state_enable": True, "semantic_state_target_chars": 1800,
+                "semantic_state_update_policy": "adaptive", "semantic_state_batch_threshold": 5,
+                "semantic_state_max_wait_hours": 120, "semantic_state_significance_threshold": 0.74,
+                "semantic_state_merge_max_batches": 8,
                 "semantic_state_auto_bootstrap": True, "semantic_state_replace_profile": True,
                 "lean_recall_enable": True, "lean_recall_candidate_k": 50,
                 "lean_event_index_enable": True, "lean_source_evidence_enable": True,
@@ -241,11 +367,11 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
                 "lean_adaptive_evidence_enable": True, "passage_vector_auto_migrate": True,
                 "source_turn_vector_auto_migrate": True,
                 "lean_temporal_enable": True, "lean_story_min_inject": 1,
-                "lean_story_max_inject": 5, "lean_story_normal_inject": 3,
-                "lean_relative_margin": 0.24, "lean_relative_margin_broad": 0.34,
+                "lean_story_max_inject": 7, "lean_story_normal_inject": 3,
+                "lean_relative_margin": 0.24, "lean_relative_margin_broad": 0.36,
                 "recall_safety_net_enable": True, "recall_safety_net_min_selected": 2,
                 "recall_safety_net_min_top_score": 0.60,
-                "inject_char_budget": 8000, "inject_compact_chars": 180,
+                "inject_char_budget": 9000, "inject_compact_chars": 180,
                 "lean_texture_enable": False,
                 "episodic_evidence_per_memory": 3, "episodic_full_diary_limit": 1,
                 "recall_context_query_messages": 3, "recall_context_query_max_chars": 900,
@@ -254,40 +380,137 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
                 "passage_index_enable": True, "passage_max_chars": 280,
                 "passage_overlap_chars": 60, "mixed_injection_enable": True,
                 "full_diary_top_n": 2, "passage_expand_chars": 100,
+                "time_insight_auto_update_hours": 12, "time_insight_recent_window_days": 21,
+                "time_insight_anniversary_window_days": 2, "time_insight_min_importance": 3,
+                "time_insight_min_evidence_score": 0.68, "time_insight_query_max_insights": 2,
+                "time_insight_query_min_score": 0.42, "time_insight_query_max_chars": 900,
+                "time_insight_llm_refine_enable": True, "time_insight_llm_min_confidence": 0.72,
                 "context_keep_recent_messages": 40, "context_min_messages_before_trim": 80,
+                "data_backup_keep": 6,
             },
         },
         "economy": {
-            "name": "低成本",
-            "summary": "保留原文档案与滚动状态，缩小当前候选池并关闭 rerank。",
+            "name": "低成本长记忆",
+            "summary": "不牺牲原文档案和证据生成，通过降低频率、候选量与 LLM 精炼节省成本。",
             "cost": "较低",
             "values": {
-                "compress_every_n_turns": 36, "diary_count": 2, "compress_batch_max_messages": 72,
+                **preset_common_values,
+                "compress_every_n_turns": 45, "diary_count": 2, "compress_batch_max_messages": 90,
                 "eod_checkpoint_enable": True, "eod_checkpoint_min_turns": 1,
                 "eod_checkpoint_max_diaries": 4,
-                "evidence_first_generation_enable": False, "raw_evidence_archive_enable": True,
-                "semantic_state_enable": True, "semantic_state_target_chars": 1200,
+                "evidence_first_generation_enable": True, "raw_evidence_archive_enable": True,
+                "diary_must_coverage_threshold": 0.88, "diary_rewrite_preview_min_chars": 1800,
+                "semantic_state_enable": True, "semantic_state_target_chars": 1300,
+                "semantic_state_update_policy": "adaptive", "semantic_state_batch_threshold": 6,
+                "semantic_state_max_wait_hours": 168, "semantic_state_significance_threshold": 0.80,
+                "semantic_state_merge_max_batches": 10,
                 "semantic_state_auto_bootstrap": True, "semantic_state_replace_profile": True,
-                "lean_recall_enable": True, "lean_recall_candidate_k": 35,
+                "lean_recall_enable": True, "lean_recall_candidate_k": 40,
                 "lean_event_index_enable": True, "lean_source_evidence_enable": True,
                 "lean_coverage_selection_enable": True,
                 "lean_adaptive_evidence_enable": True, "passage_vector_auto_migrate": True,
                 "source_turn_vector_auto_migrate": True,
                 "lean_temporal_enable": True, "lean_story_min_inject": 1,
-                "lean_story_max_inject": 3, "lean_story_normal_inject": 2,
-                "lean_relative_margin": 0.20, "lean_relative_margin_broad": 0.30,
+                "lean_story_max_inject": 5, "lean_story_normal_inject": 2,
+                "lean_relative_margin": 0.20, "lean_relative_margin_broad": 0.32,
                 "recall_safety_net_enable": True, "recall_safety_net_min_selected": 1,
                 "recall_safety_net_min_top_score": 0.55,
-                "inject_char_budget": 5000, "inject_compact_chars": 140,
+                "inject_char_budget": 6000, "inject_compact_chars": 140,
                 "lean_texture_enable": False,
                 "episodic_evidence_per_memory": 2, "episodic_full_diary_limit": 1,
-                "recall_context_query_messages": 2, "recall_context_query_max_chars": 500,
-                "min_similarity_to_inject": 0.56, "recall_injection_min_score": 0.66,
+                "recall_context_query_messages": 2, "recall_context_query_max_chars": 600,
+                "min_similarity_to_inject": 0.55, "recall_injection_min_score": 0.66,
                 "recall_dedup_window": 8, "recall_rerank_enable": False,
                 "passage_index_enable": True, "passage_max_chars": 320,
                 "passage_overlap_chars": 50, "mixed_injection_enable": True,
                 "full_diary_top_n": 1, "passage_expand_chars": 80,
+                "time_insight_auto_update_hours": 24, "time_insight_recent_window_days": 21,
+                "time_insight_anniversary_window_days": 2, "time_insight_min_importance": 3,
+                "time_insight_min_evidence_score": 0.72, "time_insight_query_max_insights": 1,
+                "time_insight_query_min_score": 0.48, "time_insight_query_max_chars": 650,
+                "time_insight_llm_refine_enable": False, "time_insight_llm_min_confidence": 0.76,
                 "context_keep_recent_messages": 32, "context_min_messages_before_trim": 72,
+                "data_backup_keep": 4,
+            },
+        },
+    }
+
+    # Retrieval-only presets shown in the recall lab. They never touch tokens,
+    # providers, character names, service URLs, paths, ports, or generation rules.
+    recall_preset_common_values = {
+        "enable_auto_recall": True,
+        "lean_recall_enable": True,
+        "lean_event_index_enable": True,
+        "lean_source_evidence_enable": True,
+        "lean_coverage_selection_enable": True,
+        "lean_adaptive_evidence_enable": True,
+        "lean_temporal_enable": True,
+        "recall_safety_net_enable": True,
+        "recall_cross_layer_consistency_enable": True,
+        "recall_temporal_constraints_enable": True,
+        "recall_intent_layer_weights_enable": True,
+        "recall_observation_enable": True,
+        "lean_texture_enable": False,
+    }
+    recall_preset_definitions = {
+        "recall_effect": {
+            "name": "全场景最优（推荐）",
+            "summary": "普通对话控制密度，叙事意图自动扩到长线上限；同时兼顾精确事实与跨阶段剧情。",
+            "cost": "较高",
+            "values": {
+                **recall_preset_common_values,
+                "lean_recall_candidate_k": 80, "lean_story_min_inject": 1,
+                "lean_story_normal_inject": 4, "lean_story_max_inject": 10,
+                "min_similarity_to_inject": 0.48, "recall_injection_min_score": 0.58,
+                "lean_relative_margin": 0.30, "lean_relative_margin_broad": 0.46,
+                "recall_safety_net_min_selected": 2, "recall_safety_net_min_top_score": 0.62,
+                "recall_context_query_messages": 5, "recall_context_query_max_chars": 1500,
+                "recall_dedup_window": 3, "recall_rerank_enable": True,
+            },
+        },
+        "recall_precise": {
+            "name": "精确取证",
+            "summary": "提高资格线、缩小普通注入，优先日期、原话、承诺、边界和专名的一手证据。",
+            "cost": "中等",
+            "values": {
+                **recall_preset_common_values,
+                "lean_recall_candidate_k": 60, "lean_story_min_inject": 1,
+                "lean_story_normal_inject": 3, "lean_story_max_inject": 6,
+                "min_similarity_to_inject": 0.55, "recall_injection_min_score": 0.66,
+                "lean_relative_margin": 0.18, "lean_relative_margin_broad": 0.28,
+                "recall_safety_net_min_selected": 2, "recall_safety_net_min_top_score": 0.64,
+                "recall_context_query_messages": 3, "recall_context_query_max_chars": 900,
+                "recall_dedup_window": 6, "recall_rerank_enable": True,
+            },
+        },
+        "recall_narrative": {
+            "name": "长线宽召回（专项）",
+            "summary": "比综合最优更宽松地覆盖跨月、多阶段和多人物剧情，适合集中回顾长篇故事。",
+            "cost": "最高",
+            "values": {
+                **recall_preset_common_values,
+                "lean_recall_candidate_k": 100, "lean_story_min_inject": 1,
+                "lean_story_normal_inject": 4, "lean_story_max_inject": 10,
+                "min_similarity_to_inject": 0.46, "recall_injection_min_score": 0.55,
+                "lean_relative_margin": 0.28, "lean_relative_margin_broad": 0.54,
+                "recall_safety_net_min_selected": 2, "recall_safety_net_min_top_score": 0.60,
+                "recall_context_query_messages": 6, "recall_context_query_max_chars": 1800,
+                "recall_dedup_window": 2, "recall_rerank_enable": True,
+            },
+        },
+        "recall_balanced": {
+            "name": "日常均衡",
+            "summary": "保留全 MEMORY 三路与安全网，以默认候选量适配长期日常 RP。",
+            "cost": "中等",
+            "values": {
+                **recall_preset_common_values,
+                "lean_recall_candidate_k": 50, "lean_story_min_inject": 1,
+                "lean_story_normal_inject": 3, "lean_story_max_inject": 7,
+                "min_similarity_to_inject": 0.52, "recall_injection_min_score": 0.62,
+                "lean_relative_margin": 0.24, "lean_relative_margin_broad": 0.36,
+                "recall_safety_net_min_selected": 2, "recall_safety_net_min_top_score": 0.60,
+                "recall_context_query_messages": 3, "recall_context_query_max_chars": 900,
+                "recall_dedup_window": 6, "recall_rerank_enable": True,
             },
         },
     }
@@ -313,6 +536,8 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
                 _html_response(self, console_html)
             elif path == "/xinchao":
                 _html_response(self, xinchao_html)
+            elif path == "/production":
+                _html_response(self, production_html)
             elif path == "/api/status":
                 self._api_status()
             elif path == "/api/stats":
@@ -321,6 +546,18 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
                 self._api_passages_status()
             elif path == "/api/episodic/status":
                 self._api_episodic_status()
+            elif path == "/api/production/overview":
+                self._api_production_overview(qs)
+            elif path == "/api/production/episodes":
+                self._api_production_episodes(qs)
+            elif path == "/api/production/snapshots":
+                self._api_production_snapshots()
+            elif path == "/api/production/long_diaries":
+                self._api_production_long_diaries(qs)
+            elif path == "/api/production/rollbacks":
+                self._api_production_rollbacks()
+            elif path == "/api/production/previews":
+                self._api_production_previews()
             elif path == "/api/episodic/memories":
                 self._api_episodic_memories(qs)
             elif path.startswith("/api/episodic/detail/"):
@@ -329,6 +566,21 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
                 self._api_semantic_state_status()
             elif path == "/api/eval/cases":
                 self._api_eval_cases()
+            elif path == "/api/eval/presets":
+                self._json_ok({
+                    "items": [
+                        dict(
+                            {"id": key},
+                            **{
+                                **value,
+                                "values": _safe_preset_values(value.get("values")),
+                            },
+                        )
+                        for key, value in recall_preset_definitions.items()
+                    ]
+                })
+            elif path == "/api/eval/observations":
+                self._api_eval_observations(qs)
             elif path == "/api/settings":
                 self._api_settings()
             elif path == "/api/memories":
@@ -351,6 +603,12 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
                 self._api_time_insight_settings()
             elif path == "/api/managed-memos/status":
                 self._api_managed_memos_status()
+            elif path == "/api/data-backup/list":
+                self._api_data_backup_list()
+            elif path == "/api/data-backup/inspect":
+                self._api_data_backup_inspect(qs)
+            elif path == "/api/data-backup/download":
+                self._api_data_backup_download(qs)
             elif path == "/api/context/history":
                 self._api_context_history(qs)
             elif path == "/api/context/backup":
@@ -400,11 +658,23 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
                 "/api/feedback/apply",
                 "/api/episodic/rebuild",
                 "/api/state/rebuild", "/api/eval/case", "/api/eval/run",
+                "/api/eval/auto_cases", "/api/eval/preset", "/api/eval/observation_feedback",
                 "/api/xinchao/settings/save", "/api/xinchao/settle",
                 "/api/xinchao/feedback", "/api/xinchao/thought",
                 "/api/xinchao/simulate", "/api/xinchao/reset",
                 "/api/time-insight/settings/save", "/api/time-insight/update",
                 "/api/time-insight/preview",
+                "/api/production/restore_snapshot",
+                "/api/production/long_diary_preview",
+                "/api/production/long_diary_confirm",
+                "/api/production/long_diary_rollback",
+                "/api/production/long_diary_discard",
+                "/api/production/generation_switch",
+                "/api/production/generation_rollback",
+                "/api/data-backup/run",
+                "/api/data-backup/restore",
+                "/api/data-backup/cancel-restore",
+                "/api/data-backup/delete",
             }
             if path not in allowed:
                 return _json_response(self, 404, {"ok": False, "error": "Not found"})
@@ -431,7 +701,35 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
                     self._api_eval_case_save(body)
                 elif path == "/api/eval/run":
                     self._api_eval_run(body)
-                elif path.startswith("/api/time-insight/"):
+                elif path == "/api/eval/auto_cases":
+                    self._api_eval_auto_cases(body)
+                elif path == "/api/eval/preset":
+                    self._api_eval_preset(body)
+                elif path == "/api/eval/observation_feedback":
+                    self._api_eval_observation_feedback(body)
+                elif path == "/api/production/restore_snapshot":
+                    self._api_production_restore_snapshot(body)
+                elif path == "/api/production/long_diary_preview":
+                    self._api_production_long_diary_preview(body)
+                elif path == "/api/production/long_diary_confirm":
+                    self._api_production_long_diary_confirm(body)
+                elif path == "/api/production/long_diary_rollback":
+                    self._api_production_long_diary_rollback(body)
+                elif path == "/api/production/long_diary_discard":
+                    self._api_production_long_diary_discard(body)
+                elif path == "/api/production/generation_switch":
+                    self._api_production_generation_switch()
+                elif path == "/api/production/generation_rollback":
+                    self._api_production_generation_rollback()
+                elif path == "/api/data-backup/run":
+                    self._api_data_backup_run()
+                elif path == "/api/data-backup/restore":
+                    self._api_data_backup_restore(body)
+                elif path == "/api/data-backup/cancel-restore":
+                    self._api_data_backup_cancel_restore()
+                elif path == "/api/data-backup/delete":
+                    self._api_data_backup_delete(body)
+                elif path.startswith("/api/time-insight/"): 
                     self._api_time_insight_write(path, body)
                 else:
                     self._api_xinchao_write(path, body)
@@ -531,6 +829,11 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
                         "max_diaries": int(getattr(plg, "eod_checkpoint_max_diaries", 6) or 6),
                         "last": dict(getattr(plg, "_eod_last_status", {}) or {}),
                     },
+                    "data_backup": (
+                        plg._data_backup_status()
+                        if hasattr(plg, "_data_backup_status")
+                        else {"enabled": False, "count": 0}
+                    ),
                     "reconcile_total_deleted": getattr(plg, "_reconcile_stats", {}).get("deleted", 0),
                     "last_reconcile_ts": getattr(plg, "_last_reconcile_ts", 0),
                     "rerank_provider": getattr(plg, "rerank_provider_id", "") or "(off)",
@@ -589,7 +892,7 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
                     "episodic_migration": dict(getattr(plg, "_episode_migration_state", {}) or {}),
                     "passage_vector_migration": dict(getattr(plg, "_passage_vector_migration_state", {}) or {}),
                     "profile": plugin._affiliate_profile_status() if hasattr(plugin, "_affiliate_profile_status") else {"enabled": False, "connected": False},
-                    "semantic_state": plugin._semantic_state_status() if hasattr(plugin, "_semantic_state_status") else {"enabled": False, "ready": False},
+                    "semantic_state": plugin._semantic_state_status(include_pending_preview=True) if hasattr(plugin, "_semantic_state_status") else {"enabled": False, "ready": False},
                     "time_insight": plugin._time_insight_status() if hasattr(plugin, "_time_insight_status") else {"enabled": False, "connected": False},
                     "time_model": {
                         "request_snapshot": True,
@@ -607,6 +910,109 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
                 self._json_ok(data)
             except Exception as e:
                 self._json_err(str(e))
+
+        def _api_data_backup_run(self):
+            runner = getattr(plugin, "_run_data_backup_once", None)
+            if not callable(runner):
+                return self._json_err("数据备份服务未就绪", 503)
+            try:
+                result = self._run_plugin_coro(
+                    runner(force=True, reason="webui_manual"), timeout=180,
+                )
+                if not isinstance(result, dict) or not result.get("created"):
+                    reason = (result or {}).get("error") or (result or {}).get("reason") or "unknown"
+                    return self._json_err("备份未创建: " + str(reason), 503)
+                self._json_ok(result)
+            except RuntimeError as exc:
+                self._json_err(str(exc), 503)
+
+        def _api_data_backup_list(self):
+            runner = getattr(plugin, "_data_backup_list", None)
+            if not callable(runner):
+                return self._json_err("数据备份服务未就绪", 503)
+            try:
+                self._json_ok(self._run_plugin_coro(runner(), timeout=30))
+            except RuntimeError as exc:
+                self._json_err(str(exc), 503)
+
+        def _api_data_backup_inspect(self, qs):
+            file_name = str((qs.get("file") or [""])[0]).strip()
+            if not file_name:
+                return self._json_err("缺少备份文件名", 400)
+            runner = getattr(plugin, "_data_backup_inspect", None)
+            if not callable(runner):
+                return self._json_err("数据备份服务未就绪", 503)
+            try:
+                self._json_ok(self._run_plugin_coro(runner(file_name), timeout=60))
+            except (RuntimeError, ValueError, FileNotFoundError) as exc:
+                self._json_err(str(exc), 400)
+
+        def _api_data_backup_download(self, qs):
+            file_name = str((qs.get("file") or [""])[0]).strip()
+            if not file_name:
+                return self._json_err("缺少备份文件名", 400)
+            manager = getattr(plugin, "_data_backup", None)
+            if manager is None:
+                return self._json_err("数据备份服务未就绪", 503)
+            try:
+                path = manager.archive_path(file_name)
+                self.send_response(200)
+                for key, value in _cors_headers().items():
+                    self.send_header(key, value)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
+                self.send_header("Content-Length", str(path.stat().st_size))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                with path.open("rb") as stream:
+                    while True:
+                        chunk = stream.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+            except (ValueError, FileNotFoundError) as exc:
+                self._json_err(str(exc), 404)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as exc:
+                self._json_err(str(exc), 500)
+
+        def _api_data_backup_restore(self, body):
+            file_name = str(body.get("file") or "").strip()
+            if not file_name:
+                return self._json_err("缺少备份文件名", 400)
+            if str(body.get("confirm") or "") != "RESTORE_ON_RELOAD":
+                return self._json_err("恢复确认无效", 400)
+            runner = getattr(plugin, "_prepare_data_restore", None)
+            if not callable(runner):
+                return self._json_err("数据恢复服务未就绪", 503)
+            try:
+                self._json_ok(self._run_plugin_coro(runner(file_name), timeout=240))
+            except (RuntimeError, ValueError, FileNotFoundError) as exc:
+                self._json_err(str(exc), 400)
+
+        def _api_data_backup_cancel_restore(self):
+            runner = getattr(plugin, "_cancel_data_restore", None)
+            if not callable(runner):
+                return self._json_err("数据恢复服务未就绪", 503)
+            try:
+                self._json_ok(self._run_plugin_coro(runner(), timeout=30))
+            except RuntimeError as exc:
+                self._json_err(str(exc), 503)
+
+        def _api_data_backup_delete(self, body):
+            file_name = str(body.get("file") or "").strip()
+            if not file_name:
+                return self._json_err("缺少备份文件名", 400)
+            runner = getattr(plugin, "_delete_data_backup", None)
+            if not callable(runner):
+                return self._json_err("数据备份服务未就绪", 503)
+            try:
+                self._json_ok(self._run_plugin_coro(runner(file_name), timeout=30))
+            except (RuntimeError, ValueError, FileNotFoundError) as exc:
+                self._json_err(str(exc), 400)
+            except Exception as exc:
+                self._json_err(str(exc))
 
         def _api_passages_status(self):
             try:
@@ -631,6 +1037,395 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
                 self._json_ok(stats)
             except Exception as e:
                 self._json_err(str(e))
+
+        @staticmethod
+        def _production_list(value: Any) -> list[dict[str, Any]]:
+            return [dict(item) for item in value if isinstance(item, dict)] if isinstance(value, (list, tuple)) else []
+
+        def _production_store(self):
+            return getattr(plugin, "_episodes", None)
+
+        def _production_helper(self, name: str):
+            helper = getattr(plugin, name, None)
+            if not callable(helper):
+                raise RuntimeError(f"记忆生产能力不可用: {name}")
+            return helper
+
+        def _api_production_overview(self, qs):
+            """Return one coherent production snapshot for the dedicated dashboard tab."""
+            store = self._production_store()
+            if store is None:
+                return self._json_ok({
+                    "ready": False,
+                    "reason": "原文库未就绪或 episodic 未启用",
+                    "generation_actions": {"switch_available": False, "rollback_available": False},
+                })
+            try:
+                import sqlite3
+
+                stats = dict(store.stats() or {}) if callable(getattr(store, "stats", None)) else {}
+                identity = dict(store.identity() or {}) if callable(getattr(store, "identity", None)) else {}
+                for key in ("active_generation", "pending_generation", "prev_generation", "migration_status"):
+                    if not identity.get(key) and stats.get(key):
+                        identity[key] = stats[key]
+                traceable = dict(store.traceability() or {}) if callable(getattr(store, "traceability", None)) else {}
+                source_status = dict(traceable.get("status") or {})
+                if not source_status:
+                    source_status = {"level": "gray", "label": "追溯状态不可用"}
+
+                snapshots = self._production_list(
+                    store.list_snapshots(limit=10) if callable(getattr(store, "list_snapshots", None)) else []
+                )
+                rollbacks = self._production_list(
+                    store.rollback_history(limit=30) if callable(getattr(store, "rollback_history", None)) else []
+                )
+                previews = self._production_list(
+                    store.list_diary_previews(limit=30) if callable(getattr(store, "list_diary_previews", None)) else []
+                )
+                long_helper = getattr(plugin, "_long_diaries_list", None)
+                long_diaries = self._production_list(long_helper() if callable(long_helper) else [])
+
+                totals = {
+                    "batches": int(stats.get("source_batches") or 0),
+                    "turns": int(stats.get("source_turns") or 0),
+                    "episodes": int(stats.get("episodes") or 0),
+                    "evidence": int(stats.get("evidence") or 0),
+                    "turn_links": int(stats.get("exact_turn_links") or 0),
+                }
+                tier_dist: dict[str, int] = {}
+                scene_stats = {"scenes": 0, "with_reasons": 0, "avg_span_turns": 0.0}
+                diary_stats: dict[str, Any] = {
+                    "with_diary": 0,
+                    "avg_card_len": 0.0,
+                    "quality_dist": {},
+                    "avg_must_coverage": 0.0,
+                    "avg_support_coverage": 0.0,
+                    "avg_transcript_risk": 0.0,
+                    "avg_compression_ratio": 0.0,
+                    "render_retries": 0,
+                    "render_fallbacks": 0,
+                }
+                trace = {
+                    "grounded_evidence": 0,
+                    "turn_linked_episodes": int(traceable.get("recoverable_episodes") or 0),
+                    "grounded_ratio": 0.0,
+                    "traceable_ratio": 0.0,
+                }
+                batches: list[dict[str, Any]] = []
+                db_path = str(getattr(store, "db_path", "") or stats.get("db_path") or "")
+                if db_path:
+                    conn = sqlite3.connect(db_path, check_same_thread=False)
+                    conn.row_factory = sqlite3.Row
+                    try:
+                        summary = conn.execute(
+                            """SELECT
+                                 (SELECT COUNT(*) FROM source_batches) batches,
+                                 (SELECT COUNT(*) FROM source_turns) turns,
+                                 (SELECT COUNT(*) FROM episodes) episodes,
+                                 (SELECT COUNT(*) FROM episode_evidence) evidence,
+                                 (SELECT COUNT(*) FROM episode_turn_links) turn_links,
+                                 (SELECT COUNT(*) FROM episodes WHERE scene_start_turn >= 0) scenes,
+                                 (SELECT COUNT(*) FROM episodes WHERE scene_boundary_reasons_json NOT IN ('', '[]')) with_reasons,
+                                 (SELECT AVG(scene_end_turn-scene_start_turn) FROM episodes WHERE scene_start_turn >= 0 AND scene_end_turn >= scene_start_turn) avg_span,
+                                 (SELECT COUNT(*) FROM episodes WHERE diary_content_hash != '') with_diary,
+                                 (SELECT AVG(LENGTH(card_text)) FROM episodes) avg_card_len,
+                                 (SELECT AVG(must_coverage) FROM episodes WHERE must_coverage>=0) avg_must,
+                                 (SELECT AVG(support_coverage) FROM episodes WHERE support_coverage>=0) avg_support,
+                                 (SELECT AVG(transcript_risk) FROM episodes WHERE transcript_risk>=0) avg_risk,
+                                 (SELECT AVG(compression_ratio) FROM episodes WHERE compression_ratio>=0) avg_compression,
+                                 (SELECT COUNT(*) FROM episodes WHERE render_retry_reason!='') render_retries,
+                                 (SELECT COUNT(*) FROM episodes WHERE render_fallback=1) render_fallbacks,
+                                 (SELECT COUNT(*) FROM episode_evidence WHERE grounded=1) grounded_evidence,
+                                 (SELECT COUNT(DISTINCT e2.episode_id)
+                                    FROM episodes e2
+                                   WHERE e2.active=1 AND EXISTS (
+                                     SELECT 1 FROM episode_turn_links l2
+                                     JOIN source_turns s2 ON s2.batch_id=l2.batch_id AND s2.turn_index=l2.turn_index
+                                     WHERE l2.episode_id=e2.episode_id
+                                   )) linked_episodes"""
+                        ).fetchone()
+                        if summary:
+                            totals = {key: int(summary[key] or 0) for key in ("batches", "turns", "episodes", "evidence", "turn_links")}
+                            scene_stats = {
+                                "scenes": int(summary["scenes"] or 0),
+                                "with_reasons": int(summary["with_reasons"] or 0),
+                                "avg_span_turns": round(float(summary["avg_span"] or 0), 1),
+                            }
+                            diary_stats.update({
+                                "with_diary": int(summary["with_diary"] or 0),
+                                "avg_card_len": round(float(summary["avg_card_len"] or 0), 1),
+                                "avg_must_coverage": round(float(summary["avg_must"] or 0), 4),
+                                "avg_support_coverage": round(float(summary["avg_support"] or 0), 4),
+                                "avg_transcript_risk": round(float(summary["avg_risk"] or 0), 4),
+                                "avg_compression_ratio": round(float(summary["avg_compression"] or 0), 4),
+                                "render_retries": int(summary["render_retries"] or 0),
+                                "render_fallbacks": int(summary["render_fallbacks"] or 0),
+                            })
+                            trace.update({
+                                "grounded_evidence": int(summary["grounded_evidence"] or 0),
+                                "turn_linked_episodes": int(summary["linked_episodes"] or 0),
+                            })
+                        tier_dist = {
+                            str(row["evidence_tier"] or "supporting"): int(row["n"] or 0)
+                            for row in conn.execute("SELECT evidence_tier,COUNT(*) n FROM episode_evidence GROUP BY evidence_tier")
+                        }
+                        diary_stats["quality_dist"] = {
+                            str(row["evidence_quality"] or "unknown"): int(row["n"] or 0)
+                            for row in conn.execute("SELECT evidence_quality,COUNT(*) n FROM episodes GROUP BY evidence_quality")
+                        }
+                        batches = [dict(row) for row in conn.execute(
+                            """SELECT b.batch_id,b.source_kind,b.message_count,b.first_event_ts,b.last_event_ts,b.created_ts,
+                                      (SELECT SUM(LENGTH(s.content)) FROM source_turns s WHERE s.batch_id=b.batch_id) char_count,
+                                      (SELECT COUNT(*) FROM source_turns s WHERE s.batch_id=b.batch_id AND s.role='user') user_turns,
+                                      (SELECT COUNT(*) FROM source_turns s WHERE s.batch_id=b.batch_id AND s.role='assistant') assistant_turns,
+                                      (SELECT q.status FROM semantic_state_queue q WHERE q.batch_id=b.batch_id ORDER BY q.updated_ts DESC LIMIT 1) state_status,
+                                      COUNT(DISTINCT e.episode_id) ep_cnt,
+                                      COUNT(DISTINCT CASE WHEN ev.evidence_tier='must_write' THEN ev.id END) must_cnt,
+                                      COUNT(DISTINCT CASE WHEN e.scene_start_turn>=0 THEN e.episode_id END) scene_cnt,
+                                      COUNT(DISTINCT CASE WHEN e.diary_content_hash!='' THEN e.episode_id END) diary_cnt
+                               FROM source_batches b
+                               LEFT JOIN episodes e ON e.source_batch_id=b.batch_id
+                               LEFT JOIN episode_evidence ev ON ev.episode_id=e.episode_id
+                               GROUP BY b.batch_id ORDER BY b.created_ts DESC LIMIT 12"""
+                        )]
+                    finally:
+                        conn.close()
+                trace["grounded_ratio"] = round(trace["grounded_evidence"] / totals["evidence"], 4) if totals["evidence"] else 0.0
+                trace["traceable_ratio"] = round(trace["turn_linked_episodes"] / totals["episodes"], 4) if totals["episodes"] else 0.0
+
+                pending = str(identity.get("pending_generation") or stats.get("pending_generation") or "")
+                previous = str(identity.get("prev_generation") or stats.get("prev_generation") or "")
+                emb_dim = int(getattr(plugin, "_emb_dim", 0) or 0)
+                generation_actions = {
+                    "switch_available": bool(pending and emb_dim and callable(getattr(store, "switch_generation", None))),
+                    "rollback_available": bool(previous and callable(getattr(store, "rollback_generation", None))),
+                    "pending_generation": pending,
+                    "prev_generation": previous,
+                }
+                self._json_ok({
+                    "ready": True,
+                    "version": getattr(plugin, "_PLUGIN_VERSION", "?"),
+                    "db_path": str(identity.get("canonical_db_path") or db_path),
+                    "identity": identity,
+                    "source_status": source_status,
+                    "totals": totals,
+                    "traceable": traceable,
+                    "tier_dist": tier_dist,
+                    "scene_stats": scene_stats,
+                    "diary_stats": diary_stats,
+                    "trace": trace,
+                    "linked": totals["turn_links"],
+                    "batches": batches,
+                    "snapshots": snapshots,
+                    "snapshot_count": len(snapshots),
+                    "long_diaries": long_diaries[:50],
+                    "long_diaries_count": len(long_diaries),
+                    "previews": previews,
+                    "rollback_count": int(stats.get("rollbacks") or len(rollbacks)),
+                    "rollbacks": rollbacks,
+                    "generation_actions": generation_actions,
+                })
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_production_episodes(self, qs):
+            """Per-Episode generation audit rows for the standalone workbench."""
+            store = self._production_store()
+            if store is None:
+                return self._json_ok({"items": [], "total": 0, "ready": False})
+            try:
+                import sqlite3
+
+                query = str(qs.get("q", [""])[0] or "").strip()
+                quality = str(qs.get("quality", [""])[0] or "").strip()
+                limit = max(1, min(300, int(qs.get("limit", ["120"])[0] or 120)))
+                clauses = ["e.active=1"]
+                params: list[Any] = []
+                if quality:
+                    clauses.append("e.evidence_quality=?")
+                    params.append(quality)
+                if query:
+                    like = "%" + query + "%"
+                    clauses.append(
+                        "(e.memo_name LIKE ? OR e.scene_anchor LIKE ? OR e.retrieval_key LIKE ? OR e.card_text LIKE ?)"
+                    )
+                    params.extend([like, like, like, like])
+                where = " AND ".join(clauses)
+                conn = sqlite3.connect(str(store.db_path), check_same_thread=False)
+                conn.row_factory = sqlite3.Row
+                try:
+                    total = int(conn.execute(
+                        f"SELECT COUNT(*) n FROM episodes e WHERE {where}", params,
+                    ).fetchone()["n"])
+                    rows = conn.execute(
+                        f"""SELECT e.episode_id,e.memo_name,e.source_batch_id,e.source_kind,
+                                   e.occurred_at,e.memory_type,e.importance,e.scene_anchor,e.retrieval_key,
+                                   e.scene_start_turn,e.scene_end_turn,e.scene_boundary_reasons_json,
+                                   e.evidence_quality,e.diary_render_version,e.must_coverage,
+                                   e.support_coverage,e.transcript_risk,e.source_overlap_ratio,
+                                   e.direct_quote_ratio,e.compression_ratio,e.render_retry_reason,
+                                   e.render_fallback,LENGTH(e.card_text) card_len,
+                                   CASE WHEN e.diary_content_hash!='' THEN 1 ELSE 0 END memos_written,
+                                   COUNT(DISTINCT CASE WHEN ev.evidence_tier='must_write' THEN ev.id END) must_count,
+                                   COUNT(DISTINCT CASE WHEN ev.evidence_tier='supporting' THEN ev.id END) supporting_count,
+                                   COUNT(DISTINCT CASE WHEN ev.evidence_tier='archive_only' THEN ev.id END) archive_count,
+                                   COUNT(DISTINCT l.turn_index || ':' || l.evidence_index) exact_links,
+                                   COUNT(DISTINCT s.id) source_turns,
+                                   (SELECT q.status FROM semantic_state_queue q
+                                     WHERE q.batch_id=e.source_batch_id ORDER BY q.updated_ts DESC LIMIT 1) state_status
+                              FROM episodes e
+                              LEFT JOIN episode_evidence ev ON ev.episode_id=e.episode_id
+                              LEFT JOIN episode_turn_links l ON l.episode_id=e.episode_id
+                              LEFT JOIN source_turns s ON s.batch_id=l.batch_id AND s.turn_index=l.turn_index
+                             WHERE {where}
+                             GROUP BY e.id ORDER BY e.event_ts DESC,e.updated_ts DESC LIMIT ?""",
+                        [*params, limit],
+                    ).fetchall()
+                    items = []
+                    for row in rows:
+                        item = dict(row)
+                        try:
+                            item["scene_boundary_reasons"] = json.loads(
+                                str(item.pop("scene_boundary_reasons_json") or "[]")
+                            )
+                        except Exception:
+                            item["scene_boundary_reasons"] = []
+                        item["recoverable"] = bool(item.get("source_turns") and item.get("exact_links"))
+                        items.append(item)
+                finally:
+                    conn.close()
+                self._json_ok({"items": items, "total": total, "ready": True})
+            except (TypeError, ValueError) as exc:
+                self._json_err(str(exc), 400)
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_production_snapshots(self):
+            store = self._production_store()
+            try:
+                items = store.list_snapshots(limit=50) if store is not None and callable(getattr(store, "list_snapshots", None)) else []
+                self._json_ok({"snapshots": self._production_list(items), "available": store is not None})
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_production_long_diaries(self, qs):
+            try:
+                helper = getattr(plugin, "_long_diaries_list", None)
+                items = helper() if callable(helper) else []
+                self._json_ok({"long_diaries": self._production_list(items), "available": callable(helper)})
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_production_rollbacks(self):
+            store = self._production_store()
+            try:
+                items = store.rollback_history(limit=50) if store is not None and callable(getattr(store, "rollback_history", None)) else []
+                self._json_ok({"rollbacks": self._production_list(items), "available": store is not None})
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_production_previews(self):
+            store = self._production_store()
+            try:
+                items = store.list_diary_previews(limit=50) if store is not None and callable(getattr(store, "list_diary_previews", None)) else []
+                self._json_ok({"previews": self._production_list(items), "available": store is not None})
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_production_restore_snapshot(self, body):
+            store = self._production_store()
+            file_name = str((body or {}).get("file_name") or "").strip()
+            if not file_name:
+                return self._json_err("缺少 file_name", 400)
+            if store is None or not callable(getattr(store, "restore_snapshot", None)):
+                return self._json_err("快照恢复能力不可用", 503)
+            try:
+                result = store.restore_snapshot(file_name)
+                if not isinstance(result, dict) or not result.get("restored"):
+                    return self._json_err("恢复失败: " + str((result or {}).get("reason") if isinstance(result, dict) else "unknown"), 409)
+                self._json_ok(result)
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_production_long_diary_preview(self, body):
+            episode_id = str((body or {}).get("episode_id") or "").strip()
+            if not episode_id:
+                return self._json_err("缺少 episode_id", 400)
+            try:
+                result = self._run_plugin_coro(self._production_helper("_create_diary_rewrite_preview")(episode_id), timeout=300)
+                self._json_ok(result)
+            except RuntimeError as exc:
+                self._json_err(str(exc), 503)
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_production_long_diary_confirm(self, body):
+            preview_id = str((body or {}).get("preview_id") or "").strip()
+            if not preview_id:
+                return self._json_err("缺少 preview_id", 400)
+            try:
+                result = self._run_plugin_coro(self._production_helper("_confirm_diary_rewrite")(preview_id), timeout=300)
+                self._json_ok(result)
+            except RuntimeError as exc:
+                self._json_err(str(exc), 503)
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_production_long_diary_rollback(self, body):
+            memo_name = str((body or {}).get("memo_name") or "").strip()
+            preview_id = str((body or {}).get("preview_id") or "").strip()
+            if not memo_name and not preview_id:
+                return self._json_err("缺少 memo_name 或 preview_id", 400)
+            try:
+                result = self._run_plugin_coro(
+                    self._production_helper("_rollback_diary_rewrite")(memo_name=memo_name, preview_id=preview_id),
+                    timeout=120,
+                )
+                self._json_ok(result)
+            except RuntimeError as exc:
+                self._json_err(str(exc), 503)
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_production_long_diary_discard(self, body):
+            preview_id = str((body or {}).get("preview_id") or "").strip()
+            if not preview_id:
+                return self._json_err("缺少 preview_id", 400)
+            try:
+                result = self._run_plugin_coro(self._production_helper("_discard_diary_preview")(preview_id), timeout=30)
+                self._json_ok(result)
+            except RuntimeError as exc:
+                self._json_err(str(exc), 503)
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_production_generation_switch(self):
+            store = self._production_store()
+            if store is None or not callable(getattr(store, "switch_generation", None)):
+                return self._json_err("向量代际切换能力不可用", 503)
+            dim = int(getattr(plugin, "_emb_dim", 0) or 0)
+            model_id = str(getattr(plugin, "_emb_model_id", "") or "unknown")
+            if dim <= 0:
+                return self._json_err("Embedding 维度尚未就绪", 409)
+            try:
+                result = store.switch_generation(dim, model_id)
+                if not result.get("switched"):
+                    return self._json_err("切换未执行: " + str(result.get("reason") or "unknown"), 409)
+                self._json_ok(result)
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_production_generation_rollback(self):
+            store = self._production_store()
+            if store is None or not callable(getattr(store, "rollback_generation", None)):
+                return self._json_err("向量代际回滚能力不可用", 503)
+            try:
+                result = store.rollback_generation()
+                if not result.get("rolled_back"):
+                    return self._json_err("回滚未执行: " + str(result.get("reason") or "unknown"), 409)
+                self._json_ok(result)
+            except Exception as exc:
+                self._json_err(str(exc))
 
         def _api_episodic_status(self):
             try:
@@ -720,7 +1515,10 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
             try:
                 if not hasattr(plugin, "_semantic_state_status"):
                     return self._json_err("滚动状态功能不可用", 503)
-                self._json_ok(plugin._semantic_state_status(include_history=True))
+                self._json_ok(plugin._semantic_state_status(
+                    include_history=True,
+                    include_pending_preview=True,
+                ))
             except Exception as e:
                 self._json_err(str(e))
 
@@ -776,6 +1574,90 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
             except Exception as e:
                 self._json_err(str(e))
 
+        def _api_eval_auto_cases(self, body: dict[str, Any]):
+            try:
+                limit = max(20, min(200, int(body.get("limit") or getattr(plugin, "recall_auto_eval_limit", 80))))
+                self._json_ok(plugin._generate_recall_eval_cases(limit))
+            except ValueError as e:
+                self._json_err(str(e), 400)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_eval_observations(self, qs):
+            try:
+                store = getattr(plugin, "_episodes", None)
+                if store is None:
+                    return self._json_ok({"items": [], "summary": {}})
+                limit = max(1, min(300, int(qs.get("limit", ["80"])[0])))
+                safety_only = str(qs.get("safety_only", ["0"])[0]).lower() in {"1", "true", "yes"}
+                self._json_ok({
+                    "items": store.list_recall_observations(limit=limit, safety_only=safety_only),
+                    "summary": store.recall_observation_summary(),
+                })
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_eval_observation_feedback(self, body: dict[str, Any]):
+            try:
+                store = getattr(plugin, "_episodes", None)
+                if store is None:
+                    return self._json_err("情景记忆库未就绪", 503)
+                request_id = str(body.get("request_id") or "").strip()
+                feedback = str(body.get("feedback") or "").strip()
+                if not request_id:
+                    return self._json_err("缺少 request_id", 400)
+                observation = store.get_recall_observation(request_id)
+                if observation is None:
+                    return self._json_err("观测记录不存在", 404)
+                updated = store.set_recall_observation_feedback(request_id, feedback)
+                linked_feedback = []
+                linked_error = ""
+                if feedback in {"useful", "wrong"}:
+                    targets = list(dict.fromkeys(
+                        str(value) for value in (observation.get("rescue_selected") or [])
+                        if str(value)
+                    ))
+                    vec = getattr(plugin, "_vec", None)
+                    query = str(observation.get("query_text") or "").strip()
+                    if targets and vec is not None and query:
+                        embedding = None
+                        try:
+                            embedding = self._run_plugin_coro(plugin._embed(query), timeout=20)
+                        except Exception as exc:
+                            logger.debug(
+                                "[memos-memory] observation feedback embedding unavailable: %s", exc
+                            )
+                        action = "useful" if feedback == "useful" else "incorrect"
+                        effect = 0.06 if feedback == "useful" else -0.18
+                        reason = "安全网救回有帮助" if feedback == "useful" else "安全网救援错误"
+                        try:
+                            for memo_name in targets:
+                                linked_feedback.append(vec.feedback_record(
+                                    request_id=request_id,
+                                    memo_name=memo_name,
+                                    query_text=query,
+                                    action=action,
+                                    effect=effect,
+                                    reason=reason,
+                                    source="safety_observation",
+                                    query_embedding=embedding,
+                                ))
+                        except Exception as exc:
+                            linked_error = str(exc)
+                            logger.warning(
+                                "[memos-memory] safety observation feedback link failed open: %s", exc
+                            )
+                self._json_ok({
+                    "updated": updated,
+                    "request_id": request_id, "feedback": feedback,
+                    "linked_memories": len(linked_feedback),
+                    "linked_error": linked_error,
+                })
+            except ValueError as e:
+                self._json_err(str(e), 400)
+            except Exception as e:
+                self._json_err(str(e))
+
         @staticmethod
         def _settings_schema() -> dict[str, Any]:
             schema = getattr(getattr(plugin, "config", None), "schema", None)
@@ -808,7 +1690,45 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
             return "运行与维护"
 
         @staticmethod
-        def _setting_options(key: str) -> list[dict[str, str]]:
+        def _llm_provider_options(current: Any = "") -> list[dict[str, str]]:
+            options: list[dict[str, str]] = [
+                {"value": "", "label": "跟随当前会话模型"}
+            ]
+            try:
+                providers = list(plugin.context.get_all_providers())
+            except Exception:
+                providers = []
+            seen: set[str] = set()
+            for provider in providers:
+                try:
+                    meta = provider.meta()
+                    provider_id = str(getattr(meta, "id", "") or "").strip()
+                    model = str(getattr(meta, "model", "") or "").strip()
+                except Exception:
+                    config = getattr(provider, "provider_config", {}) or {}
+                    provider_id = str(config.get("id") or "").strip()
+                    model = str(config.get("model") or "").strip()
+                if not provider_id or provider_id in seen:
+                    continue
+                seen.add(provider_id)
+                label = provider_id if not model or model == provider_id else f"{provider_id} · {model}"
+                options.append({"value": provider_id, "label": label})
+            configured = str(current or "").strip()
+            if configured and configured not in seen:
+                options.append({
+                    "value": configured,
+                    "label": f"{configured} · 当前不可用",
+                })
+            return options
+
+        @staticmethod
+        def _setting_options(
+            key: str,
+            meta: dict[str, Any] | None = None,
+            current: Any = "",
+        ) -> list[dict[str, str]]:
+            if isinstance(meta, dict) and meta.get("_special") == "select_provider":
+                return Handler._llm_provider_options(current)
             choices = {
                 "memos_mode": [("external", "外部服务"), ("managed", "插件托管")],
                 "inject_order": [("relevance", "相关性"), ("story_time", "事件时间"), ("insert_time", "写入时间")],
@@ -839,12 +1759,21 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
                         "configured": bool(current) if sensitive else True,
                         "sensitive": sensitive,
                         "group": self._setting_group(key),
-                        "options": self._setting_options(key),
+                        "options": self._setting_options(key, meta, current),
                         "min": meta.get("min"),
                         "max": meta.get("max"),
                         "step": meta.get("step"),
                     })
-                presets = [dict({"id": preset_id}, **definition) for preset_id, definition in preset_definitions.items()]
+                presets = [
+                    dict(
+                        {"id": preset_id},
+                        **{
+                            **definition,
+                            "values": _safe_preset_values(definition.get("values")),
+                        },
+                    )
+                    for preset_id, definition in preset_definitions.items()
+                ]
                 self._json_ok({
                     "items": items,
                     "groups": list(setting_groups.keys()),
@@ -922,6 +1851,8 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
                 "emb_provider_id", "rerank_provider_id", "profile_provider_id", "rp_time_timezone",
                 "webui_enable", "webui_host", "webui_port", "enable_auto_reconcile",
                 "reconcile_interval", "profile_auto_update_days", "context_archive_interval_days",
+                "data_backup_enable", "data_backup_interval_days", "data_backup_keep",
+                "data_backup_dir",
             }
             restart_prefixes = ("managed_memos_",)
             restart_required = sorted(
@@ -976,7 +1907,27 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
             if not preset:
                 return self._json_err("未知预设", 400)
             try:
-                result = self._save_settings_values(dict(preset["values"]), f"preset:{preset_id}")
+                result = self._save_settings_values(
+                    _safe_preset_values(preset["values"]),
+                    f"preset:{preset_id}",
+                )
+                result["preset"] = {"id": preset_id, "name": preset["name"]}
+                self._json_ok(result)
+            except ValueError as e:
+                self._json_err(str(e), 400)
+            except Exception as e:
+                self._json_err(str(e))
+
+        def _api_eval_preset(self, body: dict[str, Any]):
+            preset_id = str(body.get("preset") or "").strip()
+            preset = recall_preset_definitions.get(preset_id)
+            if not preset:
+                return self._json_err("未知召回预设", 400)
+            try:
+                result = self._save_settings_values(
+                    _safe_preset_values(preset["values"]),
+                    f"recall_preset:{preset_id}",
+                )
                 result["preset"] = {"id": preset_id, "name": preset["name"]}
                 self._json_ok(result)
             except ValueError as e:
@@ -1012,7 +1963,7 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
                                   MAX(occurred_at) AS occurred_at, MAX(event_ts) AS event_ts,
                                   MAX(time_basis) AS time_basis,
                                   MAX(source_created_ts) AS source_created_ts, MAX(created_ts) AS created_ts,
-                                  MAX(tags) AS tags
+                                  MAX(tags) AS tags, MAX(memory_type) AS memory_type
                            FROM chunks GROUP BY memo_name
                            ORDER BY COALESCE(NULLIF(MAX(event_ts),0), NULLIF(MAX(source_created_ts),0), MAX(created_ts)) DESC
                            LIMIT 10000""")
@@ -1024,14 +1975,18 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
                             "event_ts": float(r["event_ts"] or 0),
                             "source_created_ts": float(r["source_created_ts"] or 0),
                             "time_basis": r["time_basis"] or "unknown",
+                            "memory_type": str(r["memory_type"] or "unknown"),
                         })
                 finally:
                     conn.close()
                 imp_dist = {}
                 month_dist = {}
+                memory_type_dist = {}
                 for it in items:
                     imp = it.get("importance", 3)
                     imp_dist[imp] = imp_dist.get(imp, 0) + 1
+                    memory_type = str(it.get("memory_type") or "unknown")
+                    memory_type_dist[memory_type] = memory_type_dist.get(memory_type, 0) + 1
                     occurred_at = str(it.get("occurred_at") or "")
                     if len(occurred_at) >= 7 and occurred_at[4:5] == "-":
                         m = occurred_at[:7]
@@ -1042,9 +1997,33 @@ def _make_handler(plugin: Any, dashboard_html: str, console_html: str, xinchao_h
                             continue
                         m = time.strftime("%Y-%m", time.localtime(ts))
                         month_dist[m] = month_dist.get(m, 0) + 1
+                episodes = getattr(plugin, "_episodes", None)
+                episode_stats = episodes.stats() if episodes is not None else {}
+                episode_total = int(episode_stats.get("episodes") or 0)
+                recoverable = min(
+                    episode_total, int(episode_stats.get("recoverable_episodes") or 0)
+                )
                 data = {
                     "memories_total": total,
                     "importance_dist": [{"k": str(k), "v": v} for k, v in sorted(imp_dist.items())],
+                    "memory_structure": {
+                        "memory_types": [
+                            {"k": k, "v": v}
+                            for k, v in sorted(
+                                memory_type_dist.items(), key=lambda pair: (-pair[1], pair[0])
+                            )
+                        ],
+                        "evidence_quality": [
+                            {"k": "source_grounded", "v": int(episode_stats.get("source_grounded") or 0)},
+                            {"k": "mixed_user_edited", "v": int(episode_stats.get("mixed_user_edited") or 0)},
+                            {"k": "diary_derived", "v": int(episode_stats.get("diary_derived") or 0)},
+                        ],
+                        "traceability": [
+                            {"k": "recoverable", "v": recoverable},
+                            {"k": "unlinked", "v": max(0, episode_total - recoverable)},
+                        ],
+                        "episodes_total": episode_total,
+                    },
                     "by_month": [{"k": k, "v": v} for k, v in sorted(month_dist.items())],
                     "time_quality": {
                         "exact_or_explicit": sum(1 for x in items if (x.get("event_ts") or x.get("occurred_at")) and x.get("time_basis") in {"explicit", "explicit_dialogue", "conversation_now"}),
@@ -2344,8 +3323,19 @@ class WebUIServer:
                 if (here / "xinchao.html").exists()
                 else "<h1>xinchao.html missing</h1>"
             )
+            production_html = (
+                (here / "production.html").read_text(encoding="utf-8")
+                if (here / "production.html").exists()
+                else "<h1>production.html missing</h1>"
+            )
 
-            handler_cls = _make_handler(self.plugin, dashboard_html, console_html, xinchao_html)
+            handler_cls = _make_handler(
+                self.plugin,
+                dashboard_html,
+                console_html,
+                xinchao_html,
+                production_html,
+            )
             self._server = ThreadingHTTPServer(
                 (self.plugin.webui_host, self.plugin.webui_port),
                 handler_cls,
@@ -2383,208 +3373,6 @@ class WebUIServer:
         return _CONSOLE_HTML_V2.replace("{{VERSION}}", ver)
 
 
-_CONSOLE_HTML = """<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>memos-memory console</title>
-<style>
-:root{color-scheme:dark;--bg:#080c14;--panel:#101725;--panel2:#141f31;--line:#26364d;--line2:#1b283a;--text:#e4edf8;--muted:#8998ad;--blue:#60a5fa;--green:#34d399;--amber:#fbbf24;--red:#fb7185;--violet:#a78bfa;--cyan:#22d3ee;--pink:#f472b6}
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Microsoft YaHei",monospace;background:#080c14;color:var(--text);padding:18px;font-size:12px;letter-spacing:0}
-.shell{max-width:1540px;margin:0 auto}
-.head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:14px}
-.brand{display:flex;align-items:center;gap:10px;margin-bottom:6px}
-h1{font-size:18px;color:#fff;font-weight:780;letter-spacing:0}
-.ver{height:22px;display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:6px;padding:0 8px;color:#b7c5d8;background:#111a2a;font-size:12px}
-.sub{font-size:12px;color:var(--muted);line-height:1.5}
-.top-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
-.top-actions a,.filter-bar button{padding:7px 12px;border:1px solid var(--line);border-radius:7px;background:var(--panel2);color:var(--text);cursor:pointer;font-size:12px;text-decoration:none}
-.top-actions a:hover,.filter-bar button:hover{border-color:#3b82f6;background:#17243a}
-.grid{display:grid;grid-template-columns:1.1fr 1.4fr;gap:12px;margin-bottom:12px}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;box-shadow:0 18px 54px rgba(0,0,0,.22)}
-.panel-title{display:flex;justify-content:space-between;align-items:center;color:#fff;font-size:13px;font-weight:760;margin-bottom:10px}
-.muted{color:var(--muted)}
-.stats{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:8px;margin-bottom:12px}
-.metric{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px 12px;color:var(--muted)}
-.metric span{display:block;font-size:22px;line-height:1.1;margin-top:4px;color:#fff;font-weight:760;font-variant-numeric:tabular-nums}
-.mix{display:grid;gap:8px}
-.mix-row{display:grid;grid-template-columns:96px 1fr 74px;gap:9px;align-items:center}
-.mix-name{color:#c7d2e3}
-.mix-val{color:#fff;text-align:right;font-variant-numeric:tabular-nums}
-.bar{height:9px;background:#0b1220;border:1px solid #1b293d;border-radius:999px;overflow:hidden}
-.fill{height:100%;width:0;background:var(--blue)}
-.fill.current_time{background:#f97316}.fill.semantic_state{background:#22c55e}.fill.profile{background:var(--violet)}.fill.diary{background:var(--amber)}.fill.event_core{background:#fb7185}.fill.evidence{background:#38bdf8}.fill.memory_structure{background:#94a3b8}.fill.time_insight{background:var(--cyan)}.fill.enhancer{background:var(--green)}.fill.context{background:var(--blue)}.fill.other_extra{background:var(--pink)}
-.latest-meta{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px}
-.mini{border:1px solid var(--line2);border-radius:7px;padding:8px;color:var(--muted);background:#0c1421}
-.mini b{display:block;color:#fff;font-size:15px;margin-top:2px;font-variant-numeric:tabular-nums}
-.inject-table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
-.inject-table th,.inject-table td{border-bottom:1px solid var(--line2);padding:7px 6px;text-align:right;white-space:nowrap}
-.inject-table th:first-child,.inject-table td:first-child{text-align:left}
-.inject-table th{color:var(--muted);font-weight:600}
-.inject-table td{color:#d9e5f5}
-.filter-bar{display:flex;gap:7px;margin-bottom:12px;flex-wrap:wrap;align-items:center;background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px}
-.filter-bar button.active{background:#1d4ed8;color:#fff;border-color:#3b82f6}
-#log-list{background:var(--panel);border-radius:8px;border:1px solid var(--line);max-height:calc(100vh - 510px);min-height:220px;overflow-y:auto}
-.log-entry{padding:8px 12px;border-bottom:1px solid var(--line2);display:grid;grid-template-columns:86px 92px 1fr;gap:10px;align-items:flex-start;line-height:1.45}
-.log-entry:hover{background:#111d2f}.log-entry:last-child{border-bottom:none}
-.log-cat{display:inline-block;padding:2px 8px;border-radius:5px;font-size:11px;font-weight:760;min-width:72px;text-align:center;text-transform:uppercase;letter-spacing:.3px}
-.cat-enhancer{background:rgba(52,211,153,.12);color:var(--green);border:1px solid rgba(52,211,153,.26)}
-.cat-compress{background:rgba(96,165,250,.12);color:var(--blue);border:1px solid rgba(96,165,250,.26)}
-.cat-inject{background:rgba(251,191,36,.12);color:var(--amber);border:1px solid rgba(251,191,36,.26)}
-.cat-recall{background:rgba(167,139,250,.12);color:var(--violet);border:1px solid rgba(167,139,250,.26)}
-.cat-sync{background:rgba(244,114,182,.12);color:var(--pink);border:1px solid rgba(244,114,182,.26)}
-.cat-cache{background:rgba(20,184,166,.12);color:#5eead4;border:1px solid rgba(20,184,166,.26)}
-.cat-system{background:rgba(148,163,184,.12);color:#cbd5e1;border:1px solid rgba(148,163,184,.24)}
-.log-time{color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
-.log-msg{word-break:break-word;color:#d9e5f5}
-.log-detail{display:block;color:#93a4bb;font-size:11px;margin-top:4px;white-space:pre-wrap}
-.empty{padding:34px;text-align:center;color:var(--muted)}
-label{color:var(--muted)}input[type=checkbox]{accent-color:#3b82f6}
-@media(max-width:980px){.grid{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}#log-list{max-height:none}.latest-meta{grid-template-columns:1fr}.log-entry{grid-template-columns:1fr;gap:4px}.head{display:block}.top-actions{justify-content:flex-start;margin-top:10px}}
-</style>
-</head>
-<body>
-<div class="shell">
-<div class="head">
-<div>
-<div class="brand"><h1>memos-memory console</h1><span class="ver">v{{VERSION}}</span></div>
-<div class="sub">注入构成、上下文治理、enhancer、检索与同步事件的实时控制台。</div>
-</div>
-<div class="top-actions"><a href="/">WebUI</a><a href="/api/console/stats" target="_blank">Stats API</a></div>
-</div>
-
-<div class="stats">
-<div class="metric">Logs <span id="total">0</span></div>
-<div class="metric">Inject <span id="cnt-inject">0</span></div>
-<div class="metric">Provider Cache <span id="cnt-cache">0</span></div>
-<div class="metric">Enhancer <span id="cnt-enhancer">0</span></div>
-<div class="metric">Compress <span id="cnt-compress">0</span></div>
-<div class="metric">Sync <span id="cnt-sync">0</span></div>
-</div>
-
-<div class="grid">
-<section class="panel">
-<div class="panel-title"><span>Latest Injection Mix</span><span class="muted" id="latest-time">waiting</span></div>
-<div class="mix" id="latest-mix"></div>
-<div class="latest-meta">
-<div class="mini">Total input estimate<b id="latest-total">0</b></div>
-<div class="mini">Memory block<b id="latest-memory">0</b></div>
-<div class="mini">Memo count<b id="latest-count">0</b></div>
-</div>
-</section>
-<section class="panel">
-<div class="panel-title"><span>Recent Injection Samples</span><span class="muted">last 8</span></div>
-<div id="inject-table"></div>
-</section>
-</div>
-
-<div class="filter-bar">
-<button class="active" data-cat="">All</button>
-<button data-cat="enhancer">enhancer</button>
-<button data-cat="compress">compress</button>
-<button data-cat="inject">inject</button>
-<button data-cat="cache">cache</button>
-<button data-cat="recall">recall</button>
-<button data-cat="sync">sync</button>
-<button data-cat="system">system</button>
-<button id="refresh-btn">Refresh</button>
-<label style="display:flex;align-items:center;gap:4px;font-size:12px;margin-left:auto">
-<input type="checkbox" id="auto-refresh" checked> Auto
-</label>
-<button id="clear-btn" style="margin-left:8px">Clear</button>
-</div>
-
-<div id="log-list"><div class="empty">Loading...</div></div>
-</div>
-
-<script>
-var cat="", timer=null;
-var cats={enhancer:"cat-enhancer",compress:"cat-compress",inject:"cat-inject",cache:"cat-cache",recall:"cat-recall",sync:"cat-sync",system:"cat-system"};
-var labels={current_time:"当前时间",semantic_state:"滚动状态",profile:"旧画像",time_insight:"时间洞察",diary:"日记视角",event_core:"事件核心",evidence:"原文证据",memory_structure:"记忆结构",enhancer:"Enhancer",cache:"Provider缓存",context:"Astr上下文",other_extra:"其他注入",compress:"compress",inject:"inject",recall:"recall",sync:"sync",system:"system"};
-var mixKeys=["current_time","semantic_state","profile","time_insight","diary","event_core","evidence","memory_structure","enhancer","context","other_extra"];
-
-function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){if(c==="&")return "&amp;";if(c==="<")return "&lt;";if(c===">")return "&gt;";if(c==='"')return "&quot;";return "&#39;";});}
-function n(v){v=Number(v||0);return v.toLocaleString("zh-CN");}
-function pct(v,t){return t>0?Math.round((Number(v||0)*1000)/t)/10:0;}
-
-function setCat(c,btn){
-  cat=c;
-  document.querySelectorAll(".filter-bar button[data-cat]").forEach(function(b){b.classList.remove("active");});
-  if(btn)btn.classList.add("active");
-  fetchAll();
-}
-
-async function fetchAll(){await Promise.all([fetchLogs(),fetchStats()]);}
-
-async function fetchStats(){
-  try{
-    var r=await fetch("/api/console/stats");var d=await r.json();if(!d.ok)return;
-    var data=d.data||{}, latest=data.latest||{}, comp=latest.composition||{};
-    var total=Number(latest.total_est_chars||0);
-    document.getElementById("latest-time").textContent=latest.ts_iso||"waiting";
-    document.getElementById("latest-total").textContent=n(total)+" 字";
-    document.getElementById("latest-memory").textContent=n(latest.chars||0)+" 字";
-    document.getElementById("latest-count").textContent=n(latest.count||0);
-    var mix=document.getElementById("latest-mix");
-    if(!total){mix.innerHTML="<div class='empty'>还没有注入样本。对话触发一次召回后这里会显示占比。</div>";}
-    else{
-      mix.innerHTML=mixKeys.map(function(k){
-        var val=Number(comp[k]||0), p=pct(val,total);
-        return "<div class='mix-row'><div class='mix-name'>"+labels[k]+"</div><div class='bar'><div class='fill "+k+"' style='width:"+p+"%'></div></div><div class='mix-val'>"+n(val)+" / "+p+"%</div></div>";
-      }).join("");
-    }
-    var rows=(data.rows||[]).slice(-8).reverse();
-    var tbl=document.getElementById("inject-table");
-    if(!rows.length){tbl.innerHTML="<div class='empty'>No injection samples yet.</div>";}
-    else{
-      tbl.innerHTML="<table class='inject-table'><thead><tr><th>time</th><th>total</th><th>now</th><th>ctx</th><th>story</th><th>state</th><th>evidence</th><th>profile</th><th>enh</th><th>other</th><th>soft target</th></tr></thead><tbody>"
-        +rows.map(function(x){
-          var c=x.composition||{};
-          var b=x.injection_budget||{};
-          var budgetCell="-";
-          if(b.budget){budgetCell=n(b.before)+"→"+n(b.after)+" / 目标 "+n(b.budget);if((b.demoted||0)+(b.compacted||0)>0){budgetCell+=" (降"+n(b.demoted||0)+"/缩"+n(b.compacted||0)+")";}if((b.overflow_chars||0)>0){budgetCell+=" · 超 "+n(b.overflow_chars);}}
-          return "<tr><td>"+esc(x.ts_iso||"")+"</td><td>"+n(x.total_est_chars)+"</td><td>"+n(c.current_time)+"</td><td>"+n(c.context)+"</td><td>"+n(c.diary)+"</td><td>"+n(c.semantic_state)+"</td><td>"+n(c.evidence)+"</td><td>"+n(c.profile)+"</td><td>"+n(c.enhancer)+"</td><td>"+n(c.other_extra)+"</td><td>"+budgetCell+"</td></tr>";
-        }).join("")+"</tbody></table>";
-    }
-  }catch(e){}
-}
-
-async function fetchLogs(){
-  try{
-    var url=cat?"/api/logs?limit=300&category="+encodeURIComponent(cat):"/api/logs?limit=300";
-    var r=await fetch(url);var d=await r.json();if(!d.ok)return;
-    var logs=d.data.logs||[], counts=d.data.counts||{};
-    document.getElementById("total").textContent=n(d.data.total||0);
-    document.getElementById("cnt-enhancer").textContent=n(counts.enhancer||0);
-    document.getElementById("cnt-compress").textContent=n(counts.compress||0);
-    document.getElementById("cnt-inject").textContent=n(counts.inject||0);
-    document.getElementById("cnt-cache").textContent=n(counts.cache||0);
-    document.getElementById("cnt-sync").textContent=n(counts.sync||0);
-    var el=document.getElementById("log-list");
-    if(!logs.length){el.innerHTML="<div class='empty'>No logs yet. Logs appear after conversations.</div>";return;}
-    el.innerHTML=logs.map(function(l){
-      var detail=l.detail&&Object.keys(l.detail).length?" <span class='log-detail'>"+esc(JSON.stringify(l.detail))+"</span>":"";
-      return "<div class='log-entry'><span class='log-time'>"+esc(l.ts_iso||"")+"</span><span class='log-cat "+(cats[l.category]||"cat-system")+"'>"+esc(l.category||"system")+"</span><span class='log-msg'>"+esc(l.message||"")+detail+"</span></div>";
-    }).join("");
-  }catch(e){document.getElementById("log-list").innerHTML="<div class='empty'>Load failed: "+esc(e.message)+"</div>";}
-}
-
-async function clearLogs(){await fetch("/api/logs?clear=1");fetchAll();}
-function toggleAuto(){if(document.getElementById("auto-refresh").checked){timer=setInterval(fetchAll,3000);}else if(timer){clearInterval(timer);timer=null;}}
-
-document.querySelectorAll(".filter-bar button[data-cat]").forEach(function(btn){btn.addEventListener("click",function(){setCat(btn.dataset.cat,btn);});});
-document.getElementById("refresh-btn").addEventListener("click",fetchAll);
-document.getElementById("clear-btn").addEventListener("click",clearLogs);
-document.getElementById("auto-refresh").addEventListener("change",toggleAuto);
-toggleAuto();
-fetchAll();
-</script>
-</body>
-</html>"""
-
-
 _CONSOLE_HTML_V2 = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -2602,7 +3390,7 @@ body{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Microsoft YaHei",mo
 .mini-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px}.mini{border:1px solid var(--line2);border-radius:7px;padding:8px;color:var(--muted);background:#0c1421}.mini b{display:block;color:#fff;font-size:15px;margin-top:2px;font-variant-numeric:tabular-nums}.state-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.state{border:1px solid var(--line2);border-radius:8px;background:#0c1421;padding:9px}.state strong{display:flex;align-items:center;justify-content:space-between;color:#fff;margin-bottom:6px}.dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:#64748b}.dot.on{background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.14)}.dot.off{background:#ef4444;box-shadow:0 0 0 3px rgba(239,68,68,.12)}.state pre{white-space:pre-wrap;color:#aebcd0;font-size:11px;line-height:1.45}
 .inject-table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}.inject-table th,.inject-table td{border-bottom:1px solid var(--line2);padding:7px 6px;text-align:right;white-space:nowrap}.inject-table th:first-child,.inject-table td:first-child{text-align:left}.inject-table th{color:var(--muted);font-weight:600}.inject-table td{color:#d9e5f5}
 .filter-bar{display:flex;gap:7px;margin-bottom:12px;flex-wrap:wrap;align-items:center;background:rgba(15,23,37,.72);border:1px solid var(--line);border-radius:10px;padding:10px}.filter-bar button.active{background:#1d4ed8;color:#fff;border-color:#3b82f6}label{color:var(--muted)}input[type=checkbox]{accent-color:#3b82f6}
-#log-list{background:rgba(15,23,37,.86);border-radius:10px;border:1px solid var(--line);max-height:calc(100vh - 610px);min-height:260px;overflow-y:auto;box-shadow:0 24px 80px rgba(0,0,0,.25)}.log-entry{padding:8px 12px;border-bottom:1px solid var(--line2);display:grid;grid-template-columns:86px 92px 1fr;gap:10px;align-items:flex-start;line-height:1.45}.log-entry:hover{background:#111d2f}.log-entry:last-child{border-bottom:none}.log-cat{display:inline-block;padding:2px 8px;border-radius:5px;font-size:11px;font-weight:760;min-width:72px;text-align:center;text-transform:uppercase;letter-spacing:.3px}.cat-xinchao{background:rgba(232,121,249,.12);color:#f0abfc;border:1px solid rgba(232,121,249,.26)}.cat-enhancer{background:rgba(52,211,153,.12);color:var(--green);border:1px solid rgba(52,211,153,.26)}.cat-compress{background:rgba(96,165,250,.12);color:var(--blue);border:1px solid rgba(96,165,250,.26)}.cat-inject{background:rgba(251,191,36,.12);color:var(--amber);border:1px solid rgba(251,191,36,.26)}.cat-recall{background:rgba(167,139,250,.12);color:var(--violet);border:1px solid rgba(167,139,250,.26)}.cat-sync{background:rgba(244,114,182,.12);color:var(--pink);border:1px solid rgba(244,114,182,.26)}.cat-cache{background:rgba(20,184,166,.12);color:#5eead4;border:1px solid rgba(20,184,166,.26)}.cat-system{background:rgba(148,163,184,.12);color:#cbd5e1;border:1px solid rgba(148,163,184,.24)}.log-time{color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}.log-msg{word-break:break-word;color:#d9e5f5}.log-detail{display:block;color:#93a4bb;font-size:11px;margin-top:4px;white-space:pre-wrap}.empty{padding:34px;text-align:center;color:var(--muted)}
+#log-list{background:rgba(15,23,37,.86);border-radius:10px;border:1px solid var(--line);max-height:calc(100vh - 610px);min-height:260px;overflow-y:auto;box-shadow:0 24px 80px rgba(0,0,0,.25)}.log-entry{padding:8px 12px;border-bottom:1px solid var(--line2);display:grid;grid-template-columns:86px 92px 1fr;gap:10px;align-items:flex-start;line-height:1.45}.log-entry:hover{background:#111d2f}.log-entry:last-child{border-bottom:none}.log-cat{display:inline-block;padding:2px 8px;border-radius:5px;font-size:11px;font-weight:760;min-width:72px;text-align:center;text-transform:uppercase;letter-spacing:.3px}.cat-xinchao{background:rgba(232,121,249,.12);color:#f0abfc;border:1px solid rgba(232,121,249,.26)}.cat-enhancer{background:rgba(52,211,153,.12);color:var(--green);border:1px solid rgba(52,211,153,.26)}.cat-compress{background:rgba(96,165,250,.12);color:var(--blue);border:1px solid rgba(96,165,250,.26)}.cat-inject{background:rgba(251,191,36,.12);color:var(--amber);border:1px solid rgba(251,191,36,.26)}.cat-recall{background:rgba(167,139,250,.12);color:var(--violet);border:1px solid rgba(167,139,250,.26)}.cat-sync{background:rgba(244,114,182,.12);color:var(--pink);border:1px solid rgba(244,114,182,.26)}.cat-cache{background:rgba(20,184,166,.12);color:#5eead4;border:1px solid rgba(20,184,166,.26)}.cat-system{background:rgba(148,163,184,.12);color:#cbd5e1;border:1px solid rgba(148,163,184,.24)}.log-time{color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}.log-msg{word-break:break-word;color:#d9e5f5}.log-detail{display:block;color:#93a4bb;font-size:11px;margin-top:4px;white-space:pre-wrap}.empty{padding:34px;text-align:center;color:var(--muted)}.ctx-used{display:inline-block;margin-left:8px;padding:1px 7px;border-radius:5px;font-size:11px;font-weight:760}.ctx-used.yes{background:rgba(52,211,153,.13);color:#34d399;border:1px solid rgba(52,211,153,.3)}.ctx-used.no{background:rgba(248,113,113,.13);color:#f87171;border:1px solid rgba(248,113,113,.3)}.ctx-used.wait{background:rgba(251,191,36,.12);color:#fbbf24;border:1px solid rgba(251,191,36,.3)}
 @media(max-width:980px){.head{display:block}.top-actions{justify-content:flex-start;margin-top:10px}.stats{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}.mini-grid,.state-grid{grid-template-columns:1fr}.log-entry{grid-template-columns:1fr;gap:4px}#log-list{max-height:none}}
 </style>
 </head>
@@ -2680,7 +3468,7 @@ async function fetchAll(){await Promise.all([fetchStats(),fetchLogs()])}
 function renderMix(latest,totals){var comp=latest.composition||{},total=Number(latest.total_est_chars||0),label=latest.ts_iso||"waiting";if(latest.outcome)label+=" · "+latest.outcome;if(!total&&totals){comp=totals;total=mixKeys.reduce(function(s,k){return s+Number(comp[k]||0)},0);label=total?"累计样本":"waiting"}document.getElementById("latest-time").textContent=label;document.getElementById("latest-total").textContent=n(total)+" 字";document.getElementById("latest-memory").textContent=n(latest.chars||comp.diary||0)+" 字";document.getElementById("latest-count").textContent=n(latest.count||0);document.getElementById("latest-mix").innerHTML=total?mixKeys.map(function(k){var v=Number(comp[k]||0),p=pct(v,total);return"<div class='mix-row'><div class='mix-name'>"+labels[k]+"</div><div class='bar'><div class='fill "+k+"' style='width:"+p+"%'></div></div><div class='mix-val'>"+n(v)+" / "+p+"%</div></div>"}).join(""):"<div class='empty'>还没有请求样本。任意一次真实 LLM 对话后这里都会出现。</div>"}
 function renderStates(data){var f=data.features||{},rt=data.latest_runtime||{};var defs=[["xinchao","Xinchao",f.xinchao,rt.xinchao],["enhancer","RP enhancer",f.enhancer,rt.enhancer],["provider_cache","Provider cache",f.provider_cache,rt.provider_cache],["system_cache_guard","System guard",f.system_cache_guard,rt.system_cache_guard],["prefix_drift","Prefix drift",f.prefix_drift,rt.prefix_drift],["context","Context trim",f.context,rt.context],["archive","Context archive",f.archive,{}],["profile","Profile",f.profile,{}],["time_insight","Time insight",f.time_insight,{}]];document.getElementById("state-grid").innerHTML=defs.map(function(x){return"<div class='state'><strong>"+esc(x[1])+"<i class='dot "+(x[2]?"on":"off")+"'></i></strong><pre>"+esc(Object.keys(x[3]||{}).length?pretty(x[3]):(x[2]?"已启用，等待运行样本":"未启用"))+"</pre></div>"}).join("")}
 async function fetchStats(){try{var data=await fetchJson("/api/console/stats");renderMix(data.latest||{},data.totals||{});renderStates(data);var rows=(data.rows||[]).slice(-10).reverse();var tbl=document.getElementById("inject-table");if(!rows.length){tbl.innerHTML="<div class='empty'>还没有请求样本。任意一次真实 LLM 对话后这里都会出现。</div>"}else{tbl.innerHTML="<table class='inject-table'><thead><tr><th>time</th><th>result</th><th>total</th><th>now</th><th>ctx</th><th>story</th><th>state</th><th>evidence</th><th>profile</th><th>mind</th><th>enh</th><th>other</th></tr></thead><tbody>"+rows.map(function(x){var c=x.composition||{};return"<tr><td>"+esc(x.ts_iso||"")+"</td><td>"+esc(x.outcome||"legacy")+"</td><td>"+n(x.total_est_chars)+"</td><td>"+n(c.current_time)+"</td><td>"+n(c.context)+"</td><td>"+n(c.diary)+"</td><td>"+n(c.semantic_state)+"</td><td>"+n(c.evidence)+"</td><td>"+n(c.profile)+"</td><td>"+n(c.xinchao)+"</td><td>"+n(c.enhancer)+"</td><td>"+n(c.other_extra)+"</td></tr>"}).join("")+"</tbody></table>"}}catch(e){document.getElementById("latest-mix").innerHTML="<div class='empty'>Stats API failed: "+esc(e.message)+"</div>";document.getElementById("inject-table").innerHTML="<div class='empty'>无法读取 /api/console/stats："+esc(e.message)+"</div>"}}
-async function fetchLogs(){try{var data=await fetchJson(cat?"/api/logs?limit=300&category="+encodeURIComponent(cat):"/api/logs?limit=300");var counts=data.counts||{};document.getElementById("total").textContent=n(data.total||0);["xinchao","inject","recall","cache","enhancer","compress","sync"].forEach(function(k){var el=document.getElementById("cnt-"+k);if(el)el.textContent=n(counts[k]||0)});var logs=data.logs||[],el=document.getElementById("log-list");if(!logs.length){el.innerHTML="<div class='empty'>当前分类没有日志。只有实际触发过对应流程才会出现。</div>";return}el.innerHTML=logs.map(function(l){var detail=l.detail&&Object.keys(l.detail).length?"<span class='log-detail'>"+esc(JSON.stringify(l.detail))+"</span>":"";return"<div class='log-entry'><span class='log-time'>"+esc(l.ts_iso||"")+"</span><span class='log-cat "+(cats[l.category]||"cat-system")+"'>"+esc(l.category||"system")+"</span><span class='log-msg'>"+esc(l.message||"")+detail+"</span></div>"}).join("")}catch(e){document.getElementById("log-list").innerHTML="<div class='empty'>Load failed: "+esc(e.message)+"</div>"}}
+async function fetchLogs(){try{var data=await fetchJson(cat?"/api/logs?limit=300&category="+encodeURIComponent(cat):"/api/logs?limit=300");var counts=data.counts||{};document.getElementById("total").textContent=n(data.total||0);["xinchao","inject","recall","cache","enhancer","compress","sync"].forEach(function(k){var el=document.getElementById("cnt-"+k);if(el)el.textContent=n(counts[k]||0)});var logs=data.logs||[],el=document.getElementById("log-list");if(!logs.length){el.innerHTML="<div class='empty'>当前分类没有日志。只有实际触发过对应流程才会出现。</div>";return}el.innerHTML=logs.map(function(l){var detail=l.detail&&Object.keys(l.detail).length?"<span class='log-detail'>"+esc(JSON.stringify(l.detail))+"</span>":"",badge="",d=l.detail||{};if(l.category==="recall"&&d.context_ready&&Number(d.context_query_parts||0)>0){var reason=d.context_used_reason?"原因: "+String(d.context_used_reason):"上下文查询片段: "+Number(d.context_query_parts||0);if(d.context_used===true)badge="<span class='ctx-used yes' title='"+esc(reason)+"'>已用上文</span>";else if(d.context_used===false)badge="<span class='ctx-used no' title='"+esc(reason)+"'>未用上文</span>";else badge="<span class='ctx-used wait' title='"+esc(reason)+"'>判定中</span>"}return"<div class='log-entry'><span class='log-time'>"+esc(l.ts_iso||"")+"</span><span class='log-cat "+(cats[l.category]||"cat-system")+"'>"+esc(l.category||"system")+"</span><span class='log-msg'>"+esc(l.message||"")+badge+detail+"</span></div>"}).join("")}catch(e){document.getElementById("log-list").innerHTML="<div class='empty'>Load failed: "+esc(e.message)+"</div>"}}
 function setCat(c,btn){cat=c;document.querySelectorAll(".filter-bar button[data-cat]").forEach(function(b){b.classList.toggle("active",b===btn)});fetchAll()}
 async function clearLogs(){await fetch("/api/logs?clear=1");fetchAll()}
 function toggleAuto(){if(document.getElementById("auto-refresh").checked){if(!timer)timer=setInterval(fetchAll,3000)}else if(timer){clearInterval(timer);timer=null}}

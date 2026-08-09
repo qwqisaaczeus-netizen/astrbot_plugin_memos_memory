@@ -44,7 +44,11 @@ from astrbot_plugin_memos_memory.xinchao_engine import (
     tick_thought_pool,
 )
 from astrbot_plugin_memos_memory.xinchao_store import StateStore
-from astrbot_plugin_memos_memory.webui import WebUIServer
+from astrbot_plugin_memos_memory.webui import (
+    WebUIServer,
+    _is_preset_protected_setting,
+    _safe_preset_values,
+)
 
 
 class FakeContext:
@@ -1003,6 +1007,184 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["lastPerception"]["diagnostics"]["reason"], "provider_missing")
         self.assertEqual(live_provider.calls, 0)
 
+    async def test_burst_turns_coalesce_into_one_background_call(self):
+        await self.controller.terminate()
+        provider = FakeProvider([
+            '{"satisfiedDrives":["social"],"satisfactionLevels":{"social":0.3},'
+            '"activatedDrives":[],"activationLevels":{},'
+            '"driveDeltas":{},"flashThoughts":[],"summary":"连续闲聊",'
+            '"confidence":0.9}'
+        ] * 6, delay=0.02)
+        self.plugin = FakePlugin(ProviderContext(provider))
+        self.controller = XinchaoController(self.plugin, Path(self.temp.name))
+        await self.controller.initialize()
+        self.controller.settings["perception_mode"] = "llm"
+        for index in range(4):
+            event = FakeEvent(f"第{index + 1}句话")
+            response = SimpleNamespace(is_chunk=False, completion_text=f"回应{index + 1}")
+            await self.controller.on_response(event, response)
+        for _ in range(80):
+            if not self.controller._pending_turns.get("character:测试角色"):
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        self.assertLess(provider.calls, 4)
+        status = await self.controller.status("character:测试角色")
+        self.assertIsNotNone(status["lastPerception"])
+        self.assertGreaterEqual(status["lastPerception"]["mergedTurns"], 1)
+        self.assertEqual(status["perceptionQueue"]["pending"], 0)
+
+    async def test_non_coalesced_mode_keeps_every_turn(self):
+        """4.5.3-beta: 关闭合并时严格 FIFO 逐条结算，不丢消息（修复 4.5.2 静默清队）。"""
+        await self.controller.terminate()
+        provider = FakeProvider([
+            '{"satisfiedDrives":[],"satisfactionLevels":{},'
+            '"activatedDrives":["social"],"activationLevels":{"social":0.4},'
+            '"driveDeltas":{},"flashThoughts":[],"summary":"逐条",'
+            '"confidence":0.9}'
+        ] * 3, delay=0.01)
+        self.plugin = FakePlugin(ProviderContext(provider))
+        self.controller = XinchaoController(self.plugin, Path(self.temp.name))
+        await self.controller.initialize()
+        self.controller.settings["perception_mode"] = "llm"
+        self.controller.settings["post_perception_coalesce_enable"] = False
+        key = "character:测试角色"
+        for index in range(3):
+            self.controller._enqueue_perception(
+                key, "default:friend", f"第{index + 1}句", f"回应{index + 1}", None,
+            )
+        for _ in range(150):
+            if not self.controller._pending_turns.get(key):
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        self.assertEqual(provider.calls, 3)
+        self.assertEqual(self.controller._pending_turns.get(key), [])
+
+    async def test_worker_slot_released_before_task_done(self):
+        """4.5.3-beta: worker 退出后槽位立即释放，新消息立即拉起新 worker（修复 4.5.2 滞留竞态）。"""
+        await self.controller.terminate()
+        provider = FakeProvider([
+            '{"satisfiedDrives":[],"satisfactionLevels":{},'
+            '"activatedDrives":["social"],"activationLevels":{"social":0.4},'
+            '"driveDeltas":{},"flashThoughts":[],"summary":"连续",'
+            '"confidence":0.9}'
+        ] * 3, delay=0.01)
+        self.plugin = FakePlugin(ProviderContext(provider))
+        self.controller = XinchaoController(self.plugin, Path(self.temp.name))
+        await self.controller.initialize()
+        self.controller.settings["perception_mode"] = "llm"
+        key = "character:测试角色"
+        response = SimpleNamespace(is_chunk=False, completion_text="回应")
+        await self.controller.on_response(FakeEvent("第一句"), response)
+        for _ in range(150):
+            if not self.controller._pending_turns.get(key) and not self.controller._perception_workers.get(key):
+                break
+            await asyncio.sleep(0.01)
+        self.assertNotIn(key, self.controller._perception_workers)
+        await self.controller.on_response(FakeEvent("第二句"), response)
+        self.assertIn(key, self.controller._perception_workers)
+        for _ in range(150):
+            if not self.controller._pending_turns.get(key):
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(self.controller._pending_turns.get(key), [])
+
+    async def test_coalesced_batch_prompt_carries_every_merged_turn(self):
+        await self.controller.terminate()
+        provider = FakeProvider([
+            '{"satisfiedDrives":[],"satisfactionLevels":{},'
+            '"activatedDrives":["social"],"activationLevels":{"social":0.4},'
+            '"driveDeltas":{},"flashThoughts":[],"summary":"连续互动",'
+            '"confidence":0.9}'
+        ])
+        self.plugin = FakePlugin(ProviderContext(provider))
+        self.controller = XinchaoController(self.plugin, Path(self.temp.name))
+        await self.controller.initialize()
+        parsed = await self.controller._llm_perception(
+            "default:friend",
+            ["第一句", "第二句"],
+            ["第一答", "第二答"],
+        )
+        prompt = provider.requests[0]["prompt"]
+        self.assertEqual(parsed["activatedDrives"], ["social"])
+        for fragment in ("第一句", "第二句", "第一答", "第二答"):
+            self.assertIn(fragment, prompt)
+        self.assertIn("2 轮对话", prompt)
+
+    async def test_open_post_circuit_skips_prompt_construction(self):
+        await self.controller.terminate()
+        provider = FakeProvider([RuntimeError("post down")] * 12)
+        self.plugin = FakePlugin(ProviderContext(provider))
+        self.controller = XinchaoController(self.plugin, Path(self.temp.name))
+        await self.controller.initialize()
+        self.controller.settings["perception_mode"] = "llm"
+        for _ in range(3):
+            await self.controller._perceive_and_apply(
+                "character:测试角色", "default:friend", "晚上好。", "晚上好，我在这里。",
+            )
+        calls_after_open = provider.calls
+        await self.controller._perceive_and_apply(
+            "character:测试角色", "default:friend", "晚上好。", "晚上好，我在这里。",
+        )
+        status = await self.controller.status("character:测试角色")
+        self.assertEqual(provider.calls, calls_after_open)
+        self.assertEqual(status["lastPerception"]["diagnostics"]["reason"], "circuit_open")
+        self.assertEqual(status["perceptionHealthByStage"]["post"]["state"], "circuit_open")
+
+    async def test_repeated_circuit_trips_extend_the_cooldown(self):
+        await self.controller.terminate()
+        provider = FakeProvider([RuntimeError("down")] * 30)
+        self.plugin = FakePlugin(ProviderContext(provider))
+        self.controller = XinchaoController(self.plugin, Path(self.temp.name))
+        await self.controller.initialize()
+        for _ in range(3):
+            self.controller._mark_perception_failure(provider, "post", "error", "down")
+        first = self.controller._perception_health["post"]["circuit_backoff_seconds"]
+        self.controller._mark_perception_failure(provider, "post", "error", "down")
+        second = self.controller._perception_health["post"]["circuit_backoff_seconds"]
+        self.assertEqual(second, first * 2)
+        self.controller._mark_perception_success(provider, "post")
+        self.assertEqual(
+            self.controller._perception_health["post"]["circuit_backoff_seconds"], 0.0,
+        )
+
+    async def test_concurrent_settles_do_not_double_fire_generators(self):
+        key = "character:测试角色"
+        runs = 0
+
+        async def fake_generators(scope, state):
+            nonlocal runs
+            runs += 1
+            await asyncio.sleep(0.05)
+            return state
+
+        self.controller._run_generators = fake_generators
+        await asyncio.gather(
+            self.controller._settle_one(key, allow_generators=True),
+            self.controller._settle_one(key, allow_generators=True),
+        )
+        self.assertEqual(runs, 1)
+
+    async def test_generator_flag_cleared_when_generator_raises(self):
+        """4.5.3-beta: 生成器异常时运行标志必须清除，后续结算不受影响。"""
+        key = "character:测试角色"
+
+        async def broken_generators(scope, state):
+            raise RuntimeError("boom")
+
+        self.controller._run_generators = broken_generators
+        with self.assertRaises(RuntimeError):
+            await self.controller._settle_one(key, allow_generators=True)
+        self.assertNotIn(key, self.controller._generator_running)
+
+        async def ok_generators(scope, state):
+            return state
+
+        self.controller._run_generators = ok_generators
+        await self.controller._settle_one(key, allow_generators=True)
+        self.assertNotIn(key, self.controller._generator_running)
+
     async def test_llm_perception_keeps_deterministic_event_evidence(self):
         await self.controller.terminate()
         provider = FakeProvider([
@@ -1027,6 +1209,78 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(event["driveDeltas"]["grieve"], 0)
         self.assertGreater(event["satisfactionLevels"]["social"], 0)
         self.assertTrue(event["flashThoughts"])
+
+    def test_two_stage_reconciliation_resolves_or_carries_live_activation_once(self):
+        live = {
+            "activatedDrives": ["social", "monitor"],
+            "activationLevels": {"social": 0.70, "monitor": 0.60},
+        }
+        event, diagnostics = self.controller._reconcile_two_stage_event(
+            {
+                "satisfactionLevels": {"social": 0.65},
+                "activatedDrives": ["social", "monitor"],
+                "activationLevels": {"social": 0.70, "monitor": 0.60},
+            },
+            live,
+            declared_activations=set(),
+        )
+        self.assertNotIn("social", event["activatedDrives"])
+        self.assertIn("monitor", event["activatedDrives"])
+        self.assertEqual(diagnostics["resolved"], ["social"])
+        self.assertEqual(diagnostics["carried"], ["monitor"])
+        self.assertAlmostEqual(event["activationLevels"]["monitor"], 0.468)
+
+    async def test_two_channels_share_time_state_and_live_evidence(self):
+        await self.controller.terminate()
+        provider = FakeProvider([
+            '{"activatedDrives":["monitor"],"activationLevels":{"monitor":0.7},'
+            '"driveDeltas":{},"flashThoughts":[],"guidance":"先观察",'
+            '"confidence":0.9}',
+            '{"satisfiedDrives":[],"satisfactionLevels":{},'
+            '"activatedDrives":["monitor"],"activationLevels":{"monitor":0.5},'
+            '"driveDeltas":{},"flashThoughts":[],"summary":"仍在关注",'
+            '"confidence":0.9}',
+        ])
+        self.plugin = FakePlugin(ProviderContext(provider))
+        self.plugin.rp_time_timezone = "Asia/Shanghai"
+        self.plugin._semantic_state_status = lambda: {
+            "state": {"rendered_text": "关系位置：愿意直接确认彼此状态。"},
+        }
+        self.controller = XinchaoController(self.plugin, Path(self.temp.name))
+        await self.controller.initialize()
+        self.controller.settings["perception_mode"] = "llm"
+        now = datetime(2026, 8, 9, 3, 4, 5, tzinfo=timezone.utc)
+        live = await self.controller._appraise_current_input(
+            "default:friend", "你怎么突然不说话了？", now=now,
+        )
+        await self.controller._perceive_and_apply(
+            "character:测试角色", "default:friend",
+            "你怎么突然不说话了？", "我在，只是在认真听你说。",
+            live_appraisal=live,
+        )
+        self.assertIn("2026-08-09 11:04:05", provider.requests[0]["prompt"])
+        self.assertIn("当前滚动人格状态", provider.requests[0]["prompt"])
+        self.assertIn("回答前即时评估", provider.requests[1]["prompt"])
+        self.assertIn('"monitor"', provider.requests[1]["prompt"])
+        status = await self.controller.status("character:测试角色")
+        self.assertTrue(status["lastPerception"]["diagnostics"]["two_stage"]["available"])
+
+    async def test_partial_post_json_is_retried_instead_of_silently_accepted(self):
+        await self.controller.terminate()
+        provider = FakeProvider([
+            '{"activatedDrives":["social"],"confidence":0.9}',
+            '{"satisfiedDrives":[],"satisfactionLevels":{},'
+            '"activatedDrives":["social"],"activationLevels":{"social":0.4},'
+            '"driveDeltas":{},"confidence":0.9}',
+        ])
+        self.plugin = FakePlugin(ProviderContext(provider))
+        self.controller = XinchaoController(self.plugin, Path(self.temp.name))
+        await self.controller.initialize()
+        parsed = await self.controller._llm_perception(
+            "default:friend", "晚上好。", "晚上好，我在。",
+        )
+        self.assertEqual(provider.calls, 2)
+        self.assertEqual(parsed["_llm_meta"]["attempts"], 2)
 
     async def test_cross_type_duplicate_is_regenerated_once(self):
         await self.controller.terminate()
@@ -1426,13 +1680,51 @@ class MainHookIntegrationTests(unittest.IsolatedAsyncioTestCase):
 class WebUIRouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_xinchao_page_and_settings_api_are_live(self):
         with tempfile.TemporaryDirectory() as temp:
+            chat_provider = FakeProvider(
+                provider_id="chat_main",
+                model="deepseek-v4-pro",
+            )
+            protected_values = {
+                "character_name": "手填角色名",
+                "memos_base_url": "http://127.0.0.1:18082",
+                "memos_mode": "external",
+                "memos_token": "manual-token",
+                "managed_memos_dir": str(Path(temp) / "managed-root"),
+                "managed_memos_exe": str(Path(temp) / "managed-root" / "memos.exe"),
+                "managed_memos_data_dir": str(Path(temp) / "managed-data"),
+                "managed_memos_host": "127.0.0.2",
+                "managed_memos_port": 18083,
+                "managed_memos_port_start": 18100,
+                "vec_db_path": str(Path(temp) / "memories.db"),
+                "episodic_db_path": str(Path(temp) / "episodic.db"),
+                "data_backup_dir": str(Path(temp) / "data_backups"),
+                "context_archive_backup_dir": str(Path(temp) / "context_backups"),
+                "webui_host": "127.0.0.1",
+                "webui_port": 0,
+                "emb_provider_id": "emb_manual",
+                "compress_provider_id": "chat_main",
+                "query_plan_llm_provider_id": "planner_manual",
+                "episode_extraction_provider_id": "episode_manual",
+                "diary_render_provider_id": "diary_manual",
+                "semantic_state_provider_id": "state_manual",
+                "time_insight_llm_provider_id": "insight_manual",
+                "profile_provider_id": "profile_manual",
+                "rerank_provider_id": "rerank_manual",
+                "rp_time_timezone": "Asia/Shanghai",
+                "imp_tier5_keywords": "手填五级词",
+                "imp_tier4_keywords": "手填四级词",
+                "imp_tier3_keywords": "手填三级词",
+                "imp_low_keywords": "手填低级词",
+            }
+            self.assertEqual(
+                _safe_preset_values({**protected_values, "lean_recall_candidate_k": 64}),
+                {"lean_recall_candidate_k": 64},
+            )
             plugin = MemosMemoryPlugin(
-                FakeContext(),
+                ProviderContext(chat_provider),
                 SavableConfig({
-                    "vec_db_path": str(Path(temp) / "memories.db"),
+                    **protected_values,
                     "webui_enable": True,
-                    "webui_host": "127.0.0.1",
-                    "webui_port": 0,
                     "enable_auto_compress": False,
                 }),
             )
@@ -1498,6 +1790,8 @@ class WebUIRouteTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("跟随当前会话模型", html)
                 self.assertIn("live_perception_provider_id", html)
                 self.assertIn("post_perception_timeout_seconds", html)
+                self.assertIn("post_perception_coalesce_enable", html)
+                self.assertIn("post_perception_max_batch_turns", html)
                 self.assertIn('data-tab="time-insight"', html)
                 self.assertIn("time_insight_repeat_cooldown_minutes", html)
                 overview = await asyncio.to_thread(
@@ -1506,8 +1800,9 @@ class WebUIRouteTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
                 self.assertTrue(overview["ok"])
-                self.assertEqual(overview["data"]["version"], "4.5.4")
+                self.assertEqual(overview["data"]["version"], "4.6.2")
                 self.assertIn("providerOptions", overview["data"])
+                self.assertEqual(overview["data"]["providerOptions"][0]["id"], "chat_main")
                 insight = await asyncio.to_thread(
                     lambda: json.loads(
                         urllib.request.urlopen(base + "/api/time-insight/settings", timeout=3).read().decode("utf-8")
@@ -1515,6 +1810,7 @@ class WebUIRouteTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertTrue(insight["ok"])
                 self.assertIn("time_insight_query_min_score", insight["data"]["settings"])
+                self.assertEqual(insight["data"]["providerOptions"][0]["id"], "chat_main")
                 save_payload = json.dumps({
                     "settings": {"time_insight_repeat_cooldown_minutes": 240}
                 }).encode("utf-8")
@@ -1547,6 +1843,9 @@ class WebUIRouteTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn('data-tab="context"', dashboard)
                 self.assertIn('data-tab="settings"', dashboard)
                 self.assertIn('data-tab="debug"', dashboard)
+                self.assertIn('data-tab="backups"', dashboard)
+                self.assertIn("备份管理", dashboard)
+                self.assertIn("下次重载恢复", dashboard)
                 self.assertIn('data-tab="timeline"', dashboard)
                 self.assertIn('data-tab="episodic"', dashboard)
                 self.assertIn("情景证据", dashboard)
@@ -1555,10 +1854,21 @@ class WebUIRouteTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("4.x 三层记忆状态", dashboard)
                 self.assertIn("arch-source-value", dashboard)
                 self.assertIn("4.4 请求路径", dashboard)
+                self.assertIn("记忆结构", dashboard)
+                self.assertIn("证据来源", dashboard)
+                self.assertIn("原文回链", dashboard)
+                self.assertNotIn("重要性分布", dashboard)
+                self.assertNotIn("记忆生产工作台", dashboard)
+                self.assertEqual(dashboard.count('href="/production"'), 1)
+                self.assertEqual(dashboard.count('id="backup-meta"'), 1)
+                self.assertEqual(dashboard.count('id="context-backup-meta"'), 1)
                 self.assertNotIn('data-tab="search"', dashboard)
                 self.assertNotIn('data-tab="graph"', dashboard)
                 self.assertNotIn('id="month-route-q"', dashboard)
                 self.assertIn("真实注入记录", dashboard)
+                self.assertIn("召回数值预设", dashboard)
+                self.assertIn("不漏检安全网观测", dashboard)
+                self.assertIn("从真实记忆生成", dashboard)
                 self.assertNotIn('data-tab="summary"', dashboard)
                 self.assertNotIn('data-tab="anchors"', dashboard)
                 self.assertNotIn("KB Cache", console)
@@ -1582,6 +1892,8 @@ class WebUIRouteTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(status["data"]["eod_checkpoint"]["schedule"], "23:45")
                 self.assertEqual(status["data"]["eod_checkpoint"]["min_turns"], 1)
                 self.assertEqual(status["data"]["eod_checkpoint"]["max_diaries"], 6)
+                self.assertTrue(status["data"]["data_backup"]["enabled"])
+                self.assertEqual(status["data"]["data_backup"]["interval_days"], 14)
                 plugin_settings = await asyncio.to_thread(
                     lambda: json.loads(
                         urllib.request.urlopen(base + "/api/settings", timeout=3).read().decode("utf-8")
@@ -1590,20 +1902,77 @@ class WebUIRouteTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("原文档案与日记生成", plugin_settings["data"]["groups"])
                 self.assertIn("剧情注入与原文证据", plugin_settings["data"]["groups"])
                 self.assertIn("兼容回退（不参与当前主路）", plugin_settings["data"]["groups"])
+                self.assertIn("运行与维护", plugin_settings["data"]["groups"])
                 setting_items = {item["key"]: item for item in plugin_settings["data"]["items"]}
+                llm_provider_keys = {
+                    "compress_provider_id",
+                    "query_plan_llm_provider_id",
+                    "episode_extraction_provider_id",
+                    "diary_render_provider_id",
+                    "semantic_state_provider_id",
+                    "profile_provider_id",
+                }
+                for provider_key in llm_provider_keys:
+                    options = setting_items[provider_key]["options"]
+                    option_values = {item["value"] for item in options}
+                    self.assertEqual(options[0]["value"], "")
+                    self.assertIn("chat_main", option_values)
+                    self.assertIn(
+                        setting_items[provider_key]["value"],
+                        option_values,
+                    )
+                self.assertEqual(setting_items["emb_provider_id"]["options"], [])
+                self.assertEqual(setting_items["rerank_provider_id"]["options"], [])
+                self.assertEqual(setting_items["emb_provider_id"]["value"], "emb_manual")
+                self.assertEqual(setting_items["rerank_provider_id"]["value"], "rerank_manual")
                 self.assertTrue(setting_items["lean_event_index_enable"]["value"])
                 self.assertTrue(setting_items["lean_source_evidence_enable"]["value"])
                 self.assertTrue(setting_items["lean_coverage_selection_enable"]["value"])
                 self.assertTrue(setting_items["lean_adaptive_evidence_enable"]["value"])
                 self.assertTrue(setting_items["passage_vector_auto_migrate"]["value"])
                 self.assertTrue(setting_items["source_turn_vector_auto_migrate"]["value"])
+                self.assertTrue(setting_items["recall_cross_layer_consistency_enable"]["value"])
+                self.assertTrue(setting_items["recall_temporal_constraints_enable"]["value"])
+                self.assertTrue(setting_items["recall_intent_layer_weights_enable"]["value"])
+                self.assertTrue(setting_items["recall_observation_enable"]["value"])
                 item_keys = {item["key"] for item in plugin_settings["data"]["items"]}
                 self.assertIn("eod_checkpoint_enable", item_keys)
                 self.assertIn("eod_checkpoint_max_diaries", item_keys)
+                self.assertIn("data_backup_enable", item_keys)
+                self.assertIn("data_backup_interval_days", item_keys)
+                self.assertIn("data_backup_keep", item_keys)
+                self.assertIn("data_backup_dir", item_keys)
                 for preset in plugin_settings["data"]["presets"]:
+                    self.assertTrue(preset["values"]["evidence_first_generation_enable"])
+                    self.assertTrue(preset["values"]["lean_source_evidence_enable"])
+                    self.assertTrue(preset["values"]["enable_time_insight_affiliate"])
+                    self.assertTrue(preset["values"]["data_backup_enable"])
                     self.assertNotIn("recall_multi_query_enable", preset["values"])
                     self.assertNotIn("recall_month_route_enable", preset["values"])
                     self.assertNotIn("recall_information_gain_enable", preset["values"])
+                    for protected_key in protected_values:
+                        self.assertNotIn(protected_key, preset["values"])
+                    self.assertFalse(any(
+                        _is_preset_protected_setting(key)
+                        for key in preset["values"]
+                    ))
+                apply_global_request = urllib.request.Request(
+                    base + "/api/settings/preset",
+                    data=json.dumps({"preset": "balanced"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                applied_global = await asyncio.to_thread(
+                    lambda: json.loads(
+                        urllib.request.urlopen(apply_global_request, timeout=3).read().decode("utf-8")
+                    ),
+                )
+                self.assertTrue(applied_global["ok"])
+                self.assertEqual(plugin.compress_every_n_turns, 30)
+                self.assertTrue(plugin.evidence_first_generation_enable)
+                self.assertTrue(plugin.enable_time_insight_affiliate)
+                self.assertEqual(plugin.data_backup_interval_days, 14)
+                for protected_key, expected in protected_values.items():
+                    self.assertEqual(plugin.config.get(protected_key), expected)
                 episodic = await asyncio.to_thread(
                     lambda: json.loads(
                         urllib.request.urlopen(base + "/api/episodic/status", timeout=3).read().decode("utf-8")
@@ -1653,6 +2022,85 @@ class WebUIRouteTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
                 self.assertEqual(eval_cases["data"]["items"][0]["expected_memos"], ["memos/calendar-test"])
+                recall_presets = await asyncio.to_thread(
+                    lambda: json.loads(
+                        urllib.request.urlopen(base + "/api/eval/presets", timeout=3).read().decode("utf-8")
+                    ),
+                )
+                self.assertEqual(len(recall_presets["data"]["items"]), 4)
+                self.assertEqual(recall_presets["data"]["items"][0]["id"], "recall_effect")
+                recall_by_id = {
+                    item["id"]: item for item in recall_presets["data"]["items"]
+                }
+                effect_values = recall_by_id["recall_effect"]["values"]
+                narrative_values = recall_by_id["recall_narrative"]["values"]
+                self.assertEqual(effect_values["lean_story_max_inject"], 10)
+                self.assertEqual(narrative_values["lean_story_max_inject"], 10)
+                self.assertGreater(
+                    narrative_values["lean_recall_candidate_k"],
+                    effect_values["lean_recall_candidate_k"],
+                )
+                self.assertGreater(
+                    narrative_values["lean_relative_margin_broad"],
+                    effect_values["lean_relative_margin_broad"],
+                )
+                self.assertTrue(effect_values["lean_source_evidence_enable"])
+                self.assertTrue(effect_values["recall_intent_layer_weights_enable"])
+                apply_recall_request = urllib.request.Request(
+                    base + "/api/eval/preset",
+                    data=json.dumps({"preset": "recall_effect"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                applied_recall = await asyncio.to_thread(
+                    lambda: json.loads(
+                        urllib.request.urlopen(apply_recall_request, timeout=3).read().decode("utf-8")
+                    ),
+                )
+                self.assertTrue(applied_recall["ok"])
+                self.assertEqual(plugin.lean_recall_candidate_k, 80)
+                self.assertEqual(plugin.lean_story_normal_inject, 4)
+                self.assertEqual(plugin.lean_story_max_inject, 10)
+                for protected_key, expected in protected_values.items():
+                    self.assertEqual(plugin.config.get(protected_key), expected)
+
+                auto_request = urllib.request.Request(
+                    base + "/api/eval/auto_cases",
+                    data=json.dumps({"limit": 20}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                auto_cases = await asyncio.to_thread(
+                    lambda: json.loads(urllib.request.urlopen(auto_request, timeout=3).read().decode("utf-8")),
+                )
+                self.assertTrue(auto_cases["ok"])
+                self.assertFalse(auto_cases["data"]["memory_content_changed"])
+                self.assertGreaterEqual(auto_cases["data"]["generated"], 1)
+
+                plugin._episodes.record_recall_observation({
+                    "request_id": "web-obs", "query": "雨夜约定", "intent": "specific_event",
+                    "safety_triggered": True, "selected_before": [],
+                    "selected_after": ["memos/calendar-test"],
+                    "rescue_selected": ["memos/calendar-test"], "outcome": "helped",
+                })
+                observations = await asyncio.to_thread(
+                    lambda: json.loads(
+                        urllib.request.urlopen(base + "/api/eval/observations", timeout=3).read().decode("utf-8")
+                    ),
+                )
+                self.assertEqual(observations["data"]["summary"]["helped"], 1)
+                observation_feedback = urllib.request.Request(
+                    base + "/api/eval/observation_feedback",
+                    data=json.dumps({"request_id": "web-obs", "feedback": "useful"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                observed = await asyncio.to_thread(
+                    lambda: json.loads(urllib.request.urlopen(observation_feedback, timeout=3).read().decode("utf-8")),
+                )
+                self.assertTrue(observed["data"]["updated"])
+                self.assertEqual(observed["data"]["linked_memories"], 1)
+                linked_events = plugin._vec.feedback_event_list(limit=10)
+                self.assertEqual(linked_events[0]["memo_name"], "memos/calendar-test")
+                self.assertEqual(linked_events[0]["action"], "useful")
+                self.assertEqual(linked_events[0]["source"], "safety_observation")
                 delete_request = urllib.request.Request(
                     base + "/api/eval/case/" + urllib.parse.quote(case_id, safe=""), method="DELETE",
                 )
@@ -1666,6 +2114,74 @@ class WebUIRouteTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
                 self.assertEqual(stats["data"]["by_month"], [{"k": "2026-07", "v": 1}])
+                self.assertEqual(
+                    stats["data"]["memory_structure"]["memory_types"],
+                    [{"k": "plot_fact", "v": 1}],
+                )
+                self.assertEqual(
+                    stats["data"]["memory_structure"]["evidence_quality"][2],
+                    {"k": "diary_derived", "v": 1},
+                )
+                backup_request = urllib.request.Request(
+                    base + "/api/data-backup/run",
+                    data=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                backup_result = await asyncio.to_thread(
+                    lambda: json.loads(
+                        urllib.request.urlopen(backup_request, timeout=5).read().decode("utf-8")
+                    ),
+                )
+                self.assertTrue(backup_result["data"]["created"])
+                backup_file = backup_result["data"]["file"]
+                self.assertTrue((Path(temp) / "data_backups" / backup_file).is_file())
+                backup_list = await asyncio.to_thread(
+                    lambda: json.loads(
+                        urllib.request.urlopen(base + "/api/data-backup/list", timeout=5).read().decode("utf-8")
+                    ),
+                )
+                self.assertEqual(backup_list["data"]["items"][0]["file"], backup_file)
+                backup_inspect = await asyncio.to_thread(
+                    lambda: json.loads(
+                        urllib.request.urlopen(
+                            base + "/api/data-backup/inspect?file=" + urllib.parse.quote(backup_file),
+                            timeout=5,
+                        ).read().decode("utf-8")
+                    ),
+                )
+                self.assertTrue(backup_inspect["data"]["valid"])
+                downloaded = await asyncio.to_thread(
+                    lambda: urllib.request.urlopen(
+                        base + "/api/data-backup/download?file=" + urllib.parse.quote(backup_file),
+                        timeout=5,
+                    ).read(),
+                )
+                self.assertTrue(downloaded.startswith(b"PK"))
+                restore_request = urllib.request.Request(
+                    base + "/api/data-backup/restore",
+                    data=json.dumps({
+                        "file": backup_file, "confirm": "RESTORE_ON_RELOAD",
+                    }).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                restore_result = await asyncio.to_thread(
+                    lambda: json.loads(
+                        urllib.request.urlopen(restore_request, timeout=10).read().decode("utf-8")
+                    ),
+                )
+                self.assertTrue(restore_result["data"]["scheduled"])
+                self.assertTrue(restore_result["data"]["pending_restore"]["safety_backup"])
+                cancel_request = urllib.request.Request(
+                    base + "/api/data-backup/cancel-restore",
+                    data=b"{}", headers={"Content-Type": "application/json"}, method="POST",
+                )
+                cancel_result = await asyncio.to_thread(
+                    lambda: json.loads(
+                        urllib.request.urlopen(cancel_request, timeout=5).read().decode("utf-8")
+                    ),
+                )
+                self.assertTrue(cancel_result["data"]["cancelled"])
                 console_stats = await asyncio.to_thread(
                     lambda: json.loads(
                         urllib.request.urlopen(base + "/api/console/stats", timeout=3).read().decode("utf-8")

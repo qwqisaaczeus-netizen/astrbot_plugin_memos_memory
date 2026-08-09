@@ -521,6 +521,68 @@ class BudgetedInjectionFormatTests(unittest.TestCase):
         self.assertGreater(len(full_block), len(block))
 
 
+class AdaptiveSourceEvidenceTests(unittest.TestCase):
+    class _EpisodeRepo:
+        @staticmethod
+        def get_episode(_memo_name: str):
+            return {
+                "scene_anchor": "雨夜里重新确认约定",
+                "state_change": "从犹疑转为愿意相信",
+                "unresolved": [],
+                "memory_type": "promise_or_rule",
+                "trigger_hint": "离开前必须说明",
+                "evidence_quality": "source_grounded",
+            }
+
+        @staticmethod
+        def evidence_for_memo(_memo_name: str, _query: str, limit: int = 3):
+            return [
+                {"actor": "用户", "quote_text": f"证据原话{i}", "match_score": 0.9 - i * 0.01}
+                for i in range(1, limit + 1)
+            ]
+
+    def _plugin(self) -> MemosMemoryPlugin:
+        plugin = object.__new__(MemosMemoryPlugin)
+        plugin._episodes = self._EpisodeRepo()
+        plugin.character_name = "角色"
+        plugin.episodic_evidence_per_memory = 3
+        plugin.lean_adaptive_evidence_enable = True
+        plugin.lean_story_max_inject = 10
+        return plugin
+
+    def test_event_core_remains_when_source_expansion_is_not_selected(self):
+        plugin = self._plugin()
+        hit = {"memo_name": "memos/rain", "_source_turn_hits": []}
+        plugin._prepare_fused_memory_hit(
+            "今晚想安静地靠一会儿", hit, include_source_evidence=False,
+        )
+        self.assertTrue(hit["_fusion_event_core"])
+        self.assertEqual(hit["_fusion_source_evidence"], [])
+
+    def test_precise_query_uses_configured_evidence_limit(self):
+        plugin = self._plugin()
+        hit = {"memo_name": "memos/rain", "_source_turn_hits": []}
+        plugin._prepare_fused_memory_hit(
+            "把当时的原话和证据告诉我", hit, include_source_evidence=True,
+        )
+        self.assertEqual(len(hit["_fusion_source_evidence"]), 3)
+        self.assertIn("证据原话3", hit["_fusion_source_evidence"][2])
+
+    def test_adaptive_selector_limits_memory_groups(self):
+        plugin = self._plugin()
+        hits = [
+            {"memo_name": "memos/a", "memory_type": "plot_fact", "_injection_score": 0.9},
+            {"memo_name": "memos/b", "memory_type": "promise_or_rule", "_injection_score": 0.8},
+            {"memo_name": "memos/c", "memory_type": "plot_fact", "_injection_score": 0.7},
+        ]
+        ordinary, ordinary_mode = plugin._select_lean_evidence_hits("今晚抱抱我", hits)
+        self.assertEqual(ordinary_mode, "constraint")
+        self.assertEqual([item["memo_name"] for item in ordinary], ["memos/b"])
+        precise, precise_mode = plugin._select_lean_evidence_hits("当时具体说过什么原话", hits)
+        self.assertEqual(precise_mode, "precise")
+        self.assertEqual(len(precise), 2)
+
+
 class EpisodeCardTextTests(unittest.TestCase):
     def test_card_text_keeps_quotes_dates_and_prioritizes_missing_details(self):
         diary = {

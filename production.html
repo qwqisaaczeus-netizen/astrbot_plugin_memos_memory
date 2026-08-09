@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Memory Production Workbench</title>
+<style>
+:root{color-scheme:light;--bg:#eef1ef;--paper:#fff;--ink:#17201e;--muted:#67716e;--line:#d9dfdc;--line2:#e9edeb;--rail:#101715;--teal:#087b69;--teal2:#dff4ed;--amber:#b86412;--amber2:#fff1dc;--red:#b9343c;--red2:#fde8ea;--blue:#3263a8;--violet:#7756a5;--shadow:0 8px 24px rgba(20,31,28,.06)}
+*{box-sizing:border-box}html,body{margin:0;min-height:100%;background:var(--bg);color:var(--ink);font:13px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;letter-spacing:0}button,input,select{font:inherit}button{cursor:pointer}a{color:inherit;text-decoration:none}:focus-visible{outline:2px solid #34a78e;outline-offset:2px}
+.shell{display:grid;grid-template-columns:72px minmax(0,1fr);min-height:100vh}.rail{position:sticky;top:0;height:100vh;background:var(--rail);color:#dce6e2;padding:15px 10px;display:flex;flex-direction:column;align-items:center;gap:12px}.mark{width:44px;height:44px;border:1px solid #3b4b46;border-radius:8px;display:grid;place-items:center;font:800 14px ui-monospace,Consolas,monospace;color:#72dcc0;background:#17231f}.rail a{width:48px;min-height:46px;border-radius:7px;display:grid;place-items:center;color:#9eb0aa;font:700 10px ui-monospace,Consolas,monospace;text-align:center}.rail a:hover,.rail a.active{background:#213c34;color:#e8fff8}.rail .spacer{flex:1}
+.main{min-width:0;padding:20px 24px 36px;width:min(100%,1800px);margin:auto}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:14px}.top h1{font-size:25px;line-height:1.2;margin:0}.top p{margin:5px 0 0;color:var(--muted)}.actions,.toolbar,.inline{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.btn{border:1px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);min-height:36px;padding:7px 11px}.btn:hover{border-color:#8db7aa;background:#f7fbf9}.btn.primary{background:var(--teal);border-color:var(--teal);color:#fff}.btn.danger{color:var(--red)}.btn:disabled{opacity:.45;cursor:not-allowed}
+.health{display:grid;grid-template-columns:auto minmax(0,1fr) auto;align-items:center;gap:12px;padding:11px 13px;border:1px solid var(--line);border-left:4px solid #899590;border-radius:7px;background:#fff;margin-bottom:12px}.health.green{border-left-color:var(--teal)}.health.yellow{border-left-color:var(--amber)}.health.red{border-left-color:var(--red)}.lamp{width:10px;height:10px;border-radius:50%;background:#8b9692}.green .lamp{background:#20a982;animation:pulse 2.4s ease-in-out infinite}.yellow .lamp{background:#e08b2c}.red .lamp{background:#d94c54}.health strong{display:block}.health small{color:var(--muted)}.version{font:12px ui-monospace,Consolas,monospace;color:var(--muted)}
+.flow{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:1px;border:1px solid var(--line);border-radius:7px;overflow:hidden;background:var(--line);margin-bottom:12px}.flow-step{position:relative;background:#fff;padding:11px 13px;min-height:68px}.flow-step b{display:block;font-size:12px}.flow-step span{display:block;color:var(--muted);font-size:11px;margin-top:3px}.flow-step::after{content:"";position:absolute;left:0;right:0;bottom:0;height:3px;background:var(--teal);transform-origin:left;animation:grow .7s ease both}.flow-step:nth-child(2)::after{animation-delay:.08s}.flow-step:nth-child(3)::after{animation-delay:.16s;background:var(--blue)}.flow-step:nth-child(4)::after{animation-delay:.24s;background:var(--amber)}.flow-step:nth-child(5)::after{animation-delay:.32s;background:var(--violet)}
+.metrics{display:grid;grid-template-columns:repeat(6,minmax(125px,1fr));gap:9px;margin-bottom:12px}.metric{background:#fff;border:1px solid var(--line2);border-radius:7px;padding:12px;box-shadow:var(--shadow)}.metric label{display:block;color:var(--muted);font-size:11px}.metric b{display:block;font-size:24px;margin-top:3px;font-variant-numeric:tabular-nums}.metric small{color:var(--muted)}
+.tabs{display:flex;gap:4px;overflow:auto;border-bottom:1px solid var(--line);margin-bottom:12px}.tabs button{border:0;border-bottom:3px solid transparent;background:transparent;color:var(--muted);padding:10px 13px;white-space:nowrap}.tabs button.active{color:var(--ink);border-color:var(--teal);font-weight:750}.panel{display:none}.panel.active{display:block;animation:enter .24s ease both}.card{background:#fff;border:1px solid var(--line2);border-radius:7px;padding:14px;box-shadow:var(--shadow)}.card+.card{margin-top:10px}.card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:11px}.card h2,.card h3{margin:0;font-size:14px}.small{font-size:11px;color:var(--muted)}
+.toolbar{margin-bottom:10px}.toolbar input,.toolbar select{min-height:36px;border:1px solid var(--line);border-radius:7px;background:#fff;padding:7px 10px;color:var(--ink)}.toolbar input{min-width:260px;flex:1}.toolbar select{min-width:150px}.table-wrap{overflow:auto;border:1px solid var(--line2);border-radius:7px}table{width:100%;border-collapse:collapse;min-width:900px}th,td{padding:9px 10px;border-bottom:1px solid var(--line2);text-align:left;vertical-align:top}th{position:sticky;top:0;background:#f5f7f6;color:var(--muted);font-size:11px;z-index:1}tbody tr{transition:background .15s ease}tbody tr:hover{background:#f3faf7}.mono{font-family:ui-monospace,Consolas,monospace}.pill{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:2px 7px;font-size:11px;background:#f6f8f7;white-space:nowrap}.pill.ok{border-color:#9ed8c7;background:var(--teal2);color:#07614f}.pill.warn{border-color:#edc28f;background:var(--amber2);color:#85460c}.pill.bad{border-color:#e9a2a7;background:var(--red2);color:#8d242b}.empty{padding:28px;text-align:center;color:var(--muted)}
+.episode-row{cursor:pointer}.episode-detail td{padding:0}.episode-sheet{background:#f7faf8;padding:13px;display:grid;grid-template-columns:minmax(0,1.15fr) minmax(260px,.85fr);gap:12px}.kv{display:grid;grid-template-columns:145px minmax(0,1fr);border:1px solid var(--line2);border-radius:7px;overflow:hidden}.kv dt,.kv dd{margin:0;padding:7px 9px;border-bottom:1px solid var(--line2)}.kv dt{background:#f1f5f3;color:var(--muted)}.quality-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.gauge{border:1px solid var(--line2);border-radius:7px;background:#fff;padding:9px}.gauge b{display:block;font-size:17px}.gauge span{font-size:10px;color:var(--muted)}
+.split{display:grid;grid-template-columns:minmax(0,1.18fr) minmax(320px,.82fr);gap:10px}.pre{white-space:pre-wrap;overflow:auto;max-height:520px;border:1px solid var(--line2);border-radius:7px;background:#f6f8f7;padding:11px}.list{display:grid;gap:8px}.list-item{border:1px solid var(--line2);border-radius:7px;padding:10px;background:#fff}.list-item header{display:flex;justify-content:space-between;gap:10px;margin-bottom:6px}.list-item strong{overflow-wrap:anywhere}.danger-zone{border-left:4px solid var(--red)}
+@keyframes enter{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}@keyframes grow{from{transform:scaleX(0)}to{transform:scaleX(1)}}@keyframes pulse{50%{box-shadow:0 0 0 5px rgba(32,169,130,.12)}}
+@media(max-width:1100px){.metrics{grid-template-columns:repeat(3,minmax(0,1fr))}.split,.episode-sheet{grid-template-columns:1fr}.flow{grid-template-columns:1fr}.flow-step{min-height:52px}.shell{grid-template-columns:1fr}.rail{position:relative;height:auto;flex-direction:row;justify-content:flex-start;overflow:auto}.rail .spacer{display:none}.main{padding:16px}}
+@media(max-width:620px){.top{display:block}.top .actions{margin-top:10px}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.health{grid-template-columns:auto 1fr}.health .version{grid-column:2}.quality-grid{grid-template-columns:1fr}.toolbar input{min-width:100%}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}}
+</style>
+</head>
+<body>
+<div class="shell">
+  <nav class="rail" aria-label="工作台导航">
+    <div class="mark">MP</div>
+    <a href="/" title="主 WebUI">HOME</a>
+    <a class="active" href="/production" title="记忆生产">MAKE</a>
+    <a href="/xinchao" title="心潮工作台">MIND</a>
+    <span class="spacer"></span>
+    <a href="/console" title="专业控制台">LOG</a>
+  </nav>
+  <main class="main">
+    <header class="top">
+      <div><h1>记忆生产工作台</h1><p>从原始对话到 Episode、第一人称日记与滚动状态，逐步核验 4.6 生产链。</p></div>
+      <div class="actions"><button class="btn" onclick="loadAll()">刷新</button><a class="btn primary" href="/">返回主 WebUI</a></div>
+    </header>
+
+    <div id="health" class="health"><i class="lamp"></i><div><strong>正在读取生产链</strong><small>检查数据库身份、追溯链接与向量代际。</small></div><span id="version" class="version">4.6.2</span></div>
+
+    <section class="flow" aria-label="记忆生产流程">
+      <div class="flow-step"><b>01 原文档案</b><span id="flow-source">持久保存会话轮次</span></div>
+      <div class="flow-step"><b>02 场景边界</b><span id="flow-scene">按事件转折切分</span></div>
+      <div class="flow-step"><b>03 Episode</b><span id="flow-episode">证据分档与精确链接</span></div>
+      <div class="flow-step"><b>04 日记</b><span id="flow-diary">第一人称文学化入口</span></div>
+      <div class="flow-step"><b>05 滚动状态</b><span id="flow-state">收敛长期变化</span></div>
+    </section>
+
+    <section class="metrics">
+      <div class="metric"><label>原文批次</label><b id="m-batches">-</b><small id="m-batches-hint">-</small></div>
+      <div class="metric"><label>原文轮次</label><b id="m-turns">-</b><small id="m-turns-hint">-</small></div>
+      <div class="metric"><label>Episode</label><b id="m-episodes">-</b><small id="m-episodes-hint">-</small></div>
+      <div class="metric"><label>可回原文</label><b id="m-recoverable">-</b><small id="m-recoverable-hint">与主页同一口径</small></div>
+      <div class="metric"><label>精确轮次链接</label><b id="m-links">-</b><small id="m-links-hint">-</small></div>
+      <div class="metric"><label>日记产出</label><b id="m-diaries">-</b><small id="m-diaries-hint">-</small></div>
+    </section>
+
+    <nav class="tabs" id="tabs">
+      <button class="active" data-panel="audit">生产审计</button>
+      <button data-panel="queue">重构队列</button>
+      <button data-panel="batches">最近批次</button>
+      <button data-panel="safety">数据安全</button>
+    </nav>
+
+    <section id="audit" class="panel active">
+      <div class="card">
+        <div class="card-head"><h2>逐篇 Episode 审计</h2><span id="episode-meta" class="small">加载中</span></div>
+        <div class="toolbar"><input id="episode-q" placeholder="搜索日期、人物、场景或检索线索"><select id="episode-quality"><option value="">全部证据质量</option><option value="source_grounded">原始生成</option><option value="mixed_user_edited">用户编辑混合</option><option value="diary_derived">旧日记推导</option></select><button class="btn primary" onclick="loadEpisodes()">筛选</button></div>
+        <div class="table-wrap"><table><thead><tr><th>状态</th><th>时间 / 类型</th><th>场景</th><th>证据</th><th>日记质量</th><th>滚动状态</th></tr></thead><tbody id="episode-rows"><tr><td colspan="6"><div class="empty">加载中</div></td></tr></tbody></table></div>
+      </div>
+    </section>
+
+    <section id="queue" class="panel">
+      <div class="split">
+        <div class="card"><div class="card-head"><h2>长日记重构队列</h2><span id="queue-meta" class="small">加载中</span></div><div id="queue-list" class="list"><div class="empty">加载中</div></div></div>
+        <div class="card"><div class="card-head"><h2>预览详情</h2><span id="preview-meta" class="small">只预览，不直接写 Memos</span></div><div id="preview-detail" class="pre">选择队列项目生成预览。</div></div>
+      </div>
+      <div class="card"><div class="card-head"><h2>已保存预览</h2><span id="previews-meta" class="small">-</span></div><div id="previews-list" class="list"><div class="empty">加载中</div></div></div>
+    </section>
+
+    <section id="batches" class="panel">
+      <div class="card"><div class="card-head"><h2>最近生产批次</h2><span id="batches-meta" class="small">加载中</span></div><div class="table-wrap"><table><thead><tr><th>批次</th><th>来源</th><th>轮次 / 字符</th><th>事件区间</th><th>Episode</th><th>证据 / 日记</th><th>状态更新</th></tr></thead><tbody id="batch-rows"></tbody></table></div></div>
+    </section>
+
+    <section id="safety" class="panel">
+      <div class="split">
+        <div class="card"><div class="card-head"><h2>数据库身份</h2><span id="db-state" class="small">-</span></div><dl id="identity" class="kv"></dl><div class="inline" style="margin-top:10px"><button id="generation-switch" class="btn primary" onclick="generationSwitch()" disabled>切换待定代际</button><button id="generation-rollback" class="btn danger" onclick="generationRollback()" disabled>回滚上一代际</button></div></div>
+        <div class="card danger-zone"><div class="card-head"><h2>数据库快照</h2><span id="snapshots-meta" class="small">恢复前会再保存当前库</span></div><div id="snapshots-list" class="list"></div></div>
+      </div>
+      <div class="card"><div class="card-head"><h2>写回与回滚记录</h2><span id="rollbacks-meta" class="small">-</span></div><div id="rollbacks-list" class="list"></div></div>
+    </section>
+  </main>
+</div>
+<script>
+var state={overview:null,episodes:[],preview:null,busy:false};
+function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,function(c){return({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]})}
+function n(v){return Number(v||0).toLocaleString("zh-CN")}function pct(v){v=Number(v);return v>=0?(v*100).toFixed(1)+"%":"-"}function when(v){if(!v)return"-";var d=new Date(Number(v)*1000);return isNaN(d)?String(v):d.toLocaleString("zh-CN")}
+async function api(path){var r=await fetch(path),d=await r.json();if(!d.ok)throw new Error(d.error||"请求失败");return d.data}
+async function post(path,body){var r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})}),d=await r.json();if(!d.ok)throw new Error(d.error||"请求失败");return d.data}
+function pill(text,kind){return"<span class='pill "+(kind||"")+"'>"+esc(text)+"</span>"}
+function empty(text){return"<div class='empty'>"+esc(text)+"</div>"}
+function stateLabel(v){return v==="pending"?"累计待融合":v==="failed"?"融合失败":v==="done"?"已融合":v||"未排队"}
+function stateTone(v){return v==="done"?"ok":v==="failed"?"bad":"warn"}
+document.getElementById("tabs").addEventListener("click",function(e){var b=e.target.closest("button[data-panel]");if(!b)return;document.querySelectorAll(".tabs button").forEach(function(x){x.classList.toggle("active",x===b)});document.querySelectorAll(".panel").forEach(function(x){x.classList.toggle("active",x.id===b.dataset.panel)})});
+
+function renderOverview(d){state.overview=d;var t=d.totals||{},tr=d.trace||{},tb=d.traceable||{},dy=d.diary_stats||{},ss=d.source_status||{},id=d.identity||{},ga=d.generation_actions||{};document.getElementById("version").textContent=d.version||"4.6.2";var h=document.getElementById("health");h.className="health "+(ss.level||"");h.querySelector("strong").textContent=ss.label||"生产状态未知";h.querySelector("small").textContent="可回原文 "+n(tr.turn_linked_episodes)+" 篇，精确链接 "+n(tb.exact_turn_link_count)+" 条；原文词面索引 "+(tb.source_lexical_ready?"可用":"未就绪")+"，向量索引 "+(tb.source_vector_ready?"可用":"迁移中或未建立")+"。";
+  document.getElementById("m-batches").textContent=n(t.batches);document.getElementById("m-batches-hint").textContent=n((d.batches||[]).length)+" 个最近批次可查看";document.getElementById("m-turns").textContent=n(t.turns);document.getElementById("m-turns-hint").textContent=n(tb.source_turn_vectors)+" 条已有向量";document.getElementById("m-episodes").textContent=n(t.episodes);document.getElementById("m-episodes-hint").textContent=n((dy.quality_dist||{}).source_grounded)+" 篇原始生成";document.getElementById("m-recoverable").textContent=n(tr.turn_linked_episodes);document.getElementById("m-recoverable-hint").textContent=(t.episodes?pct(tr.turn_linked_episodes/t.episodes):"0.0%")+" Episode 有有效原文链接";document.getElementById("m-links").textContent=n(t.turn_links);document.getElementById("m-links-hint").textContent=n(t.evidence)+" 条结构化证据";document.getElementById("m-diaries").textContent=n(dy.with_diary);document.getElementById("m-diaries-hint").textContent="平均风险 "+pct(dy.avg_transcript_risk)+" · 回退 "+n(dy.render_fallbacks)+" 篇";
+  document.getElementById("flow-source").textContent=n(t.batches)+" 批 / "+n(t.turns)+" 轮";document.getElementById("flow-scene").textContent=n((d.scene_stats||{}).scenes)+" 个场景，平均 "+Number((d.scene_stats||{}).avg_span_turns||0).toFixed(1)+" 轮";document.getElementById("flow-episode").textContent=n(t.episodes)+" 篇 / "+n(t.evidence)+" 条证据";document.getElementById("flow-diary").textContent=n(dy.with_diary)+" 篇已写入";var sem=d.semantic_state||{},sp=sem.pending_preview||{},reason={initial_state:"首次建立",significant_change:"显著变化立即融合",batch_threshold:"达到累计批次",max_wait:"达到最长等待",failed_retry:"失败重试",every_batch:"逐批更新",deferred:"继续累计",empty:"无待处理",waiting_for_episode_view:"等待 Episode 视图"}[sp.reason]||sp.reason||"";document.getElementById("flow-state").textContent=(sem.ready?"v"+n((sem.state||{}).version||0):"未建立")+" · 累计待融合 "+n(sem.pending||0)+" · "+(sem.update_policy==="adaptive"?"自适应":"逐批")+(reason?" · "+reason:"");
+  document.getElementById("db-state").textContent=id.migration_status||"稳定";document.getElementById("identity").innerHTML=[["数据库 UUID",id.database_uuid],["稳定绝对路径",id.canonical_db_path||d.db_path],["Schema",id.schema_version],["Active generation",id.active_generation],["Pending generation",id.pending_generation||"无"],["Previous generation",id.prev_generation||"无"],["路径冲突",id.path_conflict||"无"]].map(function(x){return"<dt>"+esc(x[0])+"</dt><dd class='mono'>"+esc(x[1]||"-")+"</dd>"}).join("");document.getElementById("generation-switch").disabled=!ga.switch_available;document.getElementById("generation-rollback").disabled=!ga.rollback_available;renderQueue(d);renderBatches(d);renderSafety(d)}
+
+function renderEpisodes(d){state.episodes=d.items||[];document.getElementById("episode-meta").textContent=n(d.total)+" 篇，当前展示 "+n(state.episodes.length)+" 篇";var body=document.getElementById("episode-rows");body.innerHTML=state.episodes.map(function(x,i){var recover=x.recoverable?pill("可回原文","ok"):pill("无精确原文",x.evidence_quality==="diary_derived"?"warn":"bad");var tiers=n(x.must_count)+" / "+n(x.supporting_count)+" / "+n(x.archive_count);var quality=x.evidence_quality==="source_grounded"?"原始生成":x.evidence_quality==="mixed_user_edited"?"用户编辑混合":"旧日记推导";var risk=x.transcript_risk>=0?pct(x.transcript_risk):"历史数据";return"<tr class='episode-row' data-index='"+i+"'><td>"+recover+"<div class='small'>"+esc(quality)+"</div></td><td>"+esc(x.occurred_at||"时间未知")+"<div class='small'>"+esc(x.memory_type||"")+" · importance "+n(x.importance)+"</div></td><td><strong>"+esc(x.scene_anchor||x.memo_name||"-")+"</strong><div class='small'>轮次 "+n(x.scene_start_turn)+"–"+n(x.scene_end_turn)+"</div></td><td><span class='mono'>"+tiers+"</span><div class='small'>must / supporting / archive · "+n(x.exact_links)+" 链接</div></td><td>风险 "+risk+"<div class='small'>压缩比 "+pct(x.compression_ratio)+" · "+n(x.card_len)+" 字</div></td><td>"+pill(stateLabel(x.state_status),stateTone(x.state_status))+"</td></tr><tr class='episode-detail' id='episode-detail-"+i+"' hidden><td colspan='6'>"+episodeSheet(x)+"</td></tr>"}).join("")||"<tr><td colspan='6'>"+empty("没有匹配的 Episode")+"</td></tr>"}
+function episodeSheet(x){var reasons=(x.scene_boundary_reasons||[]).join("、")||"未记录";return"<div class='episode-sheet'><dl class='kv'><dt>Memo</dt><dd class='mono'>"+esc(x.memo_name||"-")+"</dd><dt>源批次</dt><dd class='mono'>"+esc(x.source_batch_id||"-")+"</dd><dt>检索线索</dt><dd>"+esc(x.retrieval_key||"-")+"</dd><dt>边界原因</dt><dd>"+esc(reasons)+"</dd><dt>渲染版本</dt><dd>"+esc(x.diary_render_version||"历史版本")+"</dd><dt>重试 / 回退</dt><dd>"+esc(x.render_retry_reason||"无")+(x.render_fallback?"；已走兼容回退":"")+"</dd></dl><div class='quality-grid'><div class='gauge'><b>"+pct(x.must_coverage)+"</b><span>must 覆盖率</span></div><div class='gauge'><b>"+pct(x.support_coverage)+"</b><span>support 覆盖率</span></div><div class='gauge'><b>"+pct(x.source_overlap_ratio)+"</b><span>原文重叠率</span></div><div class='gauge'><b>"+pct(x.direct_quote_ratio)+"</b><span>直接复刻率</span></div><div class='gauge'><b>"+n(x.source_turns)+"</b><span>实际可回轮次</span></div><div class='gauge'><b>"+(x.memos_written?"已写入":"未写入")+"</b><span>Memos 状态</span></div></div></div>"}
+document.getElementById("episode-rows").addEventListener("click",function(e){var row=e.target.closest("tr.episode-row");if(!row)return;var detail=document.getElementById("episode-detail-"+row.dataset.index);detail.hidden=!detail.hidden});
+
+function renderQueue(d){var q=d.long_diaries||[],p=d.previews||[];document.getElementById("queue-meta").textContent=n(d.long_diaries_count)+" 个候选";document.getElementById("queue-list").innerHTML=q.map(function(x){return"<article class='list-item'><header><strong class='mono'>"+esc(x.memo_name||x.episode_id)+"</strong>"+pill(n(x.card_len)+" 字",x.transcript_risk>.65?"bad":"warn")+"</header><div class='small'>原文 "+n(x.source_turns)+" 轮 · must 覆盖 "+pct(x.must_coverage)+" · 风险 "+pct(x.transcript_risk)+"</div><div class='inline' style='margin-top:8px'><button class='btn primary' onclick='previewDiary("+JSON.stringify(String(x.episode_id||""))+ ")'>生成预览</button></div></article>"}).join("")||empty("当前没有需要重构的长日记");document.getElementById("previews-meta").textContent=n(p.length)+" 条";document.getElementById("previews-list").innerHTML=p.map(function(x){var buttons="<button class='btn' onclick='showPreview("+JSON.stringify(String(x.preview_id||""))+ ")'>查看</button>";if(x.status==="pending")buttons+="<button class='btn primary' onclick='confirmPreview("+JSON.stringify(String(x.preview_id||""))+ ")'>确认写回</button><button class='btn danger' onclick='discardPreview("+JSON.stringify(String(x.preview_id||""))+ ")'>丢弃</button>";if(x.status==="confirmed")buttons+="<button class='btn danger' onclick='rollbackPreview("+JSON.stringify(String(x.preview_id||""))+ ")'>回滚</button>";return"<article class='list-item'><header><strong class='mono'>"+esc(x.preview_id||"-")+"</strong>"+pill(x.status||"unknown",x.status==="confirmed"?"ok":x.status==="pending"?"warn":"")+"</header><div class='small'>原篇目 "+esc(x.old_memo_name||x.episode_id||"-")+" · 新日记 "+n(x.new_diaries_count||(x.new_diaries||[]).length)+" 篇</div><div class='inline' style='margin-top:8px'>"+buttons+"</div></article>"}).join("")||empty("暂无预览")}
+function showPreview(id){var p=((state.overview||{}).previews||[]).find(function(x){return x.preview_id===id});if(!p)return;state.preview=p;document.getElementById("preview-meta").textContent=(p.preview_id||"预览")+" · "+(p.status||"unknown");document.getElementById("preview-detail").innerHTML=(p.new_diaries||[]).map(function(x,i){return"<strong>"+esc(x.episode_key||("新日记 "+(i+1)))+"</strong><div class='small'>场景 "+n(x.scene_start_turn)+"–"+n(x.scene_end_turn)+" · must "+pct(x.must_coverage)+"</div><p>"+esc(x.content||"")+"</p>"}).join("")||esc(JSON.stringify(p,null,2))}
+
+function renderBatches(d){var bs=d.batches||[];document.getElementById("batches-meta").textContent=n(bs.length)+" 个最近批次";document.getElementById("batch-rows").innerHTML=bs.map(function(b){return"<tr><td class='mono'>"+esc(b.batch_id||"-")+"</td><td>"+esc(b.source_kind||"-")+"</td><td>"+n(b.user_turns)+" user / "+n(b.assistant_turns)+" assistant<div class='small'>"+n(b.char_count)+" 字符</div></td><td>"+esc(when(b.first_event_ts))+"<div class='small'>至 "+esc(when(b.last_event_ts))+"</div></td><td>"+n(b.ep_cnt)+"<div class='small'>"+n(b.scene_cnt)+" 场景</div></td><td>"+n(b.must_cnt)+" must / "+n(b.diary_cnt)+" 日记</td><td>"+pill(stateLabel(b.state_status),stateTone(b.state_status))+"</td></tr>"}).join("")||"<tr><td colspan='7'>"+empty("暂无原文生产批次")+"</td></tr>"}
+function renderSafety(d){var snaps=d.snapshots||[],rolls=d.rollbacks||[];document.getElementById("snapshots-meta").textContent=n(snaps.length)+" 个快照";document.getElementById("snapshots-list").innerHTML=snaps.map(function(s){var c=s.counts||{};return"<article class='list-item'><header><strong class='mono'>"+esc(s.file_name||"-")+"</strong>"+pill(s.kind||"snapshot")+"</header><div class='small'>"+n(c.batches)+" 批 / "+n(c.turns)+" 轮 / "+n(c.episodes)+" 篇 · "+esc(String(s.digest||"").slice(0,12))+"</div><button class='btn danger' style='margin-top:8px' onclick='restoreSnapshot("+JSON.stringify(String(s.file_name||""))+ ")'>恢复</button></article>"}).join("")||empty("暂无数据库快照");document.getElementById("rollbacks-meta").textContent=n(d.rollback_count)+" 条";document.getElementById("rollbacks-list").innerHTML=rolls.map(function(r){return"<article class='list-item'><header><strong class='mono'>"+esc(r.memo_name||r.episode_id||"-")+"</strong>"+pill(r.reverted_ts?"已回滚":"已写入",r.reverted_ts?"":"ok")+"</header><div class='small'>"+esc(when(r.created_ts))+"</div>"+(!r.reverted_ts?"<button class='btn danger' style='margin-top:8px' onclick='rollbackMemo("+JSON.stringify(String(r.memo_name||""))+ ")'>回滚写入</button>":"")+"</article>"}).join("")||empty("暂无写回记录")}
+
+async function mutate(path,body,message){if(state.busy)return;if(message&&!confirm(message))return;state.busy=true;try{var d=await post(path,body||{});await loadOverview();return d}catch(e){alert(e.message)}finally{state.busy=false}}
+async function previewDiary(id){document.getElementById("preview-detail").textContent="正在调用 LLM 生成预览；不会写入 Memos...";var p=await mutate("/api/production/long_diary_preview",{episode_id:id});if(p){state.overview.previews=state.overview.previews||[];state.overview.previews.unshift(p);showPreview(p.preview_id)}}
+function confirmPreview(id){return mutate("/api/production/long_diary_confirm",{preview_id:id},"确认写回新日记？原日记会保留，可随后回滚。")}
+function discardPreview(id){return mutate("/api/production/long_diary_discard",{preview_id:id},"丢弃该预览？不会修改 Memos。")}
+function rollbackPreview(id){return mutate("/api/production/long_diary_rollback",{preview_id:id},"回滚将删除本次重构写入的新 Memos。确认继续？")}
+function rollbackMemo(name){return mutate("/api/production/long_diary_rollback",{memo_name:name},"确认回滚这次 Memos 写入？")}
+function restoreSnapshot(name){return mutate("/api/production/restore_snapshot",{file_name:name},"恢复快照会覆盖当前原文库；系统会先快照当前库。确认继续？")}
+function generationSwitch(){return mutate("/api/production/generation_switch",{},"确认将待定向量代际切为 active？")}
+function generationRollback(){return mutate("/api/production/generation_rollback",{},"确认恢复上一向量代际？")}
+async function loadOverview(){try{renderOverview(await api("/api/production/overview"))}catch(e){var h=document.getElementById("health");h.className="health red";h.querySelector("strong").textContent="生产工作台加载失败";h.querySelector("small").textContent=e.message}}
+async function loadEpisodes(){try{var q=encodeURIComponent(document.getElementById("episode-q").value.trim()),quality=encodeURIComponent(document.getElementById("episode-quality").value);renderEpisodes(await api("/api/production/episodes?limit=180&q="+q+"&quality="+quality))}catch(e){document.getElementById("episode-rows").innerHTML="<tr><td colspan='6'>"+empty(e.message)+"</td></tr>"}}
+async function loadAll(){await Promise.all([loadOverview(),loadEpisodes()])}
+loadAll();
+</script>
+</body>
+</html>

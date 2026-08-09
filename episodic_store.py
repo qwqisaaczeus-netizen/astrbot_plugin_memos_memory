@@ -1,11 +1,12 @@
-"""Persistent episodic memory and source-evidence store.
+"""Persistent episodic memory and source-evidence store (4.6.0-test2 facade).
 
-Memos remains the human-readable source of active diary truth. This database
-stores lossless source turns and rebuildable machine views keyed by memo name.
+This module is the public facade that 4.5.4 callers import. Internal logic
+lives in SourceArchive / EpisodeRepo / VectorGeneration (see those modules).
+Semantic-state machinery is kept inline because it is orthogonal to the new
+layering and was already stable in 4.5.4.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import math
@@ -17,63 +18,35 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from .archive_guard import ArchiveGuard
+from .episode_repo import EpisodeRepo, SUPPORTED_TIERS, normalize_tier
+from .preview_store import PreviewStore
+from .source_archive import SourceArchive
+from .store_utils import (
+    cosine as _cosine,
+    deserialize_f32 as _deserialize_f32,
+    escape_like as _escape_like,
+    extract_terms as _terms,
+    json_list as _json_list,
+    serialize_f32 as _serialize_f32,
+)
+from .traceability import compute_traceability
+from .vector_generation import VectorGeneration, _gen_id
+
+# Backward-compatible public helper used by migration tests/tooling.
+_generation_id = _gen_id
+
 
 logger = logging.getLogger(__name__)
 
 
-def _serialize_f32(vec: list[float]) -> bytes:
-    return struct.pack(f"{len(vec)}f", *vec)
-
-
-def _deserialize_f32(blob: bytes | None) -> list[float]:
-    if not blob:
-        return []
-    return list(struct.unpack(f"{len(blob) // 4}f", blob))
-
-
-def _cosine(a: list[float], b: list[float]) -> float:
-    if not a or not b or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a)) or 1.0
-    nb = math.sqrt(sum(y * y for y in b)) or 1.0
-    return dot / (na * nb)
-
-
-def _json_list(value: Any) -> list:
-    if isinstance(value, list):
-        return value
-    if isinstance(value, str) and value.strip():
-        try:
-            parsed = json.loads(value)
-            return parsed if isinstance(parsed, list) else []
-        except json.JSONDecodeError:
-            return []
-    return []
-
-
-def _terms(text: str) -> set[str]:
-    source = " ".join(str(text or "").lower().split())
-    if not source:
-        return set()
-    out = set(re.findall(r"[a-z0-9_/-]{2,}|[\u4e00-\u9fff]{2,8}", source))
-    try:
-        import jieba
-        out.update(word.strip().lower() for word in jieba.lcut(source) if len(word.strip()) >= 2)
-    except Exception:
-        out.update(source[index:index + 2] for index in range(max(0, len(source) - 1)))
-    return {item for item in out if item}
-
-
-def _escape_like(term: str) -> str:
-    """Escape SQL LIKE wildcards so tokens containing %/_ match literally."""
-    return term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-
 class EpisodicStore:
-    """Owns raw conversation evidence and derived episode cards."""
+    """Facade (4.6.0-test2): forwards to SourceArchive + EpisodeRepo +
+    VectorGeneration. Semantic-state machinery is kept inline because it is
+    orthogonal to the layering and stable since 4.5.4.
+    """
 
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 6
 
     def __init__(self, db_path: str, emb_dim: Optional[int], emb_model_id: Optional[str]):
         self.db_path = db_path
@@ -82,6 +55,13 @@ class EpisodicStore:
         self._conn: sqlite3.Connection | None = None
         self._vec_ok = False
         self._lock = threading.RLock()
+        self._gen: VectorGeneration | None = None
+        self._src: SourceArchive | None = None
+        self._eps: EpisodeRepo | None = None
+        self._guard: ArchiveGuard | None = None
+        self._previews: PreviewStore | None = None
+        self._snapshot_keep = 3
+        self._preview_keep = 20
 
     async def init(self) -> None:
         self._connect()
@@ -105,120 +85,29 @@ class EpisodicStore:
             self._vec_ok = False
             logger.info("[memos-memory][episode] sqlite-vec unavailable, Python cosine fallback: %s", exc)
         self._conn = conn
-        self._init_schema(conn)
+        # Delegates use `self._connect()` (not the closed-over `conn`) so a
+        # post-restore reopen still sees the live connection.
+        self._gen = VectorGeneration(self._vec_ok, self._connect)
+        self._src = SourceArchive(self.db_path, self._gen, self._connect, self._lock)
+        self._eps = EpisodeRepo(self._gen, self._connect, self._lock)
+        self._guard = ArchiveGuard(self.db_path, self._connect, self._lock,
+                                    snapshot_keep=self._snapshot_keep)
+        self._previews = PreviewStore(self._connect, self._lock, keep=self._preview_keep)
+        # Capture an older schema before any Repository CREATE/ALTER statement.
+        pre_migration = self._guard.capture_pre_migration(conn, self.SCHEMA_VERSION)
+        self._init_schema(conn, pre_migration=pre_migration)
         self._ensure_embedding_contract(conn)
         return conn
 
-    def _init_schema(self, conn: sqlite3.Connection) -> None:
+    def _init_schema(self, conn: sqlite3.Connection,
+                     pre_migration: dict[str, Any] | None = None) -> None:
         conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS source_batches (
-                batch_id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                source_kind TEXT NOT NULL,
-                content_hash TEXT NOT NULL,
-                message_count INTEGER NOT NULL,
-                first_event_ts REAL DEFAULT 0,
-                last_event_ts REAL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'archived',
-                created_ts REAL NOT NULL,
-                updated_ts REAL NOT NULL
-            )"""
-        )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS source_turns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                batch_id TEXT NOT NULL,
-                turn_index INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                event_ts REAL DEFAULT 0,
-                event_timezone TEXT DEFAULT '',
-                content_hash TEXT NOT NULL,
-                embedding BLOB,
-                UNIQUE(batch_id, turn_index),
-                FOREIGN KEY(batch_id) REFERENCES source_batches(batch_id) ON DELETE CASCADE
-            )"""
-        )
-        source_turn_columns = {
-            str(row["name"]) for row in conn.execute("PRAGMA table_info(source_turns)").fetchall()
-        }
-        if "embedding" not in source_turn_columns:
-            conn.execute("ALTER TABLE source_turns ADD COLUMN embedding BLOB")
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS source_turn_terms (
-                turn_id INTEGER NOT NULL,
-                term TEXT NOT NULL,
-                PRIMARY KEY(turn_id, term),
-                FOREIGN KEY(turn_id) REFERENCES source_turns(id) ON DELETE CASCADE
-            )"""
-        )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS episodes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                episode_id TEXT NOT NULL UNIQUE,
-                memo_name TEXT NOT NULL UNIQUE,
-                source_batch_id TEXT,
-                source_kind TEXT DEFAULT 'legacy',
-                legacy INTEGER NOT NULL DEFAULT 1,
-                active INTEGER NOT NULL DEFAULT 1,
-                occurred_at TEXT DEFAULT '',
-                event_ts REAL DEFAULT 0,
-                time_basis TEXT DEFAULT 'unknown',
-                memory_type TEXT DEFAULT 'plot_fact',
-                importance INTEGER DEFAULT 3,
-                scene_anchor TEXT DEFAULT '',
-                retrieval_key TEXT DEFAULT '',
-                state_change TEXT DEFAULT '',
-                long_effect TEXT DEFAULT '',
-                trigger_hint TEXT DEFAULT '',
-                entities_json TEXT DEFAULT '[]',
-                affect_before TEXT DEFAULT '',
-                affect_after TEXT DEFAULT '',
-                unresolved_json TEXT DEFAULT '[]',
-                card_text TEXT NOT NULL,
-                diary_content_hash TEXT DEFAULT '',
-                evidence_quality TEXT DEFAULT 'diary_derived',
-                source_updated_ts REAL DEFAULT 0,
-                embedding BLOB,
-                created_ts REAL NOT NULL,
-                updated_ts REAL NOT NULL,
-                FOREIGN KEY(source_batch_id) REFERENCES source_batches(batch_id) ON DELETE SET NULL
-            )"""
-        )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS episode_evidence (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                episode_id TEXT NOT NULL,
-                evidence_index INTEGER NOT NULL,
-                kind TEXT DEFAULT 'event',
-                actor TEXT DEFAULT '',
-                detail TEXT NOT NULL,
-                quote_text TEXT DEFAULT '',
-                turn_indexes_json TEXT DEFAULT '[]',
-                confidence REAL DEFAULT 0.5,
-                grounded INTEGER NOT NULL DEFAULT 0,
-                UNIQUE(episode_id, evidence_index),
-                FOREIGN KEY(episode_id) REFERENCES episodes(episode_id) ON DELETE CASCADE
-            )"""
-        )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS episode_turn_links (
-                episode_id TEXT NOT NULL,
-                batch_id TEXT NOT NULL,
-                turn_index INTEGER NOT NULL,
-                evidence_index INTEGER NOT NULL,
-                PRIMARY KEY(episode_id, turn_index, evidence_index),
-                FOREIGN KEY(episode_id) REFERENCES episodes(episode_id) ON DELETE CASCADE,
-                FOREIGN KEY(batch_id) REFERENCES source_batches(batch_id) ON DELETE CASCADE
-            )"""
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_episode_active ON episodes(active, event_ts DESC)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_episode_memo ON episodes(memo_name)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_turn_batch ON source_turns(batch_id, turn_index)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_source_turn_term ON source_turn_terms(term, turn_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_episode ON episode_evidence(episode_id, evidence_index)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_episode_turn_link ON episode_turn_links(batch_id, turn_index)")
+        assert self._guard is not None
+        self._guard.init_schema(conn)
+        self._src.init_schema(conn)
+        self._eps.init_schema(conn)
+        assert self._previews is not None
+        self._previews.init_schema(conn)
         conn.execute(
             """CREATE TABLE IF NOT EXISTS semantic_states (
                 scope_id TEXT PRIMARY KEY,
@@ -261,50 +150,12 @@ class EpisodicStore:
                 FOREIGN KEY(batch_id) REFERENCES source_batches(batch_id) ON DELETE CASCADE
             )"""
         )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS recall_eval_cases (
-                case_id TEXT PRIMARY KEY,
-                query TEXT NOT NULL,
-                expected_memos_json TEXT NOT NULL DEFAULT '[]',
-                note TEXT DEFAULT '',
-                enabled INTEGER NOT NULL DEFAULT 1,
-                source TEXT DEFAULT 'manual',
-                created_ts REAL NOT NULL,
-                updated_ts REAL NOT NULL
-            )"""
-        )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS recall_eval_runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_ts REAL NOT NULL,
-                mode TEXT NOT NULL,
-                case_count INTEGER NOT NULL,
-                metrics_json TEXT NOT NULL,
-                details_json TEXT NOT NULL DEFAULT '[]'
-            )"""
-        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_state_versions_scope ON semantic_state_versions(scope_id, version DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_state_queue_status ON semantic_state_queue(status, updated_ts)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_eval_cases_enabled ON recall_eval_cases(enabled, updated_ts DESC)")
-        legacy_links = conn.execute(
-            """SELECT e.episode_id,e.source_batch_id,v.evidence_index,v.turn_indexes_json
-               FROM episodes e JOIN episode_evidence v ON v.episode_id=e.episode_id
-               WHERE e.source_batch_id IS NOT NULL AND e.source_batch_id!=''"""
-        ).fetchall()
-        for row in legacy_links:
-            for value in _json_list(row["turn_indexes_json"]):
-                try:
-                    turn_index = int(value)
-                except (TypeError, ValueError):
-                    continue
-                conn.execute(
-                    """INSERT OR IGNORE INTO episode_turn_links
-                       (episode_id,batch_id,turn_index,evidence_index) VALUES (?,?,?,?)""",
-                    (
-                        row["episode_id"], row["source_batch_id"], turn_index,
-                        int(row["evidence_index"] or 0),
-                    ),
-                )
+        # 8.3.A: identity; 8.3.B: register the backup captured before Repository DDL.
+        assert self._guard is not None
+        self._guard.ensure_identity(conn, self.SCHEMA_VERSION)
+        self._guard.register_pre_migration(conn, pre_migration, self.SCHEMA_VERSION)
         conn.execute(
             "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",
             (str(self.SCHEMA_VERSION),),
@@ -312,38 +163,8 @@ class EpisodicStore:
         conn.commit()
 
     def _ensure_embedding_contract(self, conn: sqlite3.Connection) -> None:
-        old_dim_row = conn.execute("SELECT value FROM meta WHERE key='emb_dim'").fetchone()
-        old_model_row = conn.execute("SELECT value FROM meta WHERE key='emb_model_id'").fetchone()
-        old_dim = int(old_dim_row["value"] or 0) if old_dim_row else 0
-        old_model = str(old_model_row["value"] or "") if old_model_row else ""
-        changed = bool(
-            (old_dim and self.emb_dim and old_dim != self.emb_dim)
-            or (old_model and self.emb_model_id not in {"", "unknown"} and old_model != self.emb_model_id)
-        )
-        if changed:
-            conn.execute("UPDATE episodes SET embedding=NULL")
-            conn.execute("UPDATE source_turns SET embedding=NULL")
-            try:
-                conn.execute("DROP TABLE IF EXISTS vec_episode_cards")
-                conn.execute("DROP TABLE IF EXISTS vec_source_turns")
-            except Exception:
-                pass
-        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('emb_dim',?)", (str(self.emb_dim or ""),))
-        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('emb_model_id',?)", (self.emb_model_id,))
-        if self._vec_ok and self.emb_dim:
-            try:
-                conn.execute(
-                    f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_episode_cards "
-                    f"USING vec0(embedding float[{self.emb_dim}] distance_metric=cosine)"
-                )
-                conn.execute(
-                    f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_source_turns "
-                    f"USING vec0(embedding float[{self.emb_dim}] distance_metric=cosine)"
-                )
-            except Exception as exc:
-                logger.warning("[memos-memory][episode] vec episode table failed: %s", exc)
-                self._vec_ok = False
-        conn.commit()
+        assert self._gen is not None
+        self._gen.prepare_active(self.emb_model_id, int(self.emb_dim or 0))
 
     async def ensure_dim(self, dim: int, model_id: str) -> None:
         with self._lock:
@@ -353,380 +174,425 @@ class EpisodicStore:
 
     @staticmethod
     def episode_id_for_memo(memo_name: str) -> str:
-        return "ep_" + hashlib.sha256(str(memo_name).encode("utf-8")).hexdigest()[:24]
+        return EpisodeRepo.episode_id_for_memo(memo_name)
+
+    # ---- archive / source forwards (3.1) ------------------------------
 
     def archive_batch(self, session_id: str, messages: list[dict[str, Any]], source_kind: str) -> str:
-        normalized = []
-        for index, message in enumerate(messages or []):
-            content = str(message.get("content") or "").strip()
-            if not content:
-                continue
-            try:
-                event_ts = float(message.get("event_ts") or message.get("recorded_ts") or message.get("created_ts") or 0)
-            except (TypeError, ValueError):
-                event_ts = 0.0
-            normalized.append({
-                "turn_index": index,
-                "role": str(message.get("role") or ""),
-                "content": content,
-                "event_ts": event_ts,
-                "event_timezone": str(message.get("event_timezone") or message.get("timezone") or ""),
-            })
-        payload = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.sha256((str(session_id) + "\n" + payload).encode("utf-8")).hexdigest()
-        batch_id = "batch_" + digest[:24]
-        now = time.time()
-        event_times = [float(row["event_ts"]) for row in normalized if float(row["event_ts"]) > 0]
-        with self._lock:
-            conn = self._connect()
-            conn.execute(
-                """INSERT OR IGNORE INTO source_batches
-                   (batch_id,session_id,source_kind,content_hash,message_count,first_event_ts,last_event_ts,status,created_ts,updated_ts)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    batch_id, str(session_id), str(source_kind or "auto"), digest, len(normalized),
-                    min(event_times) if event_times else 0.0,
-                    max(event_times) if event_times else 0.0,
-                    "archived", now, now,
-                ),
-            )
-            for row in normalized:
-                content_hash = hashlib.sha256(row["content"].encode("utf-8")).hexdigest()
-                conn.execute(
-                    """INSERT OR IGNORE INTO source_turns
-                       (batch_id,turn_index,role,content,event_ts,event_timezone,content_hash)
-                       VALUES (?,?,?,?,?,?,?)""",
-                    (
-                        batch_id, row["turn_index"], row["role"], row["content"],
-                        row["event_ts"], row["event_timezone"], content_hash,
-                    ),
-                )
-                saved = conn.execute(
-                    "SELECT id FROM source_turns WHERE batch_id=? AND turn_index=?",
-                    (batch_id, row["turn_index"]),
-                ).fetchone()
-                if saved:
-                    conn.executemany(
-                        "INSERT OR IGNORE INTO source_turn_terms(turn_id,term) VALUES (?,?)",
-                        [(int(saved["id"]), term) for term in sorted(_terms(row["content"]))[:120]],
-                    )
-            conn.commit()
-        return batch_id
+        if self._src is None:
+            self._connect()
+        assert self._src is not None
+        return self._src.archive_batch(session_id, messages, source_kind)
 
     def mark_batch(self, batch_id: str, status: str) -> None:
-        if not batch_id:
-            return
-        with self._lock:
-            conn = self._connect()
-            conn.execute(
-                "UPDATE source_batches SET status=?,updated_ts=? WHERE batch_id=?",
-                (str(status), time.time(), batch_id),
-            )
-            conn.commit()
+        assert self._src is not None
+        self._src.mark_batch(batch_id, status)
 
     def source_turns(self, batch_id: str) -> list[dict[str, Any]]:
-        if not batch_id:
-            return []
-        rows = self._connect().execute(
-            """SELECT turn_index,role,content,event_ts,event_timezone
-               FROM source_turns WHERE batch_id=? ORDER BY turn_index""",
-            (batch_id,),
-        ).fetchall()
-        return [dict(row) for row in rows]
+        assert self._src is not None
+        return self._src.source_turns(batch_id)
 
-    def source_turn_embedding_rows(
-        self,
-        *,
-        batch_id: str = "",
-        after_id: int = 0,
-        limit: int = 64,
-        missing_only: bool = True,
-    ) -> list[dict[str, Any]]:
-        clauses = ["id>?"]
-        params: list[Any] = [max(0, int(after_id))]
-        if batch_id:
-            clauses.append("batch_id=?")
-            params.append(str(batch_id))
-        if missing_only:
-            clauses.append("embedding IS NULL")
-        params.append(max(1, min(500, int(limit))))
-        rows = self._connect().execute(
-            f"""SELECT id,batch_id,turn_index,role,content,event_ts,event_timezone
-                 FROM source_turns WHERE {' AND '.join(clauses)} ORDER BY id LIMIT ?""",
-            tuple(params),
-        ).fetchall()
-        return [dict(row) for row in rows]
+    def source_turn_embedding_rows(self, *, batch_id: str = "", after_id: int = 0,
+                                   limit: int = 64, missing_only: bool = True,
+                                   target_generation: str = "") -> list[dict[str, Any]]:
+        assert self._src is not None
+        return self._src.turn_embedding_rows(
+            batch_id=batch_id, after_id=after_id, limit=limit,
+            missing_only=missing_only, target_generation=target_generation,
+        )
 
-    def replace_source_turn_embeddings(self, rows: list[tuple[int, list[float]]]) -> int:
-        if not rows:
-            return 0
-        with self._lock:
-            conn = self._connect()
-            updated = 0
-            try:
-                conn.execute("BEGIN")
-                for row_id, vector in rows:
-                    blob = _serialize_f32(vector)
-                    cur = conn.execute(
-                        "UPDATE source_turns SET embedding=? WHERE id=?",
-                        (blob, int(row_id)),
-                    )
-                    if not cur.rowcount:
-                        continue
-                    updated += 1
-                    content_row = conn.execute(
-                        "SELECT content FROM source_turns WHERE id=?", (int(row_id),)
-                    ).fetchone()
-                    if content_row:
-                        conn.executemany(
-                            "INSERT OR IGNORE INTO source_turn_terms(turn_id,term) VALUES (?,?)",
-                            [
-                                (int(row_id), term)
-                                for term in sorted(_terms(content_row["content"]))[:120]
-                            ],
-                        )
-                    if self._vec_ok:
-                        conn.execute("DELETE FROM vec_source_turns WHERE rowid=?", (int(row_id),))
-                        conn.execute(
-                            "INSERT INTO vec_source_turns(rowid,embedding) VALUES (?,?)",
-                            (int(row_id), blob),
-                        )
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-        return updated
+    def source_turn_chunk_rows(self, *, after_id: int = 0, limit: int = 64,
+                               missing_only: bool = True,
+                               target_generation: str = "") -> list[dict[str, Any]]:
+        assert self._src is not None
+        return self._src.chunk_embedding_rows(
+            after_id=after_id, limit=limit, missing_only=missing_only,
+            target_generation=target_generation,
+        )
+
+    def add_turn_chunks(self, turn_id: int, chunks: list[str]) -> int:
+        assert self._src is not None
+        return self._src.add_turn_chunks(turn_id, chunks)
+
+    def turn_chunks_for_turn(self, turn_id: int) -> list[dict[str, Any]]:
+        assert self._src is not None
+        return self._src.turn_chunks_for_turn(turn_id)
+
+    def replace_source_turn_embeddings(self, rows: list[tuple[int, list[float]]],
+                                        runtime_gen: str = "") -> int:
+        assert self._src is not None and self._gen is not None
+        runtime_gen = runtime_gen or self._gen.runtime_generation(
+            self.emb_model_id, int(self.emb_dim or 0)
+        )
+        return self._src.replace_turn_embeddings(rows, runtime_gen=runtime_gen)
+
+    def replace_source_chunk_embeddings(self, rows: list[tuple[int, list[float]]],
+                                        runtime_gen: str = "") -> int:
+        assert self._src is not None and self._gen is not None
+        runtime_gen = runtime_gen or self._gen.runtime_generation(
+            self.emb_model_id, int(self.emb_dim or 0)
+        )
+        return self._src.replace_chunk_embeddings(rows, runtime_gen=runtime_gen)
 
     def source_turn_vector_count(self) -> int:
-        row = self._connect().execute(
-            "SELECT COUNT(*) AS n FROM source_turns WHERE embedding IS NOT NULL"
-        ).fetchone()
-        return int(row["n"] or 0) if row else 0
+        assert self._src is not None
+        return int(self._src.counts().get("turn_vectors") or 0)
+
+    def source_chunk_vector_count(self) -> int:
+        assert self._src is not None
+        return int(self._src.counts().get("chunk_vectors") or 0)
+
+    def episode_card_embedding_rows(self, *, after_id: int = 0, limit: int = 64,
+                                    target_generation: str = "") -> list[dict[str, Any]]:
+        assert self._eps is not None
+        return self._eps.card_embedding_rows(
+            after_id=after_id, limit=limit, target_generation=target_generation,
+        )
+
+    def replace_episode_card_embeddings(self, rows: list[tuple[int, list[float]]],
+                                        runtime_gen: str = "") -> int:
+        assert self._eps is not None and self._gen is not None
+        runtime_gen = runtime_gen or self._gen.runtime_generation(
+            self.emb_model_id, int(self.emb_dim or 0)
+        )
+        return self._eps.replace_card_embeddings(rows, runtime_gen)
+
+    # ---- episode forwards (3.2 / 8.2) ---------------------------------
 
     def upsert_episode(
-        self,
-        *,
-        memo_name: str,
-        episode: dict[str, Any],
-        card_text: str,
-        embedding: list[float] | None,
-        source_batch_id: str = "",
-        source_kind: str = "legacy",
-        legacy: bool = True,
-        evidence_quality: str = "diary_derived",
-        diary_content_hash: str = "",
+        self, *,
+        memo_name: str, episode: dict[str, Any], card_text: str,
+        embedding: list[float] | None, source_batch_id: str = "",
+        source_kind: str = "legacy", legacy: bool = True,
+        evidence_quality: str = "diary_derived", diary_content_hash: str = "",
         source_updated_ts: float = 0.0,
+        diary_render_version: str = "", must_coverage: float = -1.0,
+        support_coverage: float = -1.0, transcript_risk: float = -1.0,
+        render_retry_reason: str = "", original_memo_version: str = "",
+        source_overlap_ratio: float = -1.0, direct_quote_ratio: float = -1.0,
+        compression_ratio: float = -1.0, render_fallback: bool = False,
+        runtime_gen: str = "",
     ) -> str:
-        memo_name = str(memo_name or "").strip()
-        if not memo_name:
-            raise ValueError("memo_name is required")
-        episode_id = str(episode.get("episode_id") or self.episode_id_for_memo(memo_name))
-        entities = episode.get("entities") if isinstance(episode.get("entities"), list) else []
-        unresolved = episode.get("unresolved") if isinstance(episode.get("unresolved"), list) else []
-        raw_evidence = episode.get("evidence") if isinstance(episode.get("evidence"), list) else []
-        evidence = []
-        seen_evidence: set[tuple[Any, ...]] = set()
-        for item in raw_evidence:
-            if not isinstance(item, dict):
-                continue
-            indexes = item.get("turn_indexes") if isinstance(item.get("turn_indexes"), list) else []
-            signature = (
-                str(item.get("kind") or "event").strip(),
-                str(item.get("actor") or "").strip(),
-                " ".join(str(item.get("detail") or item.get("fact") or "").split()),
-                " ".join(str(item.get("quote") or item.get("quote_text") or "").split()),
-                tuple(indexes),
+        assert self._eps is not None and self._gen is not None
+        if embedding and not runtime_gen:
+            runtime_gen = self._gen.runtime_generation(
+                self.emb_model_id, int(self.emb_dim or 0)
             )
-            if signature in seen_evidence:
-                continue
-            seen_evidence.add(signature)
-            evidence.append(item)
-        now = time.time()
-        with self._lock:
-            conn = self._connect()
-            conn.execute(
-                """INSERT INTO episodes
-                   (episode_id,memo_name,source_batch_id,source_kind,legacy,active,occurred_at,event_ts,time_basis,
-                    memory_type,importance,scene_anchor,retrieval_key,state_change,long_effect,trigger_hint,
-                    entities_json,affect_before,affect_after,unresolved_json,card_text,diary_content_hash,
-                    evidence_quality,source_updated_ts,embedding,created_ts,updated_ts)
-                   VALUES (?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(memo_name) DO UPDATE SET
-                    episode_id=excluded.episode_id,source_batch_id=excluded.source_batch_id,
-                    source_kind=excluded.source_kind,legacy=excluded.legacy,active=1,
-                    occurred_at=excluded.occurred_at,event_ts=excluded.event_ts,time_basis=excluded.time_basis,
-                    memory_type=excluded.memory_type,importance=excluded.importance,
-                    scene_anchor=excluded.scene_anchor,retrieval_key=excluded.retrieval_key,
-                    state_change=excluded.state_change,long_effect=excluded.long_effect,
-                    trigger_hint=excluded.trigger_hint,entities_json=excluded.entities_json,
-                    affect_before=excluded.affect_before,affect_after=excluded.affect_after,
-                    unresolved_json=excluded.unresolved_json,card_text=excluded.card_text,
-                    diary_content_hash=excluded.diary_content_hash,evidence_quality=excluded.evidence_quality,
-                    source_updated_ts=excluded.source_updated_ts,embedding=excluded.embedding,updated_ts=excluded.updated_ts""",
-                (
-                    episode_id, memo_name, source_batch_id or None, source_kind, 1 if legacy else 0,
-                    str(episode.get("occurred_at") or ""), float(episode.get("event_ts") or 0),
-                    str(episode.get("time_basis") or "unknown"),
-                    str(episode.get("memory_type") or "plot_fact"),
-                    max(1, min(5, int(episode.get("importance") or 3))),
-                    str(episode.get("scene_anchor") or ""), str(episode.get("retrieval_key") or ""),
-                    str(episode.get("state_change") or ""), str(episode.get("long_effect") or ""),
-                    str(episode.get("trigger_hint") or ""),
-                    json.dumps(entities, ensure_ascii=False), str(episode.get("affect_before") or ""),
-                    str(episode.get("affect_after") or ""), json.dumps(unresolved, ensure_ascii=False),
-                    str(card_text or ""), str(diary_content_hash or ""), str(evidence_quality),
-                    float(source_updated_ts or 0), _serialize_f32(embedding) if embedding else None, now, now,
-                ),
-            )
-            row = conn.execute("SELECT id FROM episodes WHERE memo_name=?", (memo_name,)).fetchone()
-            row_id = int(row["id"])
-            conn.execute("DELETE FROM episode_evidence WHERE episode_id=?", (episode_id,))
-            conn.execute("DELETE FROM episode_turn_links WHERE episode_id=?", (episode_id,))
-            for index, item in enumerate(evidence):
-                if not isinstance(item, dict):
-                    continue
-                detail = str(item.get("detail") or item.get("fact") or "").strip()
-                quote = str(item.get("quote") or item.get("quote_text") or "").strip()
-                if not detail and not quote:
-                    continue
-                conn.execute(
-                    """INSERT INTO episode_evidence
-                       (episode_id,evidence_index,kind,actor,detail,quote_text,turn_indexes_json,confidence,grounded)
-                       VALUES (?,?,?,?,?,?,?,?,?)""",
-                    (
-                        episode_id, index, str(item.get("kind") or "event"), str(item.get("actor") or ""),
-                        detail or quote, quote,
-                        json.dumps(item.get("turn_indexes") if isinstance(item.get("turn_indexes"), list) else []),
-                        max(0.0, min(1.0, float(item.get("confidence") or 0.5))),
-                        1 if item.get("grounded") else 0,
-                    ),
-                )
-                if source_batch_id:
-                    turn_indexes = (
-                        item.get("turn_indexes") if isinstance(item.get("turn_indexes"), list) else []
-                    )
-                    for value in turn_indexes:
-                        try:
-                            turn_index = int(value)
-                        except (TypeError, ValueError):
-                            continue
-                        conn.execute(
-                            """INSERT OR IGNORE INTO episode_turn_links
-                               (episode_id,batch_id,turn_index,evidence_index) VALUES (?,?,?,?)""",
-                            (episode_id, source_batch_id, turn_index, index),
-                        )
-            if self._vec_ok:
-                try:
-                    conn.execute("DELETE FROM vec_episode_cards WHERE rowid=?", (row_id,))
-                    if embedding:
-                        conn.execute(
-                            "INSERT INTO vec_episode_cards(rowid,embedding) VALUES (?,?)",
-                            (row_id, _serialize_f32(embedding)),
-                        )
-                except Exception as exc:
-                    logger.debug("[memos-memory][episode] card vector upsert failed: %s", exc)
-            conn.commit()
-        return episode_id
+        return self._eps.upsert_episode(
+            memo_name=memo_name, episode=episode, card_text=card_text,
+            embedding=embedding, source_batch_id=source_batch_id,
+            source_kind=source_kind, legacy=legacy, evidence_quality=evidence_quality,
+            diary_content_hash=diary_content_hash, source_updated_ts=source_updated_ts,
+            diary_render_version=diary_render_version, must_coverage=must_coverage,
+            support_coverage=support_coverage, transcript_risk=transcript_risk,
+            render_retry_reason=render_retry_reason,
+            original_memo_version=original_memo_version,
+            source_overlap_ratio=source_overlap_ratio,
+            direct_quote_ratio=direct_quote_ratio,
+            compression_ratio=compression_ratio,
+            render_fallback=render_fallback,
+            runtime_gen=runtime_gen,
+        )
 
     def delete_by_memo_name(self, memo_name: str) -> int:
-        with self._lock:
-            conn = self._connect()
-            row = conn.execute("SELECT id FROM episodes WHERE memo_name=?", (memo_name,)).fetchone()
-            if not row:
-                return 0
-            row_id = int(row["id"])
-            conn.execute("DELETE FROM episodes WHERE id=?", (row_id,))
-            if self._vec_ok:
-                try:
-                    conn.execute("DELETE FROM vec_episode_cards WHERE rowid=?", (row_id,))
-                except Exception:
-                    pass
-            conn.commit()
-            return 1
+        assert self._eps is not None
+        return self._eps.delete_by_memo_name(memo_name)
 
     def memo_names(self) -> set[str]:
-        rows = self._connect().execute("SELECT memo_name FROM episodes WHERE active=1").fetchall()
-        return {str(row["memo_name"]) for row in rows}
+        assert self._eps is not None
+        return self._eps.memo_names()
 
     def get_episode(self, memo_name: str) -> dict[str, Any] | None:
-        row = self._connect().execute(
-            "SELECT * FROM episodes WHERE memo_name=? AND active=1", (memo_name,),
-        ).fetchone()
-        if not row:
-            return None
-        data = dict(row)
-        data["entities"] = _json_list(data.pop("entities_json", "[]"))
-        data["unresolved"] = _json_list(data.pop("unresolved_json", "[]"))
-        data["embedding_ready"] = bool(data.get("embedding"))
-        data.pop("embedding", None)
-        return data
+        assert self._eps is not None
+        return self._eps.get_episode(memo_name)
 
-    def list_episodes(
-        self,
-        *,
-        query: str = "",
-        quality: str = "",
-        limit: int = 100,
-        offset: int = 0,
-    ) -> list[dict[str, Any]]:
-        """Return active episode cards without exposing embedding blobs."""
-        clauses = ["active=1"]
-        params: list[Any] = []
-        quality = str(quality or "").strip()
-        if quality:
-            clauses.append("evidence_quality=?")
-            params.append(quality)
-        rows = self._connect().execute(
-            f"""SELECT episode_id,memo_name,source_batch_id,source_kind,legacy,
-                       occurred_at,event_ts,time_basis,memory_type,importance,
-                       scene_anchor,retrieval_key,state_change,long_effect,trigger_hint,
-                       entities_json,affect_before,affect_after,unresolved_json,card_text,
-                       diary_content_hash,evidence_quality,source_updated_ts,created_ts,updated_ts
-                FROM episodes WHERE {' AND '.join(clauses)}
-                ORDER BY event_ts DESC, updated_ts DESC LIMIT ? OFFSET ?""",
-            (*params, max(1, min(1000, int(limit))), max(0, int(offset))),
-        ).fetchall()
-        query_terms = _terms(query)
-        result = []
-        for row in rows:
-            item = dict(row)
-            if query_terms:
-                haystack = " ".join(
-                    str(item.get(key) or "").lower()
-                    for key in (
-                        "memo_name", "occurred_at", "memory_type", "scene_anchor",
-                        "retrieval_key", "state_change", "long_effect", "trigger_hint", "card_text",
-                    )
-                )
-                if not any(term in haystack for term in query_terms):
-                    continue
-            item["entities"] = _json_list(item.pop("entities_json", "[]"))
-            item["unresolved"] = _json_list(item.pop("unresolved_json", "[]"))
-            result.append(item)
-        return result
+    def get_episode_by_id(self, episode_id: str) -> dict[str, Any] | None:
+        assert self._eps is not None
+        return self._eps.get_episode_by_id(episode_id)
+
+    def list_episodes(self, *, query: str = "", quality: str = "",
+                      limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+        assert self._eps is not None
+        return self._eps.list_episodes(query=query, quality=quality, limit=limit, offset=offset)
 
     def episode_detail(self, memo_name: str) -> dict[str, Any] | None:
-        episode = self.get_episode(memo_name)
-        if not episode:
-            return None
-        episode["evidence"] = self.evidence_for_memo(memo_name, "", limit=100)
-        episode["source_turns"] = self.source_turns(str(episode.get("source_batch_id") or ""))
-        return episode
+        assert self._eps is not None
+        return self._eps.episode_detail(memo_name)
 
     def episodes_for_batch(self, batch_id: str) -> list[dict[str, Any]]:
-        if not batch_id:
-            return []
+        assert self._eps is not None
+        return self._eps.episodes_for_batch(batch_id)
+
+    def evidence_for_memo(self, memo_name: str, query: str = "", limit: int = 3) -> list[dict[str, Any]]:
+        assert self._eps is not None
+        return self._eps.evidence_for_memo(memo_name, query, limit)
+
+    def record_diary_rollback(self, *, old_memo_name: str, episode_id: str,
+                              new_memo_names: list[str], note: str = "") -> int:
+        assert self._eps is not None
+        return self._eps.record_rollback(old_memo_name=old_memo_name, episode_id=episode_id,
+                                        new_memo_names=new_memo_names, note=note)
+
+    def record_diary_rollback_atomic(self, *, old_memo_name: str, episode_id: str,
+                                     new_memo_names: list[str], note: str = "") -> int:
+        """Insert rollback mapping inside PreviewStore's active SAVEPOINT.
+
+        No commit occurs here; PreviewStore releases/rolls back the per-item
+        savepoint and commits the whole preview status update.
+        """
+        assert self._eps is not None
+        return self._eps.record_rollback(
+            old_memo_name=old_memo_name, episode_id=episode_id,
+            new_memo_names=new_memo_names, note=note,
+            commit=False, return_last_id=True,
+        )
+
+    def rollback_rows_for_memo(self, memo_name: str) -> list[dict[str, Any]]:
+        assert self._eps is not None
+        return self._eps.rollback_rows_for_memo(memo_name)
+
+    def rollback_history(self, limit: int = 30) -> list[dict[str, Any]]:
+        assert self._eps is not None
+        return self._eps.rollback_history(limit)
+
+    def mark_rollback_reverted(self, rollback_id: int) -> None:
+        assert self._eps is not None
+        self._eps.mark_rollback_reverted(rollback_id)
+
+    # ---- persistent rewrite-preview forwards (8.2) ------------------
+
+    def save_diary_preview(self, preview: dict[str, Any]) -> dict[str, Any]:
+        assert self._previews is not None
+        return self._previews.create(preview)
+
+    @staticmethod
+    def _flatten_diary_preview(preview: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not preview:
+            return preview
+        data = dict(preview)
+        payload = data.get("payload") if isinstance(data.get("payload"), dict) else {}
+        # Compatibility surface: operational fields remain top-level while the
+        # persistent payload is still available under `payload`.
+        for key, value in payload.items():
+            data.setdefault(key, value)
+        data["new_diaries"] = list(payload.get("new_diaries") or data.get("new_diaries") or [])
+        data["new_diaries_count"] = len(data["new_diaries"])
+        return data
+
+    def get_diary_preview(self, preview_id: str) -> dict[str, Any] | None:
+        assert self._previews is not None
+        return self._flatten_diary_preview(self._previews.get(preview_id))
+
+    def list_diary_previews(self, limit: int = 30) -> list[dict[str, Any]]:
+        assert self._previews is not None
+        return [self._flatten_diary_preview(item) for item in self._previews.list(limit)]
+
+    def update_diary_preview_status(self, preview_id: str, status: str,
+                                    confirmed: bool = False) -> bool:
+        assert self._previews is not None
+        return self._previews.update_status(preview_id, status, confirmed)
+
+    def discard_diary_preview(self, preview_id: str) -> bool:
+        assert self._previews is not None
+        return self._previews.discard(preview_id)
+
+    def confirm_diary_preview(self, preview_id: str, apply_item: Any,
+                              record_rollback: Any,
+                              compensate_item: Any | None = None) -> dict[str, Any]:
+        assert self._previews is not None
+        return self._previews.confirm(
+            preview_id, apply_item, record_rollback, compensate_item=compensate_item,
+        )
+
+    def diary_preview_rollback_targets(self, preview_id: str) -> list[dict[str, Any]]:
+        assert self._previews is not None
+        return self._previews.rollback_targets(preview_id)
+
+    def discard_old_previews(self, keep: int = 20) -> int:
+        assert self._previews is not None
+        self._previews.keep = max(1, int(keep or 20))
+        return self._previews.prune()
+
+    def upsert_eval_case(self, query: str, expected_memos: list[str], *,
+                         case_id: str = "", note: str = "", source: str = "manual",
+                         enabled: bool = True) -> dict[str, Any]:
+        assert self._eps is not None
+        return self._eps.upsert_eval_case(query, expected_memos, case_id=case_id,
+                                          note=note, source=source, enabled=enabled)
+
+    def list_eval_cases(self, enabled_only: bool = False, limit: int = 300) -> list[dict[str, Any]]:
+        assert self._eps is not None
+        return self._eps.list_eval_cases(enabled_only=enabled_only, limit=limit)
+
+    def delete_eval_case(self, case_id: str) -> bool:
+        assert self._eps is not None
+        return self._eps.delete_eval_case(case_id)
+
+    def record_eval_run(self, mode: str, metrics: dict[str, Any], details: list[dict[str, Any]]) -> int:
+        assert self._eps is not None
+        return self._eps.record_eval_run(mode, metrics, details)
+
+    def record_recall_observation(self, data: dict[str, Any]) -> dict[str, Any]:
+        assert self._eps is not None
+        return self._eps.record_recall_observation(data)
+
+    def list_recall_observations(self, limit: int = 100,
+                                 safety_only: bool = False) -> list[dict[str, Any]]:
+        assert self._eps is not None
+        return self._eps.list_recall_observations(limit=limit, safety_only=safety_only)
+
+    def get_recall_observation(self, request_id: str) -> dict[str, Any] | None:
+        assert self._eps is not None
+        return self._eps.get_recall_observation(request_id)
+
+    def recall_observation_summary(self) -> dict[str, Any]:
+        assert self._eps is not None
+        return self._eps.recall_observation_summary()
+
+    def set_recall_observation_feedback(self, request_id: str, feedback: str) -> bool:
+        assert self._eps is not None
+        return self._eps.set_recall_observation_feedback(request_id, feedback)
+
+    def search_source_turns(self, query_vec: list[float], query_text: str,
+                            limit: int = 24) -> list[dict[str, Any]]:
+        assert self._src is not None
+        return self._src.search_strict_source(query_vec, query_text, limit)
+
+    def search_cards(self, query_vec: list[float], query_text: str,
+                     limit: int = 18) -> list[dict[str, Any]]:
+        assert self._eps is not None
+        return self._eps.search_cards(query_vec, query_text, limit)
+
+    # ---- 4.6.0 new generation forwards ------------------------------
+
+    def switch_generation(self, dim: int | None = None,
+                          model_id: str | None = None) -> dict[str, Any]:
+        assert self._gen is not None
+        dim = int(dim or self.emb_dim or 0)
+        model_id = str(model_id or self.emb_model_id or "unknown")
+        return self._gen.switch_after_validation(dim, model_id,
+            take_snapshot=lambda: self.snapshot_db("pre_switch"))
+
+    def rollback_generation(self) -> dict[str, Any]:
+        assert self._gen is not None
+        return self._gen.rollback()
+
+    def stats(self) -> dict[str, Any]:
+        assert self._src is not None and self._eps is not None and self._gen is not None
+        src = self._src.counts()
+        eps = self._eps.counts()
+        gen_status = self._gen.snapshot_status()
+        conn = self._conn or self._connect()
+        state_count = int(conn.execute("SELECT COUNT(*) AS n FROM semantic_states").fetchone()["n"])
+        state_versions = int(conn.execute("SELECT COUNT(*) AS n FROM semantic_state_versions").fetchone()["n"])
+        pending_state = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM semantic_state_queue WHERE status IN ('pending','failed')"
+        ).fetchone()["n"])
+        db_uuid_row = conn.execute("SELECT value FROM meta WHERE key='database_uuid'").fetchone()
+        db_uuid = str(db_uuid_row["value"]) if db_uuid_row else ""
+        return {
+            "episodes": eps.get("episodes", 0),
+            "source_grounded": eps.get("source_grounded", 0),
+            "mixed_user_edited": eps.get("mixed_user_edited", 0),
+            "diary_derived": eps.get("diary_derived", 0),
+            "evidence": eps.get("evidence", 0),
+            "source_batches": src.get("batches", 0),
+            "source_turns": src.get("turns", 0),
+            "source_turn_vectors": src.get("turn_vectors", 0),
+            "source_turn_chunks": src.get("chunks", 0),
+            "source_chunk_vectors": src.get("chunk_vectors", 0),
+            "source_turn_terms": src.get("turn_terms", 0),
+            "exact_turn_links": eps.get("exact_turn_links", 0),
+            "batch_linked_episodes": eps.get("batch_linked_episodes", 0),
+            "recoverable_episodes": eps.get("recoverable_episodes", 0),
+            "missing_embeddings": eps.get("missing_embeddings", 0),
+            "rollbacks": eps.get("rollbacks", 0),
+            "semantic_states": state_count,
+            "semantic_state_versions": state_versions,
+            "pending_state_updates": pending_state,
+            "recall_eval_cases": eps.get("recall_eval_cases", 0),
+            "recall_observations": eps.get("recall_observations", 0),
+            "vector_backend": "sqlite-vec" if self._vec_ok else "python-cosine",
+            "db_path": self.db_path,
+            "database_uuid": db_uuid,
+            "active_generation": gen_status.get("active_generation", ""),
+            "pending_generation": gen_status.get("pending_generation", ""),
+            "prev_generation": gen_status.get("prev_generation", ""),
+            "migration_status": gen_status.get("migration_status", ""),
+            "source_vector_ready": bool(src.get("turn_vectors") or src.get("chunk_vectors")),
+            "source_lexical_ready": bool(src.get("turn_terms", 0) > 0),
+            "snapshots": int(conn.execute(
+                "SELECT COUNT(*) AS n FROM db_snapshots").fetchone()["n"]),
+            "canonical_db_path": conn.execute(
+                "SELECT value FROM meta WHERE key='canonical_db_path'").fetchone()["value"]
+            if conn.execute("SELECT value FROM meta WHERE key='canonical_db_path'").fetchone() else "",
+            "path_conflict": conn.execute(
+                "SELECT value FROM meta WHERE key='path_conflict'").fetchone()["value"]
+            if conn.execute("SELECT value FROM meta WHERE key='path_conflict'").fetchone() else "",
+        }
+
+    # ---- 8.3.A/B/E guard forwards -----------------------------------
+
+    @property
+    def guard(self) -> ArchiveGuard:
+        assert self._guard is not None, "store not initialized"
+        return self._guard
+
+    def identity(self) -> dict[str, Any]:
+        assert self._guard is not None
+        return self._guard.identity_snapshot()
+
+    def snapshot_db(self, kind: str = "manual") -> dict[str, Any]:
+        assert self._guard is not None
+        return self._guard.take_snapshot(self._connect(), kind)
+
+    def list_snapshots(self, limit: int = 30) -> list[dict[str, Any]]:
+        assert self._guard is not None
+        return self._guard.list_snapshots(limit)
+
+    def restore_snapshot(self, file_name: str) -> dict[str, Any]:
+        assert self._guard is not None
+        guard = self._guard
+        def _close() -> None:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+        def _reopen() -> None:
+            self._conn = None
+            self._gen = None
+            self._src = None
+            self._eps = None
+            self._guard = None
+            self._previews = None
+            self._connect()
+        return guard.restore_snapshot(file_name, live_store_close=_close, live_store_reopen=_reopen)
+
+    def startup_self_check(self) -> dict[str, Any]:
+        assert self._guard is not None
+        return self._guard.startup_self_check()
+
+    def startup_diagnosis(self) -> dict[str, Any]:
+        assert self._guard is not None
+        return self._guard.startup_diagnosis()
+
+    def record_full_counts(self) -> dict[str, Any]:
+        assert self._guard is not None
+        return self._guard.record_full_counts()
+
+    def traceability(self) -> dict[str, Any]:
+        assert self._src is not None and self._eps is not None
+        return compute_traceability(self._src, self._eps, self.stats())
+
+    def close(self) -> None:
         with self._lock:
-            rows = self._connect().execute(
-                "SELECT memo_name FROM episodes WHERE active=1 AND source_batch_id=? ORDER BY event_ts,id",
-                (str(batch_id),),
-            ).fetchall()
-        out = []
-        for row in rows:
-            detail = self.episode_detail(str(row["memo_name"]))
-            if detail:
-                out.append(detail)
-        return out
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+            self._gen = None
+            self._src = None
+            self._eps = None
+            self._guard = None
+            self._previews = None
 
     def batch_status(self, limit: int = 30) -> list[dict[str, Any]]:
         rows = self._connect().execute(
@@ -895,6 +761,22 @@ class EpisodicStore:
             )
             conn.commit()
 
+    def mark_state_updates(self, batch_ids: list[str], status: str, error: str = "") -> int:
+        values = list(dict.fromkeys(str(value) for value in batch_ids if str(value)))
+        if not values:
+            return 0
+        placeholders = ",".join("?" for _ in values)
+        with self._lock:
+            conn = self._connect()
+            cur = conn.execute(
+                f"""UPDATE semantic_state_queue
+                    SET status=?,attempts=attempts+1,last_error=?,updated_ts=?
+                    WHERE batch_id IN ({placeholders})""",
+                (str(status), str(error or "")[:1000], time.time(), *values),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
+
     def supersede_pending_state_updates(self, reason: str = "full_rebuild") -> int:
         with self._lock:
             conn = self._connect()
@@ -905,97 +787,6 @@ class EpisodicStore:
             )
             conn.commit()
             return int(cur.rowcount or 0)
-
-    def upsert_eval_case(
-        self,
-        query: str,
-        expected_memos: list[str],
-        *,
-        case_id: str = "",
-        note: str = "",
-        source: str = "manual",
-        enabled: bool = True,
-    ) -> dict[str, Any]:
-        query = " ".join(str(query or "").split()).strip()
-        expected = list(dict.fromkeys(str(value).strip() for value in expected_memos if str(value).strip()))
-        if not query or not expected:
-            raise ValueError("query and expected_memos are required")
-        case_id = str(case_id or "").strip() or "case_" + hashlib.sha256(query.encode("utf-8")).hexdigest()[:20]
-        now = time.time()
-        with self._lock:
-            conn = self._connect()
-            existing = conn.execute(
-                "SELECT created_ts,expected_memos_json FROM recall_eval_cases WHERE case_id=?", (case_id,)
-            ).fetchone()
-            if existing:
-                expected = list(dict.fromkeys(_json_list(existing["expected_memos_json"]) + expected))
-            created_ts = float(existing["created_ts"] or now) if existing else now
-            conn.execute(
-                """INSERT OR REPLACE INTO recall_eval_cases
-                   (case_id,query,expected_memos_json,note,enabled,source,created_ts,updated_ts)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (case_id, query, json.dumps(expected, ensure_ascii=False), str(note or ""), 1 if enabled else 0,
-                 str(source or "manual"), created_ts, now),
-            )
-            conn.commit()
-        return {"case_id": case_id, "query": query, "expected_memos": expected, "enabled": bool(enabled)}
-
-    def list_eval_cases(self, enabled_only: bool = False, limit: int = 300) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM recall_eval_cases"
-        if enabled_only:
-            sql += " WHERE enabled=1"
-        sql += " ORDER BY updated_ts DESC LIMIT ?"
-        with self._lock:
-            rows = self._connect().execute(sql, (max(1, min(2000, int(limit))),)).fetchall()
-        out = []
-        for row in rows:
-            item = dict(row)
-            item["expected_memos"] = _json_list(item.pop("expected_memos_json", "[]"))
-            item["enabled"] = bool(item.get("enabled"))
-            out.append(item)
-        return out
-
-    def delete_eval_case(self, case_id: str) -> bool:
-        with self._lock:
-            conn = self._connect()
-            cur = conn.execute("DELETE FROM recall_eval_cases WHERE case_id=?", (str(case_id),))
-            conn.commit()
-            return bool(cur.rowcount)
-
-    def record_eval_run(self, mode: str, metrics: dict[str, Any], details: list[dict[str, Any]]) -> int:
-        with self._lock:
-            conn = self._connect()
-            cur = conn.execute(
-                """INSERT INTO recall_eval_runs(created_ts,mode,case_count,metrics_json,details_json)
-                   VALUES (?,?,?,?,?)""",
-                (time.time(), str(mode), len(details), json.dumps(metrics, ensure_ascii=False),
-                 json.dumps(details, ensure_ascii=False)),
-            )
-            conn.commit()
-            return int(cur.lastrowid)
-
-    def evidence_for_memo(self, memo_name: str, query: str = "", limit: int = 3) -> list[dict[str, Any]]:
-        episode = self.get_episode(memo_name)
-        if not episode:
-            return []
-        rows = self._connect().execute(
-            """SELECT kind,actor,detail,quote_text,turn_indexes_json,confidence,grounded
-               FROM episode_evidence WHERE episode_id=? ORDER BY evidence_index""",
-            (episode["episode_id"],),
-        ).fetchall()
-        query_terms = _terms(query)
-        scored = []
-        for index, row in enumerate(rows):
-            data = dict(row)
-            text = " ".join([data.get("actor") or "", data.get("detail") or "", data.get("quote_text") or ""])
-            item_terms = _terms(text)
-            overlap = len(query_terms & item_terms) / max(1, len(query_terms)) if query_terms else 0.0
-            score = overlap * 0.75 + float(data.get("confidence") or 0.0) * 0.20 + (0.05 if data.get("grounded") else 0.0)
-            data["turn_indexes"] = _json_list(data.pop("turn_indexes_json", "[]"))
-            data["match_score"] = round(score, 4)
-            scored.append((score, -index, data))
-        scored.sort(reverse=True, key=lambda item: (item[0], item[1]))
-        return [item[2] for item in scored[:max(0, int(limit))]]
 
     def episodes_for_source_turn(self, batch_id: str, turn_index: int) -> list[dict[str, Any]]:
         """Map one archived source turn back to exact or batch-level episodes."""
@@ -1047,191 +838,3 @@ class EpisodicStore:
             item for item in out[:2]
             if float(item.get("batch_link_score") or 0.0) >= max(0.0, best - 0.12)
         ]
-
-    def search_source_turns(
-        self,
-        query_vec: list[float],
-        query_text: str,
-        limit: int = 24,
-    ) -> list[dict[str, Any]]:
-        """Search first-hand archived turns with semantic and lexical evidence."""
-        limit = max(1, min(200, int(limit)))
-        with self._lock:
-            conn = self._connect()
-            candidates: dict[int, dict[str, Any]] = {}
-            if self._vec_ok and query_vec:
-                try:
-                    rows = conn.execute(
-                        """SELECT s.*,v.distance AS distance
-                           FROM vec_source_turns v JOIN source_turns s ON s.id=v.rowid
-                           WHERE v.embedding MATCH ? AND k=? ORDER BY v.distance""",
-                        (_serialize_f32(query_vec), max(limit * 3, 36)),
-                    ).fetchall()
-                    for row in rows:
-                        item = dict(row)
-                        item["semantic"] = 1.0 - float(item.pop("distance") or 0.0)
-                        candidates[int(item["id"])] = item
-                except Exception as exc:
-                    logger.debug("[memos-memory][episode] source vector search failed: %s", exc)
-            if not candidates and query_vec:
-                rows = conn.execute(
-                    "SELECT * FROM source_turns WHERE embedding IS NOT NULL"
-                ).fetchall()
-                for row in rows:
-                    item = dict(row)
-                    item["semantic"] = _cosine(query_vec, _deserialize_f32(item.get("embedding")))
-                    candidates[int(item["id"])] = item
-
-            query_terms = _terms(query_text)
-            if query_terms:
-                terms = sorted(query_terms)[:32]
-                placeholders = ",".join("?" for _ in terms)
-                lexical_rows = conn.execute(
-                    f"""SELECT s.*,COUNT(*) AS term_hits
-                         FROM source_turn_terms t JOIN source_turns s ON s.id=t.turn_id
-                         WHERE t.term IN ({placeholders})
-                         GROUP BY s.id ORDER BY term_hits DESC,s.id DESC LIMIT ?""",
-                    (*terms, max(limit * 4, 48)),
-                ).fetchall()
-                for row in lexical_rows:
-                    row_id = int(row["id"])
-                    if row_id not in candidates:
-                        item = dict(row)
-                        item["semantic"] = _cosine(
-                            query_vec, _deserialize_f32(item.get("embedding"))
-                        )
-                        candidates[row_id] = item
-
-            out = []
-            for item in candidates.values():
-                content = str(item.get("content") or "")
-                content_terms = _terms(content)
-                overlap = len(query_terms & content_terms) / max(1, len(query_terms)) if query_terms else 0.0
-                exact = sum(1 for term in query_terms if term in content.lower())
-                exact_norm = exact / max(1, len(query_terms)) if query_terms else 0.0
-                semantic = max(-1.0, min(1.0, float(item.get("semantic") or 0.0)))
-                lexical = max(overlap, exact_norm)
-                item["lexical"] = round(lexical, 4)
-                item["relevance"] = round(max(0.0, semantic * 0.78 + lexical * 0.22), 6)
-                item["score"] = round(semantic * 0.68 + overlap * 0.20 + exact_norm * 0.12, 6)
-                item.pop("embedding", None)
-                out.append(item)
-            out.sort(
-                key=lambda item: (float(item.get("score") or 0.0), float(item.get("relevance") or 0.0)),
-                reverse=True,
-            )
-            return out[:limit]
-
-    def search_cards(self, query_vec: list[float], query_text: str, limit: int = 18) -> list[dict[str, Any]]:
-        with self._lock:
-            return self._search_cards_locked(query_vec, query_text, limit)
-
-    def _search_cards_locked(self, query_vec: list[float], query_text: str, limit: int = 18) -> list[dict[str, Any]]:
-        limit = max(1, int(limit))
-        conn = self._connect()
-        candidates: dict[int, dict[str, Any]] = {}
-        if self._vec_ok and query_vec:
-            try:
-                rows = conn.execute(
-                    """SELECT e.*,v.distance AS distance
-                       FROM vec_episode_cards v JOIN episodes e ON e.id=v.rowid
-                       WHERE v.embedding MATCH ? AND k=? AND e.active=1 ORDER BY v.distance""",
-                    (_serialize_f32(query_vec), max(limit * 3, 30)),
-                ).fetchall()
-                for row in rows:
-                    item = dict(row)
-                    item["semantic"] = 1.0 - float(item.pop("distance") or 0.0)
-                    candidates[int(item["id"])] = item
-            except Exception as exc:
-                logger.debug("[memos-memory][episode] vector card search failed: %s", exc)
-        if not candidates:
-            rows = conn.execute("SELECT * FROM episodes WHERE active=1 AND embedding IS NOT NULL").fetchall()
-            for row in rows:
-                item = dict(row)
-                item["semantic"] = _cosine(query_vec, _deserialize_f32(item.get("embedding")))
-                candidates[int(item["id"])] = item
-
-        query_terms = _terms(query_text)
-        # Exact lexical evidence may rescue a card outside the ANN window.
-        # 4.5: filter inside SQLite instead of pulling every episode row into
-        # Python. Same predicate as before (substring hit on lowered card_text),
-        # so recall is identical; only rows that actually match come back.
-        if query_terms:
-            terms = sorted(query_terms, key=len, reverse=True)[:64]
-            like_clause = " OR ".join("LOWER(card_text) LIKE ? ESCAPE '\\'" for _ in terms)
-            params = [f"%{_escape_like(term)}%" for term in terms]
-            rows = conn.execute(
-                f"SELECT * FROM episodes WHERE active=1 AND ({like_clause})",
-                params,
-            ).fetchall()
-            for row in rows:
-                item = dict(row)
-                if int(item["id"]) not in candidates:
-                    item["semantic"] = _cosine(query_vec, _deserialize_f32(item.get("embedding")))
-                    candidates[int(item["id"])] = item
-
-        out = []
-        for item in candidates.values():
-            card_terms = _terms(item.get("card_text") or "")
-            overlap = len(query_terms & card_terms) / max(1, len(query_terms)) if query_terms else 0.0
-            exact = sum(1 for term in query_terms if term in str(item.get("card_text") or "").lower())
-            exact_norm = exact / max(1, len(query_terms)) if query_terms else 0.0
-            semantic = max(-1.0, min(1.0, float(item.get("semantic") or 0.0)))
-            importance = max(1, min(5, int(item.get("importance") or 3)))
-            score = semantic * 0.72 + overlap * 0.16 + exact_norm * 0.08 + ((importance - 1) / 4) * 0.04
-            item["lexical"] = round(max(overlap, exact_norm), 4)
-            item["relevance"] = round(max(0.0, semantic * 0.82 + max(overlap, exact_norm) * 0.18), 6)
-            item["score"] = round(score, 6)
-            item["entities"] = _json_list(item.pop("entities_json", "[]"))
-            item["unresolved"] = _json_list(item.pop("unresolved_json", "[]"))
-            item.pop("embedding", None)
-            out.append(item)
-        out.sort(key=lambda item: (float(item.get("score") or 0.0), float(item.get("relevance") or 0.0)), reverse=True)
-        return out[:limit]
-
-    def stats(self) -> dict[str, Any]:
-        conn = self._connect()
-        episodes = int(conn.execute("SELECT COUNT(*) AS n FROM episodes WHERE active=1").fetchone()["n"])
-        grounded = int(conn.execute(
-            "SELECT COUNT(*) AS n FROM episodes WHERE active=1 AND evidence_quality='source_grounded'"
-        ).fetchone()["n"])
-        legacy = int(conn.execute(
-            "SELECT COUNT(*) AS n FROM episodes WHERE active=1 AND evidence_quality='diary_derived'"
-        ).fetchone()["n"])
-        evidence = int(conn.execute("SELECT COUNT(*) AS n FROM episode_evidence").fetchone()["n"])
-        batches = int(conn.execute("SELECT COUNT(*) AS n FROM source_batches").fetchone()["n"])
-        turns = int(conn.execute("SELECT COUNT(*) AS n FROM source_turns").fetchone()["n"])
-        source_turn_vectors = int(conn.execute(
-            "SELECT COUNT(*) AS n FROM source_turns WHERE embedding IS NOT NULL"
-        ).fetchone()["n"])
-        missing_embeddings = int(conn.execute(
-            "SELECT COUNT(*) AS n FROM episodes WHERE active=1 AND embedding IS NULL"
-        ).fetchone()["n"])
-        state_count = int(conn.execute("SELECT COUNT(*) AS n FROM semantic_states").fetchone()["n"])
-        state_versions = int(conn.execute("SELECT COUNT(*) AS n FROM semantic_state_versions").fetchone()["n"])
-        pending_state = int(conn.execute(
-            "SELECT COUNT(*) AS n FROM semantic_state_queue WHERE status IN ('pending','failed')"
-        ).fetchone()["n"])
-        eval_cases = int(conn.execute("SELECT COUNT(*) AS n FROM recall_eval_cases WHERE enabled=1").fetchone()["n"])
-        return {
-            "episodes": episodes,
-            "source_grounded": grounded,
-            "diary_derived": legacy,
-            "evidence": evidence,
-            "source_batches": batches,
-            "source_turns": turns,
-            "source_turn_vectors": source_turn_vectors,
-            "missing_embeddings": missing_embeddings,
-            "semantic_states": state_count,
-            "semantic_state_versions": state_versions,
-            "pending_state_updates": pending_state,
-            "recall_eval_cases": eval_cases,
-            "vector_backend": "sqlite-vec" if self._vec_ok else "python-cosine",
-            "db_path": self.db_path,
-        }
-
-    def close(self) -> None:
-        with self._lock:
-            if self._conn is not None:
-                self._conn.close()
-                self._conn = None

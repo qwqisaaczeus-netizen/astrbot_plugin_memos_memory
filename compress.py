@@ -169,14 +169,20 @@ EPISODE_EXTRACTION_PROMPT = """【角色】你是 {character_name} 的情景记�
 
 【目标】{count_instruction}跨日期、地点、目标或关系阶段时分开；同一完整场景不可为了凑数量硬拆。
 
+【本地场景边界候选（候选区间）】
+{scene_candidates_json}
+{scene_candidate_instruction}
+
 【严格规则】
-1. evidence 是记忆的事实基础。每条必须写 kind、actor、detail、turn_indexes；quote 只能逐字摘自对应轮次，不能润色或拼接。
-2. 分清 user 与 {character_name}。actor 只能写 user、assistant 或双方，不得把 user 的话或感受归给角色。
-3. 客观事实、角色主观理解和长期推测必须分开。affect_before/after 是角色体验；不能冒充已发生事实。
-4. 保留关键称呼、原话、动作、物件、位置、身体反应、承诺、边界、拒绝、因果和结果。
-5. unresolved 只记录对话结束时仍悬而未决的冲突、问题、约定或期待；没有就为空数组。
-6. 对话明确剧情时间时使用 explicit_dialogue；本轮实际发生且只能依据记录时间时使用 conversation_now；无法确定时使用 unknown。
-7. 没有长期保留价值时返回 []。禁止用空泛心理描写凑记忆。
+1. evidence 是记忆的事实基础。每条必须写 kind、actor、detail、turn_indexes、tier；quote 只能逐字摘自对应轮次，不能润色或拼接。
+2. tier 只能是 must_write、supporting、archive_only。承诺、边界和关键事件必须标为 must_write；用于交代氛围或因果链的证据标为 supporting；重复、微弱或泛化内容标为 archive_only。
+3. 分清 user 与 {character_name}。actor 只能写 user、assistant 或双方，不得把 user 的话或感受归给角色。
+4. 客观事实、角色主观理解和长期推测必须分开。affect_before/after 是角色体验；不能冒充已发生事实。
+5. 保留关键称呼、原话、动作、物件、位置、身体反应、承诺、边界、拒绝、因果和结果。
+6. unresolved 只记录对话结束时仍悬而未决的冲突、问题、约定或期待；没有就为空数组。
+7. 对话明确剧情时间时使用 explicit_dialogue；本轮实际发生且只能依据记录时间时使用 conversation_now；无法确定时使用 unknown。
+8. scene_start_turn 与 scene_end_turn 必须给出情景在原始对话中的闭区间，并说明选择该边界的 reasons。
+9. 没有长期保留价值时返回 []。禁止用空泛心理描写凑记忆。
 
 【memory_type】只能是 plot_fact、relationship_shift、emotional_anchor、behavior_bias、promise_or_rule、daily_texture。
 
@@ -187,9 +193,12 @@ EPISODE_EXTRACTION_PROMPT = """【角色】你是 {character_name} 的情景记�
   "time_label":"清晨/上午/正午/下午/傍晚/晚上/深夜或空",
   "time_basis":"explicit_dialogue/conversation_now/unknown",
   "scene_anchor":"10-30字辨识锚点",
+  "scene_start_turn":0,
+  "scene_end_turn":1,
+  "reasons":["选择该场景范围的事实理由"],
   "memory_type":"relationship_shift",
   "evidence":[
-    {{"kind":"dialogue/action/fact/object/commitment/boundary/body/setting","actor":"user/assistant/双方","detail":"忠实事实","quote":"可为空的逐字原话","turn_indexes":[0,1],"confidence":0.0}}
+    {{"kind":"dialogue/action/fact/object/commitment/boundary/body/setting","actor":"user/assistant/双方","detail":"忠实事实","quote":"可为空的逐字原话","turn_indexes":[0,1],"tier":"must_write/supporting/archive_only","confidence":0.0}}
   ],
   "affect_before":"角色在事件前的心理位置，可为空",
   "affect_after":"角色在事件后的心理位置，可为空",
@@ -213,11 +222,13 @@ DIARY_RENDER_PROMPT = """【角色】你是 {character_name} 的私人日记写�
 
 【写作规则】
 1. 每个 episode_key 输出且只输出一次，不合并不同情景，不新增情景。
-2. content 必须完整保留情景模型中的人物主体、关键原话/动作/物件、情绪转折、关系因果、结果和未解决部分。
-3. 可以组织语言和描写体验，但不得增加情景模型没有支持的事实、动作、称呼、承诺或结果。
-4. 不写“根据对话”“记忆模型”“证据显示”等分析口吻。它应当像 {character_name} 真正写给自己的私密日记，而不是摘要、资料卡或条目列表。
-5. 文学性来自具体感受、动作之间的停顿和真实因果，不来自空泛抒情、重复感叹或擅自扩写。
-6. 不设硬字数上限。较长场景要写清完整过程；较短日常不必注水。
+2. content 必须是 {character_name} 第一人称的沉浸式私密日记，而不是聊天实录；禁止使用“User:”或“Assistant:”标签，也禁止逐轮复述对话。
+3. evidence 中 tier=must_write 的事实必须 100% 写入；tier=supporting 的事实整体至少写入 50%，用于保住氛围和因果；tier=archive_only 的事实必须省略。
+4. 完整保留人物主体、关键原话/动作/物件、情绪转折、关系因果、结果和未解决部分，并写清这段经历对我的 effect（影响）以及事后仍延续的 afterglow（余韵）。
+5. 可以组织语言和描写体验，但不得增加情景模型没有支持的事实、动作、称呼、承诺或结果。
+6. 不写“根据对话”“记忆模型”“证据显示”等分析口吻。它应当像 {character_name} 真正写给自己的私密日记，而不是摘要、资料卡或条目列表。
+7. 文学性来自具体感受、动作之间的停顿和真实因果，不来自空泛抒情、重复感叹或擅自扩写。
+8. 不设硬字数上限。较长场景要写清完整过程；较短日常不必注水。
 
 【情景模型】
 {episodes_json}
@@ -240,21 +251,43 @@ def build_episode_extraction_prompt(
     exact_count: bool = False,
     timezone_name: str = "Asia/Shanghai",
     message_time_context: str = "",
+    scene_candidates: list[dict] | None = None,
+    diary_cap: int = 0,
 ) -> str:
-    if exact_count:
+    import json
+
+    requested_count = max(1, int(num_diaries or 1))
+    range_cap = max(1, int(diary_cap)) if diary_cap else requested_count
+    if diary_cap:
         count_instruction = (
-            f"目标提取 {max(1, int(num_diaries or 1))} 个连续情景。先按真实日期、场景、目标、"
+            f"动态提取 1..{range_cap} 个连续情景，最多不超过 {range_cap} 个情景；"
+            "数量由有效候选范围和长期价值决定。"
+        )
+    elif exact_count:
+        count_instruction = (
+            f"目标提取 {requested_count} 个连续情景。先按真实日期、场景、目标、"
             "情绪转折和关系阶段寻找彼此独立的记忆；信息确实不足时可以少于目标，"
             "但不能因为省事漏掉已有的独立场景，也不能复制或切碎同一情感弧。"
         )
     else:
-        count_instruction = (
-            f"最多提取 {max(1, int(num_diaries or 1))} 个连续情景。"
+        count_instruction = f"最多提取 {requested_count} 个连续情景。"
+    candidates = [item for item in (scene_candidates or []) if isinstance(item, dict)]
+    if candidates:
+        candidate_instruction = (
+            "本地场景边界候选是硬边界：每个情景的 scene_start_turn..scene_end_turn 必须完整位于同一个候选范围内，"
+            "不得跨候选拼接；无有效证据的候选可以不用。"
+        )
+    else:
+        candidate_instruction = (
+            "本地候选未启用或未检测到有效边界；请直接依据原始轮次划定连续情景边界，"
+            "但仍必须输出 scene_start_turn 与 scene_end_turn。"
         )
     return EPISODE_EXTRACTION_PROMPT.format(
         character_name=character_name,
-        num_diaries=max(1, int(num_diaries or 1)),
+        num_diaries=requested_count,
         count_instruction=count_instruction,
+        scene_candidates_json=json.dumps(candidates, ensure_ascii=False, indent=2),
+        scene_candidate_instruction=candidate_instruction,
         current_time=now_context(timezone_name),
         message_time_context=message_time_context or "【逐轮时间】以每个 [对话记录时间] 为准。",
         messages=messages_text,
@@ -272,6 +305,39 @@ def build_diary_render_prompt(
         character_name=character_name,
         episodes_json=json.dumps(episodes, ensure_ascii=False, indent=2),
         messages=messages_text,
+    )
+
+
+DIARY_LITERARY_REWRITE_PROMPT = """【角色】你是 {character_name} 的私人日记文学润色者。
+请在不改变事实边界的前提下，把旧日记改写成更沉浸、更自然的第一人称私密记忆。
+
+【硬规则】
+1. 以情景模型为唯一事实边界；不新增或删除事件、动作、称呼、承诺、边界、因果和结果。
+2. tier=must_write 的证据必须 100% 保留；tier=supporting 的证据整体至少保留 50%；tier=archive_only 必须省略。
+3. 禁止聊天实录体、逐轮问答和“User:”/“Assistant:”标签；不要提到模型、证据或改写过程。
+4. 保留旧日记中有情景证据支持的独特语气与细节，删去重复、空泛和无依据内容。
+5. 写清经历造成的 effect（影响）和事后持续的 afterglow（余韵），但不得凭空制造心理结论。
+
+【旧日记】
+{previous_content}
+
+【情景模型】
+{episodes_json}
+
+【输出】只输出改写后的第一人称日记正文，不要 JSON、markdown、标题或解释。"""
+
+
+def build_diary_literary_rewrite_prompt(
+    character_name: str,
+    previous_content: str,
+    episodes: list[dict],
+) -> str:
+    import json
+
+    return DIARY_LITERARY_REWRITE_PROMPT.format(
+        character_name=character_name,
+        previous_content=str(previous_content or ""),
+        episodes_json=json.dumps(episodes, ensure_ascii=False, indent=2),
     )
 
 
@@ -333,19 +399,50 @@ def build_semantic_state_update_prompt(
             "unresolved": episode.get("unresolved") or [],
             "evidence": [
                 {
+                    "tier": item.get("tier") or "supporting",
                     "actor": item.get("actor") or "",
                     "detail": item.get("detail") or item.get("quote") or "",
                     "grounded": bool(item.get("grounded")),
                 }
-                for item in (episode.get("evidence") or [])[:12]
-                if isinstance(item, dict)
-            ],
+                for item in (episode.get("evidence") or [])
+                if isinstance(item, dict) and item.get("tier") != "archive_only"
+            ][:12],
         })
     return SEMANTIC_STATE_UPDATE_PROMPT.format(
         character_name=character_name,
         target_chars=max(600, int(target_chars or 1800)),
         current_state=current_text,
         episodes_json=json.dumps(evidence_view, ensure_ascii=False, indent=2),
+    )
+
+
+QUERY_PLAN_DISAMBIGUATE_PROMPT = """你是记忆检索查询消歧器。请结合上下文判断用户查询中的人物、代词、事件、时间、地点或物件指向，生成忠实且可检索的查询计划。
+
+【规则】
+1. 不得补造上下文未提供的事实；仍有歧义时明确列出，不要擅自选定。
+2. 保留用户原意、情绪和限制条件，把上下文只用于解析指代和省略信息。
+3. 输出严格 JSON，不要 markdown 或解释。
+
+【用户查询】
+{user_query}
+
+【可用上下文】
+{context_text}
+
+【输出格式】
+{{
+  "resolved_query":"消歧后的完整查询；无法唯一确定时保留中性表述",
+  "entities":["明确的人物、称呼、地点、物件或事件"],
+  "time_constraints":["明确或可核验的时间限制"],
+  "ambiguities":["仍无法消除的歧义"],
+  "search_queries":["用于记忆检索的高密度查询"]
+}}"""
+
+
+def build_query_plan_disambiguation_prompt(user_query: str, context_text: str) -> str:
+    return QUERY_PLAN_DISAMBIGUATE_PROMPT.format(
+        user_query=str(user_query or ""),
+        context_text=str(context_text or "") or "（无可用上下文）",
     )
 
 
@@ -423,6 +520,7 @@ def format_messages_for_prompt(
     contexts: list,
     max_turns: int = 30,
     timezone_name: str = "Asia/Shanghai",
+    max_chars_per_turn: int = 0,
 ) -> str:
     """Format chat contexts with a persisted real-time marker for every turn."""
     if not contexts:
@@ -430,15 +528,18 @@ def format_messages_for_prompt(
     recent = contexts[-(max_turns * 2):]
     lines: list[str] = []
     last_marker = None
+    char_cap = max(0, int(max_chars_per_turn or 0))
     for turn_index, msg in enumerate(recent):
         role = msg.get("role", "") if isinstance(msg, dict) else getattr(msg, "role", "")
         content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
         if not isinstance(content, str) or not content.strip():
             continue
         ts = _message_timestamp(msg)
+        turn_timestamp = "未知"
         if ts > 0:
             zone = _message_timezone(msg, timezone_name)
             local = _local_datetime(ts, zone)
+            turn_timestamp = f"{local.strftime('%Y-%m-%d %H:%M')} · {zone}"
             marker_key = (local.strftime("%Y-%m-%d %H:%M"), zone)
             if role == "user" or marker_key != last_marker:
                 wd = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][local.weekday()]
@@ -448,7 +549,17 @@ def format_messages_for_prompt(
                 last_marker = marker_key
         speaker = "用户" if role == "user" else "我"
         clean = " ".join(content.split())
+        omitted_chars = 0
+        if char_cap > 0 and len(clean) > char_cap:
+            omitted_chars = len(clean) - char_cap
+            clean = clean[:char_cap]
         lines.append(f"[turn:{turn_index}] {speaker}: {clean}")
+        if omitted_chars:
+            lines.append(
+                f"[本轮视图已截断：省略 {omitted_chars} 字；完整原文见原文档案；"
+                f"turn:{turn_index}; timestamp:{turn_timestamp}; "
+                f"role:{role or 'unknown'}; omitted_chars:{omitted_chars}]"
+            )
     return "\n".join(lines)
 
 

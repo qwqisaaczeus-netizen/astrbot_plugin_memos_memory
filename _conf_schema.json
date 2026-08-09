@@ -119,6 +119,170 @@
     "hint": "建议开启。原始轮次只写入本地 episodic_memory.db，不写进 Memos 正文；同一批次按内容哈希幂等归档。",
     "default": true
   },
+  "raw_archive_full_assistant_text": {
+    "type": "bool",
+    "description": "原文档案始终保存完整助手回复（兼容项）",
+    "hint": "4.6 起原文所有权固定为无损；此旧键仅保留配置兼容，false 不再截断原文。显示与索引长度请分别使用 prompt view / chunk 配置。",
+    "default": true
+  },
+  "raw_archive_assistant_max_chars": {
+    "type": "int",
+    "description": "旧版助手原文上限（兼容项，不再生效）",
+    "hint": "4.6 起不再截断原文；此键仅用于读取旧配置，显示和向量索引不会改写 SourceArchive 原文。",
+    "min": 0,
+    "default": 0
+  },
+  "raw_archive_index_chunk_chars": {
+    "type": "int",
+    "description": "原文档案向量分块目标字符数",
+    "hint": "默认 800，只控制原文派生索引的分块粒度，不改写已归档原文。",
+    "min": 200,
+    "max": 4000,
+    "default": 800
+  },
+  "raw_archive_prompt_view_max_chars": {
+    "type": "int",
+    "description": "原文提示视图单项最大字符数",
+    "hint": "默认 1200，只限制生成提示中的原文视图，不截断数据库原文；0 表示不提供该视图。",
+    "min": 0,
+    "max": 12000,
+    "default": 1200
+  },
+  "scene_split_enable": {
+    "type": "bool",
+    "description": "启用确定性场景切分",
+    "hint": "按跨日、长停顿和明确场景线索识别 lead boundary，再交给证据提取验证。",
+    "default": true
+  },
+  "scene_split_gap_seconds": {
+    "type": "float",
+    "description": "场景切分长停顿阈值（秒）",
+    "hint": "默认 10800（3 小时）。相邻轮次间隔达到该值时建立候选场景前导边界。",
+    "min": 60,
+    "max": 172800,
+    "default": 10800
+  },
+  "evidence_tier_enable": {
+    "type": "bool",
+    "description": "启用证据 MUST/SHOULD 分层",
+    "hint": "必须证据用于完整性硬校验，可选证据用于提升细节覆盖；关闭后使用兼容覆盖判断。",
+    "default": true
+  },
+  "diary_literary_mode": {
+    "type": "bool",
+    "description": "启用第一人称文学日记模式",
+    "hint": "在已核验证据边界内保留动作、感受和关系变化，避免写成机器摘要。",
+    "default": true
+  },
+  "diary_transcript_check_enable": {
+    "type": "bool",
+    "description": "启用日记逐字稿风险检查",
+    "hint": "检测日记是否大段照抄原始对话；命中风险时进入受控重写流程。",
+    "default": true
+  },
+  "diary_first_person_check_enable": {
+    "type": "bool",
+    "description": "启用日记第一人称检查",
+    "hint": "校验日记是否保持角色第一人称视角，避免旁观者总结或对话转录。",
+    "default": true
+  },
+  "diary_must_coverage_threshold": {
+    "type": "float",
+    "description": "日记 MUST 证据覆盖率门槛",
+    "hint": "默认 0.9。低于门槛时触发补写或重写；范围 0.3–1.0。",
+    "min": 0.3,
+    "max": 1.0,
+    "step": 0.01,
+    "default": 0.9
+  },
+  "diary_rewrite_preview_min_chars": {
+    "type": "int",
+    "description": "日记重写进入预览确认的最小字符数",
+    "hint": "默认 2200。较长重写先保存预览，由逐项事务确认，避免一次性替换多篇日记。",
+    "min": 800,
+    "max": 12000,
+    "default": 2200
+  },
+  "diary_count_max_cap": {
+    "type": "int",
+    "description": "单批场景与日记数量硬上限",
+    "hint": "默认 6。SceneSplitter 最多保留该数量的候选场景；真实篇数仍由证据决定，不会硬凑。",
+    "min": 1,
+    "max": 12,
+    "default": 6
+  },
+  "query_plan_enable": {
+    "type": "bool",
+    "description": "启用查询规划器",
+    "hint": "结合当前问题与有限上下文识别人物、时间、关系和指代，为召回生成确定性计划。",
+    "default": true
+  },
+  "query_plan_context_window": {
+    "type": "int",
+    "description": "查询规划读取的最近上下文消息数",
+    "hint": "默认 8，只供 QueryPlanner 消歧与线索提取使用。",
+    "min": 1,
+    "max": 20,
+    "default": 8
+  },
+  "query_plan_llm_disambiguate": {
+    "type": "bool",
+    "description": "启用查询规划 LLM 低置信消歧",
+    "hint": "默认关闭。只有确定性计划置信度不足时才调用模型；失败会继续使用规则计划。",
+    "default": false
+  },
+  "query_plan_llm_provider_id": {
+    "type": "string",
+    "description": "查询规划消歧模型",
+    "hint": "留空继承当前会话模型。仅在 query_plan_llm_disambiguate=true 且置信度不足时调用。",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "query_plan_llm_confidence_threshold": {
+    "type": "float",
+    "description": "查询规划触发 LLM 消歧的置信度门槛",
+    "hint": "默认 0.5。规则计划置信度低于该值时才尝试 LLM 消歧；范围 0.1–0.95。",
+    "min": 0.1,
+    "max": 0.95,
+    "step": 0.01,
+    "default": 0.5
+  },
+  "db_snapshot_keep": {
+    "type": "int",
+    "description": "数据库自动快照保留数量",
+    "hint": "默认保留最近 3 份。升级或结构变更前由 ArchiveGuard 创建独立快照；不会把不同数据库合并。",
+    "min": 1,
+    "max": 20,
+    "default": 3
+  },
+  "data_backup_enable": {
+    "type": "bool",
+    "description": "启用插件数据周期备份",
+    "hint": "默认开启。使用 SQLite 在线备份保存 memories.db、episodic_memory.db 与心潮状态 JSON；不包含 Memos Token、AstrBot 配置或 Memos 服务端数据库。",
+    "default": true
+  },
+  "data_backup_interval_days": {
+    "type": "int",
+    "description": "插件数据备份间隔（天）",
+    "hint": "默认 14 天。首次没有备份时会在插件完成初始化后创建一份，此后按最近成功备份时间计算。",
+    "min": 1,
+    "max": 365,
+    "default": 14
+  },
+  "data_backup_keep": {
+    "type": "int",
+    "description": "周期数据备份保留份数",
+    "hint": "默认保留最近 6 份；只清理本功能生成的 memory_backup_*.zip。",
+    "min": 1,
+    "max": 52,
+    "default": 6
+  },
+  "data_backup_dir": {
+    "type": "string",
+    "description": "插件数据备份目录",
+    "hint": "默认位于 memories.db 同目录的 data_backups 子目录。修改后需重载插件。",
+    "default": "./data/astrbot_plugin_memos_memory/data_backups"
+  },
   "episode_extraction_provider_id": {
     "type": "string",
     "description": "情景与证据提取模型",
@@ -187,6 +351,7 @@
   "episodic_evidence_per_memory": {
     "type": "int",
     "description": "每条记忆最多注入几项查询相关证据",
+    "hint": "当前精简主路中，先按问题类型选择最多 1-2 个需要原文论证的记忆组，再用本参数限制每组内部的一手证据条数。普通约束问题每组只给 1 条；日期、原话、争议等精确问题最多使用这里配置的条数。",
     "min": 1,
     "max": 8,
     "default": 3
@@ -235,6 +400,46 @@
     "min": 600,
     "max": 6000,
     "default": 1800
+  },
+  "semantic_state_update_policy": {
+    "type": "string",
+    "description": "滚动状态更新节奏",
+    "hint": "推荐 adaptive：重大关系变化立即融合，普通日常累计多个压缩批次后合并，最长等待时间到达时兜底；日记和 Episode 仍会立即保存并可召回。every_batch 仅用于兼容旧行为。",
+    "options": ["adaptive", "every_batch"],
+    "default": "adaptive"
+  },
+  "semantic_state_batch_threshold": {
+    "type": "int",
+    "description": "普通批次累计多少次后融合状态",
+    "hint": "默认 3。只影响没有重大承诺、边界、身份或关系转折的普通批次；达到数量后会合并为一次状态 LLM 调用。",
+    "min": 1,
+    "max": 12,
+    "default": 3
+  },
+  "semantic_state_max_wait_hours": {
+    "type": "float",
+    "description": "普通状态更新最长等待小时",
+    "hint": "默认 72 小时。即使未累计到批次数，也会在最长等待后融合，避免低频聊天的状态长期滞后。",
+    "min": 1,
+    "max": 720,
+    "default": 72
+  },
+  "semantic_state_significance_threshold": {
+    "type": "float",
+    "description": "重大变化立即融合阈值",
+    "hint": "默认 0.72。由记忆类型、重要度、状态变化、长期影响、未解决事项及 must_write 证据共同计算；承诺、边界和身份等硬信号会直接保护。",
+    "min": 0.35,
+    "max": 0.95,
+    "step": 0.01,
+    "default": 0.72
+  },
+  "semantic_state_merge_max_batches": {
+    "type": "int",
+    "description": "单次状态融合最多合并批次数",
+    "hint": "默认 6。限制一次状态 Prompt 的体积；运行时不会低于普通批次阈值，更多待处理批次保留到下一轮。",
+    "min": 1,
+    "max": 20,
+    "default": 6
   },
   "semantic_state_auto_bootstrap": {
     "type": "bool",
@@ -372,6 +577,38 @@
     "max": 0.9,
     "default": 0.6
   },
+  "recall_cross_layer_consistency_enable": {
+    "type": "bool",
+    "description": "跨层证据一致性加分",
+    "hint": "默认开启。日记段落、情景卡和原始轮次中至少两个独立表示共同支持同一候选时小幅加分；旧记忆缺层时不扣分。",
+    "default": true
+  },
+  "recall_temporal_constraints_enable": {
+    "type": "bool",
+    "description": "精确时间约束排序",
+    "hint": "默认开启。识别明确日期、月份、季节、今天/昨天以及第一次、上一次、最近一次等约束并加权对应候选；不会硬删除其他候选。",
+    "default": true
+  },
+  "recall_intent_layer_weights_enable": {
+    "type": "bool",
+    "description": "按问题意图调整记忆层权重",
+    "hint": "默认开启。具体事件偏向原文证据，时间问题偏向情景卡，当前关系偏向状态变化，叙事回顾允许更宽剧情覆盖。",
+    "default": true
+  },
+  "recall_observation_enable": {
+    "type": "bool",
+    "description": "记录召回安全网实际效果",
+    "hint": "默认开启。只把请求 ID、查询、入选 memo 名和安全网结果写入本地评测表，用于判断保底是否真的救回；不修改日记、原文或 Memos。",
+    "default": true
+  },
+  "recall_auto_eval_limit": {
+    "type": "int",
+    "description": "自动生成召回评测样本上限",
+    "hint": "默认 80。召回实验室从正反馈、真实注入回放和已有情景证据生成本地评测集时的最大样本数。",
+    "min": 20,
+    "max": 200,
+    "default": 80
+  },
   "inject_char_budget": {
     "type": "int",
     "description": "记忆注入软字符目标（0 关闭）",
@@ -458,8 +695,8 @@
   },
   "enable_injection_style_rules": {
     "type": "bool",
-    "description": "启用注入风格规则",
-    "hint": "建议开启。会明确要求模型把人格记忆演出来，不机械复述；剧情只在相关时承接；日常碎片只作氛围。",
+    "description": "旧分层注入风格规则（兼容回退）",
+    "hint": "仅在关闭 4.x 精简召回并走旧分层注入时生效。当前全量 Memory 融合主路使用统一的历史边界与表达规则，不读取此开关。",
     "default": true
   },
   "enable_time_insight_affiliate": {
@@ -663,14 +900,14 @@
   },
   "inject_format": {
     "type": "string",
-    "description": "注入格式(diary|summary|quote, 默认 diary)",
-    "hint": "diary=纯原文; summary=前 N 字摘要(省 token); quote=引用体(你曾在X记下:...)。",
+    "description": "旧注入格式（兼容回退）",
+    "hint": "仅旧注入路径使用。4.x 全量 Memory 融合会按查询证据决定完整日记、段落或紧凑事件卡，不由此键截断。",
     "default": "diary"
   },
   "summary_chars": {
     "type": "int",
-    "description": "summary 格式的截断长度(默认 200)",
-    "hint": "inject_format=summary 时生效。",
+    "description": "旧 summary 截断长度（兼容回退）",
+    "hint": "仅旧注入路径且 inject_format=summary 时生效。",
     "default": 200
   },
   "recall_dedup_window": {

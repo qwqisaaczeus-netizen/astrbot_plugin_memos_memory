@@ -208,6 +208,17 @@ def prepare_memories(
         importance = int(clamp(raw.get("importance"), 1, 5, 3))
         manual = bool(int(raw.get("manual") or 0))
         feedback = clamp(raw.get("feedback_effect"), -0.5, 0.5, 0.0)
+        evidence_quality = str(raw.get("evidence_quality") or "diary_derived")
+        turn_link_count = int(clamp(raw.get("turn_link_count"), 0, 1000000, 0))
+        grounded_evidence_count = int(clamp(
+            raw.get("grounded_evidence_count"), 0, 1000000, 0,
+        ))
+        source_recoverable = bool(raw.get("source_recoverable") or turn_link_count > 0)
+        grounding_bonus = {
+            "source_grounded": 0.055,
+            "mixed_user_edited": 0.035,
+        }.get(evidence_quality, 0.0)
+        recoverable_bonus = 0.025 if source_recoverable else 0.0
         if importance < cfg.min_importance and not manual and feedback <= 0:
             continue
         quality = (
@@ -217,6 +228,8 @@ def prepare_memories(
             + (0.08 if manual else 0.0)
             + max(-0.12, min(0.10, feedback * 0.25))
             + (0.04 if str(raw.get("memory_type") or "") in PERSONA_TYPES else 0.0)
+            + grounding_bonus
+            + recoverable_bonus
             - (0.10 if "too_frequent" in actions else 0.0)
         )
         prepared.append({
@@ -234,6 +247,10 @@ def prepare_memories(
             "entities_list": parse_jsonish_list(raw.get("entities")),
             "tags_list": parse_jsonish_list(raw.get("tags")),
             "text": text,
+            "evidence_quality": evidence_quality,
+            "turn_link_count": turn_link_count,
+            "grounded_evidence_count": grounded_evidence_count,
+            "source_recoverable": source_recoverable,
             "quality": round(max(0.0, min(1.0, quality)), 4),
         })
     prepared.sort(key=lambda item: (item["event_date"], item["importance"]), reverse=True)
@@ -256,6 +273,10 @@ def _evidence(memory: dict[str, Any], reason: str, score: float) -> dict[str, An
         "date_confidence": memory["date_confidence"],
         "score": round(score, 4),
         "entities": memory["entities_list"],
+        "evidence_quality": memory.get("evidence_quality", "diary_derived"),
+        "source_recoverable": bool(memory.get("source_recoverable")),
+        "turn_link_count": int(memory.get("turn_link_count") or 0),
+        "grounded_evidence_count": int(memory.get("grounded_evidence_count") or 0),
     }
 
 
@@ -485,7 +506,7 @@ def build_candidates(
         reverse=True,
     )
     stats = {
-        "engine_version": 3,
+        "engine_version": 4,
         "generated_date": now.date().isoformat(),
         "source_memories": len(memories),
         "dated_memories": len(prepared),
@@ -495,6 +516,13 @@ def build_candidates(
             for kind in priority
         },
         "excluded_undated_or_invalid": max(0, len(memories) - len(prepared)),
+        "source_grounded_memories": sum(
+            1 for item in prepared
+            if item.get("evidence_quality") in {"source_grounded", "mixed_user_edited"}
+        ),
+        "source_recoverable_memories": sum(
+            1 for item in prepared if item.get("source_recoverable")
+        ),
     }
     return candidates, stats
 

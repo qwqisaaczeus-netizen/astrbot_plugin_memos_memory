@@ -128,9 +128,10 @@ class FakeContext:
 
 
 class FakeHost:
-    def __init__(self, db_path, external=False):
+    def __init__(self, db_path, external=False, episodic_db_path=None):
         self.context = FakeContext(external=external)
         self.vec_db_path = str(db_path)
+        self.episodic_db_path = str(episodic_db_path or Path(db_path).with_name("episodic_memory.db"))
         self.rp_time_timezone = "Asia/Shanghai"
         self.config = {
             "enable_time_insight_affiliate": True,
@@ -139,6 +140,13 @@ class FakeHost:
             "time_insight_min_evidence_score": 0.60,
             "time_insight_ambient_max_insights": 1,
             "time_insight_repeat_cooldown_minutes": 180,
+        }
+
+    def _semantic_state_status(self):
+        return {
+            "state": {
+                "rendered_text": "关系位置：愿意直接沟通；当前边界：不把历史日期当作正在发生。",
+            },
         }
 
 
@@ -181,6 +189,51 @@ class TimeInsightServiceTests(unittest.IsolatedAsyncioTestCase):
         conn.commit()
         conn.close()
 
+    @staticmethod
+    def create_episode_db(path):
+        conn = sqlite3.connect(path)
+        conn.execute(
+            """CREATE TABLE episodes (
+                episode_id TEXT PRIMARY KEY, memo_name TEXT, source_kind TEXT,
+                evidence_quality TEXT, occurred_at TEXT, event_ts REAL,
+                time_basis TEXT, memory_type TEXT, importance INTEGER,
+                scene_anchor TEXT, retrieval_key TEXT, state_change TEXT,
+                long_effect TEXT, trigger_hint TEXT, entities_json TEXT,
+                active INTEGER
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE episode_turn_links (
+                episode_id TEXT, batch_id TEXT, turn_index INTEGER, evidence_index INTEGER
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE episode_evidence (
+                episode_id TEXT, grounded INTEGER
+            )"""
+        )
+        today = datetime.now(ZoneInfo("Asia/Shanghai"))
+        occurred = f"{today.year - 1:04d}-{today.month:02d}-{today.day:02d}"
+        conn.execute(
+            "INSERT INTO episodes VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "ep-anniversary", "memos/anniversary", "episode_extraction",
+                "source_grounded", occurred, 0, "explicit", "promise_or_rule", 5,
+                "雨夜约定", "爱莉 雨夜 约定", "关系更信任", "会认真对待约定",
+                "谈到雨夜时自然想起", '["爱莉"]', 1,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO episode_turn_links VALUES (?,?,?,?)",
+            ("ep-anniversary", "batch-1", 2, 0),
+        )
+        conn.execute(
+            "INSERT INTO episode_evidence VALUES (?,?)",
+            ("ep-anniversary", 1),
+        )
+        conn.commit()
+        conn.close()
+
     async def test_integrated_update_and_request_injection(self):
         with tempfile.TemporaryDirectory() as temp:
             db = Path(temp) / "memories.db"
@@ -196,6 +249,27 @@ class TimeInsightServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(injected["selected"], 1)
             self.assertIn("memos_time_insight_v3", event.extra)
             self.assertIn("不是当前事件", request.extra_user_content_parts[-1].text)
+
+    async def test_v4_uses_episode_traceability_and_one_request_time_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            db = root / "memories.db"
+            episode_db = root / "episodic_memory.db"
+            self.create_db(db)
+            self.create_episode_db(episode_db)
+            service = IntegratedTimeInsightService(FakeHost(db, episodic_db_path=episode_db))
+            result = await service.update("v4-grounding")
+            self.assertEqual(result["engine_version"], 4)
+            self.assertEqual(result["source_grounded_memories"], 1)
+            self.assertEqual(result["source_recoverable_memories"], 1)
+            request = SimpleNamespace(extra_user_content_parts=[])
+            event = FakeEvent("爱莉，还记得去年今天的雨夜约定吗")
+            snapshot = datetime(2026, 8, 9, 3, 4, 5, tzinfo=ZoneInfo("UTC"))
+            injected = await service.on_request(event, request, request_now=snapshot)
+            self.assertEqual(injected["source_recoverable"], 1)
+            self.assertIn("memos/anniversary", injected["evidence_memos"])
+            self.assertIn("2026-08-09 11:04:05", request.extra_user_content_parts[-1].text)
+            self.assertIn("memos_time_insight_v4", event.extra)
 
     async def test_external_affiliate_yields_without_double_injection(self):
         with tempfile.TemporaryDirectory() as temp:

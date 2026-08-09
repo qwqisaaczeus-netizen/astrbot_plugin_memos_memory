@@ -11,6 +11,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -55,6 +56,10 @@ class PerceptionCallError(RuntimeError):
 
 _PERCEPTION_CIRCUIT_FAILURES = 3
 _PERCEPTION_CIRCUIT_SECONDS = 180.0
+# 4.5.3-beta: a provider that stays broken should stop costing one full timeout every
+# three minutes, so each re-open doubles the cooldown up to this ceiling.
+_PERCEPTION_CIRCUIT_MAX_SECONDS = 1800.0
+_SETTLE_SLEEP_SLICE_SECONDS = 15.0
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -71,6 +76,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "perception_provider_id": "",
     "live_perception_timeout_seconds": 10,
     "post_perception_timeout_seconds": 60,
+    # 4.5.3-beta: burst messages on one scope share a single background settlement
+    # call instead of racing one LLM call (and one state write) per turn.
+    "post_perception_coalesce_enable": True,
+    "post_perception_max_batch_turns": 4,
     # Compatibility input for settings saved before the two stages split.
     "perception_timeout_seconds": 20,
     "perception_min_confidence": 0.68,
@@ -232,6 +241,7 @@ def validate_settings(value: Any) -> dict[str, Any]:
         "dream_memory_enable", "proactive_enable", "dream_push_enable",
         "daytime_emergence_enable", "live_appraisal_enable", "diagnostic_log",
         "body_rhythm_enable", "body_time_modulation", "body_closeness_influence",
+        "post_perception_coalesce_enable",
     ):
         cfg[key] = bool(cfg[key])
     if cfg["scope"] not in {"character", "session"}:
@@ -250,6 +260,9 @@ def validate_settings(value: Any) -> dict[str, Any]:
     )
     cfg["post_perception_timeout_seconds"] = _clamp(
         cfg["post_perception_timeout_seconds"], 10, 180, 60,
+    )
+    cfg["post_perception_max_batch_turns"] = _int(
+        cfg["post_perception_max_batch_turns"], 1, 8, 4,
     )
     cfg["perception_min_confidence"] = _clamp(cfg["perception_min_confidence"], 0.4, 0.95, 0.68)
     cfg["injection_max_drives"] = _int(cfg["injection_max_drives"], 1, 5, 3)
@@ -318,6 +331,7 @@ class XinchaoController:
             "provider": "",
             "consecutive_failures": 0,
             "circuit_until": 0.0,
+            "circuit_backoff_seconds": 0.0,
             "last_error": "",
             "last_error_kind": "",
             "last_failure_at": 0.0,
@@ -331,7 +345,6 @@ class XinchaoController:
         self.store = StateStore(data_dir / "xinchao_state.json")
         self.settings = copy.deepcopy(DEFAULT_SETTINGS)
         self._settle_task: asyncio.Task | None = None
-        self._jobs: set[asyncio.Task] = set()
         self._last_injection: dict[str, dict[str, Any]] = {}
         self._last_perception: dict[str, dict[str, Any]] = {}
         self._last_body_phase: dict[str, str] = {}
@@ -340,6 +353,14 @@ class XinchaoController:
             "post": self._new_perception_health(),
         }
         self._active_send_locks: dict[str, asyncio.Lock] = {}
+        # 4.5.3-beta: background-channel coordination (merged back from the 4.5.2
+        # branch, with the TOCTOU/lost-message races fixed). Generator runs are
+        # guarded per scope via a plain running-flag, and burst turns on one scope
+        # queue up into a single settlement call instead of one call per message.
+        self._generator_running: dict[str, bool] = {}
+        self._pending_turns: dict[str, list[dict[str, Any]]] = {}
+        self._perception_workers: dict[str, asyncio.Task] = {}
+        self._perception_batch_stats: dict[str, dict[str, Any]] = {}
         self._event_history: list[dict[str, Any]] = []
         self._event_history_limit = 300
         self._stopping = False
@@ -362,13 +383,21 @@ class XinchaoController:
 
     async def terminate(self) -> None:
         self._stopping = True
-        tasks = [task for task in [self._settle_task, *self._jobs] if task is not None]
+        tasks = [
+            task for task in [
+                self._settle_task,
+                *self._perception_workers.values(),
+            ]
+            if task is not None
+        ]
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._settle_task = None
-        self._jobs.clear()
+        self._perception_workers.clear()
+        self._pending_turns.clear()
+        self._generator_running.clear()
         self._active_send_locks.clear()
         self._initialized = False
 
@@ -475,20 +504,95 @@ class XinchaoController:
             character_key=character,
         )
 
-    def _spawn(self, awaitable: Any, name: str) -> None:
-        task = asyncio.create_task(awaitable, name=name)
-        self._jobs.add(task)
-        def done(finished: asyncio.Task) -> None:
-            self._jobs.discard(finished)
-            if finished.cancelled():
-                return
-            try:
-                exc = finished.exception()
-            except Exception:
-                return
-            if exc is not None:
-                self._record("error", f"后台任务 {name} 失败", {"error": str(exc)[:240]})
-        task.add_done_callback(done)
+    def _enqueue_perception(
+        self, key: str, umo: str, user_text: str, assistant_text: str,
+        live_appraisal: dict[str, Any] | None,
+        request_context: str = "",
+    ) -> None:
+        """Queue one turn for the background channel, one worker per scope.
+
+        4.5.3-beta: merged back from 4.5.2 with the spawn race fixed. A worker
+        removes itself from ``_perception_workers`` in a ``finally`` block before
+        its task is marked done, so a message enqueued while the old worker is
+        exiting always sees the slot empty and spawns a fresh worker instead of
+        stranding the turn until the next message.
+        """
+        pending = self._pending_turns.setdefault(key, [])
+        pending.append({
+            "umo": umo,
+            "user": user_text,
+            "assistant": assistant_text,
+            "liveAppraisal": live_appraisal,
+            "requestContext": str(request_context or "")[:1200],
+        })
+        # Hard bound so a flood cannot grow the queue without limit; the newest
+        # turns carry the most relevant psychological evidence.
+        limit = max(8, int(self.settings.get("post_perception_max_batch_turns") or 4) * 4)
+        if len(pending) > limit:
+            del pending[:-limit]
+        if self._perception_workers.get(key) is not None:
+            return
+        task = asyncio.create_task(
+            self._perception_worker(key), name="memos-xinchao-perception",
+        )
+        self._perception_workers[key] = task
+
+    async def _perception_worker(self, key: str) -> None:
+        try:
+            while not self._stopping:
+                pending = self._pending_turns.get(key)
+                if not pending:
+                    return
+                coalesce = bool(self.settings.get("post_perception_coalesce_enable", True))
+                max_batch = max(1, int(self.settings.get("post_perception_max_batch_turns") or 4))
+                if coalesce:
+                    # Keep the newest turns: they describe the state the character
+                    # is actually in right now. Older backlog is dropped with a
+                    # counted, logged skip (the 4.5.2 design intent).
+                    take = min(len(pending), max_batch)
+                    batch = pending[-take:]
+                    dropped = len(pending) - take
+                    self._pending_turns[key] = []
+                else:
+                    # Strict FIFO, one turn per iteration, nothing dropped: this
+                    # fixes the 4.5.2 bug where disabling coalescing silently
+                    # wiped the whole queue while processing only the oldest turn.
+                    batch = pending[:1]
+                    dropped = 0
+                    del pending[:1]
+                if dropped > 0:
+                    self._record("perception", "后台感知合并了积压轮次", {
+                        "scope": key, "merged": len(batch), "skipped": dropped,
+                    })
+                self._perception_batch_stats[key] = {
+                    "ts": time.time(), "turns": len(batch), "skipped": dropped,
+                }
+                try:
+                    await self._perceive_and_apply(
+                        key,
+                        str(batch[-1].get("umo") or ""),
+                        [str(item.get("user") or "") for item in batch],
+                        [str(item.get("assistant") or "") for item in batch],
+                        live_appraisal=next(
+                            (
+                                item["liveAppraisal"] for item in reversed(batch)
+                                if isinstance(item.get("liveAppraisal"), dict)
+                            ),
+                            None,
+                        ),
+                        request_context=str(batch[-1].get("requestContext") or ""),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # One bad batch must not strand the turns queued behind it.
+                    self._record("error", "后台感知通道失败", {
+                        "scope": key, "error": str(exc)[:240],
+                    })
+        finally:
+            # Remove ourselves before the task is marked done so a message that
+            # arrives during worker shutdown sees an empty slot and respawns.
+            self._perception_workers.pop(key, None)
 
     async def on_request(
         self,
@@ -510,15 +614,19 @@ class XinchaoController:
                 return updated
             state = await self.store.update(key, wake)
             self._record("wake", "本轮互动已唤醒心智", {"scope": key})
+        body_state = self._body_state(now=now, scope_key=key)
+        event.set_extra("xinchao_body_state", body_state)
+        event.set_extra("xinchao_request_context", self._request_context(now, body_state))
         live_appraisal = None
         user_text = str(getattr(event, "message_str", "") or "").strip()[:4000]
         if self.settings.get("live_appraisal_enable", True) and user_text:
             live_appraisal = await self._appraise_current_input(
-                event.unified_msg_origin, user_text,
+                event.unified_msg_origin,
+                user_text,
+                now=now,
+                body_state=body_state,
             )
             event.set_extra("xinchao_live_appraisal", live_appraisal)
-        body_state = self._body_state(now=now, scope_key=key)
-        event.set_extra("xinchao_body_state", body_state)
         if body_state.get("available"):
             phase_key = f"{body_state.get('date')}:{body_state.get('phase')}"
             if self._last_body_phase.get(key) != phase_key:
@@ -566,26 +674,53 @@ class XinchaoController:
         key = self._scope_key(event)
         umo = event.unified_msg_origin
         live_appraisal = event.get_extra("xinchao_live_appraisal", None)
-        self._spawn(
-            self._perceive_and_apply(
-                key, umo, user_text[:4000], assistant_text[:4000],
-                live_appraisal=live_appraisal if isinstance(live_appraisal, dict) else None,
-            ),
-            "memos-xinchao-perception",
+        request_context = str(event.get_extra("xinchao_request_context", "") or "")
+        self._enqueue_perception(
+            key, umo, user_text[:4000], assistant_text[:4000],
+            live_appraisal if isinstance(live_appraisal, dict) else None,
+            request_context=request_context,
         )
 
     async def _settle_loop(self) -> None:
         while not self._stopping:
             try:
-                await asyncio.sleep(max(30, int(self.settings["settle_interval_minutes"]) * 60))
+                if not await self._settle_sleep():
+                    break
                 if not self.settings.get("enable", True):
                     continue
                 for key in await self.store.keys():
-                    await self._settle_one(key, allow_generators=True)
+                    if self._stopping:
+                        break
+                    try:
+                        await self._settle_one(key, allow_generators=True)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # One broken scope must not skip settlement for the rest.
+                        self._record("error", "后台结算失败", {
+                            "scope": key, "error": str(exc)[:240],
+                        })
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 self._record("error", "后台结算失败", {"error": str(exc)})
+
+    async def _settle_sleep(self) -> bool:
+        """Sleep the settle interval in slices so interval edits apply promptly."""
+        remaining = max(30.0, float(self.settings["settle_interval_minutes"]) * 60.0)
+        while remaining > 0:
+            if self._stopping:
+                return False
+            slice_seconds = min(_SETTLE_SLEEP_SLICE_SECONDS, remaining)
+            await asyncio.sleep(slice_seconds)
+            remaining -= slice_seconds
+            # A shortened interval takes effect on the next slice instead of
+            # after the old (possibly 24h) sleep finishes.
+            remaining = min(
+                remaining,
+                max(30.0, float(self.settings["settle_interval_minutes"]) * 60.0),
+            )
+        return not self._stopping
 
     async def _settle_one(self, key: str, allow_generators: bool = False) -> dict[str, Any]:
         meta: dict[str, Any] = {}
@@ -603,82 +738,99 @@ class XinchaoController:
         if meta.get("enteredSleep"):
             self._record("sleep", "心智进入睡眠", {"scope": key, "idle_minutes": round(meta["idleMinutes"], 1)})
         if allow_generators and not self.settings["shadow_mode"]:
-            now = datetime.now(timezone.utc)
-            if self.settings["dream_enable"] and dream_allowed(
-                state, now, self.settings["dream_min_interval_hours"], self.settings["dream_max_per_day"],
-            ):
-                state = await self._create_dream(key, state)
-            active_sent = False
-            if self.settings["proactive_enable"]:
-                latest_dream = state.get("recentDreams", [])[-1] if state.get("recentDreams") else None
-                dream_unpushed = bool(
-                    latest_dream
-                    and latest_dream.get("id")
-                    and latest_dream.get("id") != state.get("lastDreamPushDreamId")
+            # 4.5.3-beta: per-scope generator mutual exclusion via a plain running
+            # flag. This replaces the 4.5.2 ``asyncio.Lock`` + ``lock.locked()``
+            # check, which was a check-then-act race: two coroutines could both see
+            # the lock free and both fire the same dream/proactive LLM call. The
+            # flag is set synchronously before the first await, so a concurrent
+            # settle can never pass the check (single-threaded event loop).
+            if self._generator_running.get(key):
+                self._record("settle", "生成器本轮跳过（同作用域已在运行）", {"scope": key})
+                return state
+            self._generator_running[key] = True
+            try:
+                state = await self._run_generators(key, state)
+            finally:
+                self._generator_running.pop(key, None)
+        return state
+
+    async def _run_generators(self, key: str, state: dict[str, Any]) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        if self.settings["dream_enable"] and dream_allowed(
+            state, now, self.settings["dream_min_interval_hours"], self.settings["dream_max_per_day"],
+        ):
+            state = await self._create_dream(key, state)
+        active_sent = False
+        if self.settings["proactive_enable"]:
+            latest_dream = state.get("recentDreams", [])[-1] if state.get("recentDreams") else None
+            dream_unpushed = bool(
+                latest_dream
+                and latest_dream.get("id")
+                and latest_dream.get("id") != state.get("lastDreamPushDreamId")
+            )
+            if (
+                self.settings["dream_push_enable"]
+                and dream_unpushed
+                and self._provider(
+                    self.settings["proactive_provider_id"], state.get("lastUmo", ""),
+                ) is not None
+                and contact_idle_allowed(state, now, self.settings["dream_push_min_idle_hours"])
+                and bark_allowed(
+                    state, now, self.settings["dream_push_cooldown_hours"],
+                    self.settings["active_message_max_per_day"], "dream",
                 )
-                if (
-                    self.settings["dream_push_enable"]
-                    and dream_unpushed
-                    and self._provider(
-                        self.settings["proactive_provider_id"], state.get("lastUmo", ""),
-                    ) is not None
-                    and contact_idle_allowed(state, now, self.settings["dream_push_min_idle_hours"])
-                    and bark_allowed(
-                        state, now, self.settings["dream_push_cooldown_hours"],
-                        self.settings["active_message_max_per_day"], "dream",
-                    )
-                ):
-                    state, active_sent = await self._send_active_message(key, state, "dream")
-                    dream_id = latest_dream.get("id")
+            ):
+                state, active_sent = await self._send_active_message(key, state, "dream")
+                dream_id = latest_dream.get("id")
+                state = await self.store.update(
+                    key,
+                    lambda current: {
+                        **current,
+                        "lastDreamPushDreamId": dream_id,
+                        "revision": int(current.get("revision") or 0) + 1,
+                    },
+                )
+            if not active_sent and proactive_allowed(
+                state, now, self.settings["proactive_min_idle_hours"],
+                self.settings["proactive_cooldown_hours"],
+                min(
+                    self.settings["proactive_max_per_day"],
+                    self.settings["active_message_max_per_day"],
+                ),
+                self.settings["proactive_min_drive"],
+            ):
+                state, active_sent = await self._send_active_message(key, state, "autonomous_thought")
+            if self.settings["daytime_emergence_enable"]:
+                if not state.get("nextDaytimeEmergenceAt"):
                     state = await self.store.update(
                         key,
-                        lambda current: {
-                            **current,
-                            "lastDreamPushDreamId": dream_id,
-                            "revision": int(current.get("revision") or 0) + 1,
-                        },
+                        lambda current: schedule_daytime_emergence(
+                            current, now,
+                            self.settings["daytime_min_interval_hours"],
+                            self.settings["daytime_max_interval_hours"],
+                        ),
                     )
-                if not active_sent and proactive_allowed(
-                    state, now, self.settings["proactive_min_idle_hours"],
-                    self.settings["proactive_cooldown_hours"],
-                    min(
-                        self.settings["proactive_max_per_day"],
-                        self.settings["active_message_max_per_day"],
-                    ),
-                    self.settings["proactive_min_drive"],
+                    self._record("daytime", "白天记忆浮现已排期", {
+                        "scope": key,
+                        "next": state.get("nextDaytimeEmergenceAt"),
+                    })
+                elif daytime_emergence_allowed(
+                    state, now, self.settings["time_zone"],
+                    self.settings["daytime_start_hour"], self.settings["daytime_end_hour"],
+                    self.settings["daytime_max_per_day"],
                 ):
-                    state, active_sent = await self._send_active_message(key, state, "autonomous_thought")
-                if self.settings["daytime_emergence_enable"]:
-                    if not state.get("nextDaytimeEmergenceAt"):
-                        state = await self.store.update(
-                            key,
-                            lambda current: schedule_daytime_emergence(
-                                current, now,
-                                self.settings["daytime_min_interval_hours"],
-                                self.settings["daytime_max_interval_hours"],
-                            ),
+                    if not active_sent:
+                        state, active_sent = await self._send_active_message(
+                            key, state, "daytime_emergence",
                         )
-                        self._record("daytime", "白天记忆浮现已排期", {
-                            "scope": key,
-                            "next": state.get("nextDaytimeEmergenceAt"),
-                        })
-                    elif daytime_emergence_allowed(
-                        state, now, self.settings["time_zone"],
-                        self.settings["daytime_start_hour"], self.settings["daytime_end_hour"],
-                        self.settings["daytime_max_per_day"],
-                    ):
-                        if not active_sent:
-                            state, active_sent = await self._send_active_message(
-                                key, state, "daytime_emergence",
-                            )
-                        state = await self.store.update(
-                            key,
-                            lambda current: schedule_daytime_emergence(
-                                current, now,
-                                self.settings["daytime_min_interval_hours"],
-                                self.settings["daytime_max_interval_hours"],
-                            ),
-                        )
+                    state = await self.store.update(
+                        key,
+                        lambda current: schedule_daytime_emergence(
+                            current, now,
+                            self.settings["daytime_min_interval_hours"],
+                            self.settings["daytime_max_interval_hours"],
+                        ),
+                    )
         return state
 
     @staticmethod
@@ -864,26 +1016,59 @@ class XinchaoController:
             part for part in parts if part not in mind_parts
         ] + mind_parts
 
+    @staticmethod
+    def _as_turn_list(value: Any) -> list[str]:
+        if isinstance(value, (list, tuple)):
+            return [str(item or "") for item in value]
+        return [str(value or "")]
+
     async def _perceive_and_apply(
-        self, key: str, umo: str, user_text: str, assistant_text: str,
+        self, key: str, umo: str, user_text: Any, assistant_text: Any,
         live_appraisal: dict[str, Any] | None = None,
+        request_context: str = "",
     ) -> None:
-        fallback = self._rule_event(user_text, assistant_text, live_appraisal)
+        # 4.5.3-beta: accepts either a single turn (manual/test callers) or a
+        # coalesced batch of turns from the background worker.
+        user_turns = self._as_turn_list(user_text)
+        assistant_turns = self._as_turn_list(assistant_text)
+        joined_user = "\n".join(item for item in user_turns if item)
+        joined_assistant = "\n".join(item for item in assistant_turns if item)
+        fallback = self._rule_event(joined_user, joined_assistant, live_appraisal)
         event = fallback
         source = "rules"
         diagnostics: dict[str, Any] = {}
         mode = self.settings["perception_mode"]
         should_call = mode == "llm" or (
             mode == "hybrid"
-            and (len(user_text) + len(assistant_text) >= 80 or any(mark in user_text for mark in _EMOTIONAL_MARKERS))
+            and (
+                len(joined_user) + len(joined_assistant) >= 80
+                or any(mark in joined_user for mark in _EMOTIONAL_MARKERS)
+            )
         )
         if should_call:
-            if self._provider(self.settings["perception_provider_id"], umo) is None:
+            provider = self._provider(self.settings["perception_provider_id"], umo)
+            if provider is None:
                 source = "rules_no_provider"
                 diagnostics = {"reason": "provider_missing"}
+            elif self._perception_circuit_open(provider, "post"):
+                # Skip before building the prompt and character context: an open
+                # circuit means the call would be rejected anyway.
+                source = "rules_fallback"
+                remaining = self._perception_health_payload("post")["circuit_remaining_seconds"]
+                diagnostics = {
+                    "reason": "circuit_open",
+                    "error": f"感知模型连续失败，熔断剩余 {remaining:.1f} 秒",
+                    "attempts": 0,
+                }
             else:
                 try:
-                    parsed = await self._llm_perception(umo, user_text, assistant_text)
+                    parsed = await self._llm_perception(
+                        umo,
+                        user_turns,
+                        assistant_turns,
+                        live_appraisal=live_appraisal,
+                        request_context=request_context,
+                    )
                     diagnostics = dict(parsed.get("_llm_meta") or {}) if parsed else {}
                     if parsed and float(parsed.get("confidence") or 0) >= self.settings["perception_min_confidence"]:
                         event = parsed
@@ -911,6 +1096,10 @@ class XinchaoController:
                     self._record("perception", "LLM 感知异常，已使用规则", {
                         **diagnostics, "scope": key,
                     })
+        declared_activations = set(
+            str(key) for key in list(event.get("activatedDrives") or [])
+            if str(key) in DRIVE_KEYS
+        ) if isinstance(event, dict) and event is not fallback else set()
         if isinstance(event, dict) and event is not fallback:
             event = dict(event)
             fallback_activations = dict(fallback.get("activationLevels") or {})
@@ -933,6 +1122,12 @@ class XinchaoController:
             if not list(event.get("flashThoughts") or []):
                 event["flashThoughts"] = fallback.get("flashThoughts") or []
             event["fatigueDelta"] = fallback.get("fatigueDelta", 0.0)
+        event, two_stage = self._reconcile_two_stage_event(
+            event,
+            live_appraisal,
+            declared_activations=declared_activations,
+        )
+        diagnostics["two_stage"] = two_stage
         event = self._sanitize_event(event)
         if not self.settings["perception_store_summary"]:
             event["summary"] = ""
@@ -940,10 +1135,13 @@ class XinchaoController:
             updated, _ = apply_conversation_event(current, event, umo=umo)
             return updated
         state = await self.store.update(key, mutate)
+        merged_turns = max(1, len([item for item in user_turns if item]) or 1)
         self._last_perception[key] = {
             "ts": time.time(), "source": source, "event": event,
             "liveAppraisal": copy.deepcopy(live_appraisal) if isinstance(live_appraisal, dict) else None,
             "diagnostics": diagnostics,
+            "mergedTurns": merged_turns,
+            "batch": copy.deepcopy(self._perception_batch_stats.get(key) or {}),
             "revision": state["revision"],
         }
         self._record("perception", f"对话感知完成 ({source})", {
@@ -952,10 +1150,128 @@ class XinchaoController:
             "activated": event["activatedDrives"],
             "thoughts": len(event["flashThoughts"]),
             "confidence": event.get("confidence", 0),
+            "merged_turns": merged_turns,
             "diagnostics": diagnostics,
         })
 
-    async def _appraise_current_input(self, umo: str, user_text: str) -> dict[str, Any]:
+    @staticmethod
+    def _public_live_appraisal(value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            return {}
+        return {
+            key: copy.deepcopy(value.get(key))
+            for key in (
+                "activatedDrives", "activationLevels", "driveDeltas",
+                "flashThoughts", "guidance", "confidence",
+            )
+            if key in value
+        }
+
+    @staticmethod
+    def _reconcile_two_stage_event(
+        value: Any,
+        live_appraisal: dict[str, Any] | None,
+        *,
+        declared_activations: set[str] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        event = dict(value) if isinstance(value, dict) else {}
+        live = live_appraisal if isinstance(live_appraisal, dict) else {}
+        live_keys = [
+            str(key) for key in list(live.get("activatedDrives") or [])
+            if str(key) in DRIVE_KEYS
+        ]
+        if not live_keys:
+            return event, {
+                "available": False, "compared": 0,
+                "confirmed": [], "resolved": [], "carried": [],
+            }
+        declared = set(declared_activations or set())
+        activated = [
+            str(key) for key in list(event.get("activatedDrives") or [])
+            if str(key) in DRIVE_KEYS
+        ]
+        levels = {
+            str(key): float(raw or 0)
+            for key, raw in dict(event.get("activationLevels") or {}).items()
+            if str(key) in DRIVE_KEYS
+        }
+        satisfaction = {
+            str(key): float(raw or 0)
+            for key, raw in dict(event.get("satisfactionLevels") or {}).items()
+            if str(key) in DRIVE_KEYS
+        }
+        live_levels = dict(live.get("activationLevels") or {})
+        confirmed: list[str] = []
+        resolved: list[str] = []
+        carried: list[str] = []
+        for key in live_keys:
+            if key in declared:
+                confirmed.append(key)
+                continue
+            if satisfaction.get(key, 0.0) >= 0.45:
+                activated = [item for item in activated if item != key]
+                levels.pop(key, None)
+                resolved.append(key)
+                continue
+            level = max(0.0, min(1.0, float(live_levels.get(key) or 0.5) * 0.78))
+            if level >= 0.24:
+                if key not in activated:
+                    activated.append(key)
+                levels[key] = round(level, 3)
+                carried.append(key)
+        event["activatedDrives"] = list(dict.fromkeys(activated))[:4]
+        event["activationLevels"] = {
+            key: levels.get(key, 0.5) for key in event["activatedDrives"]
+        }
+        return event, {
+            "available": True,
+            "compared": len(live_keys),
+            "confirmed": confirmed,
+            "resolved": resolved,
+            "carried": carried,
+            "policy": "reply_reconciled_once",
+        }
+
+    def _request_context(
+        self,
+        now: datetime | None,
+        body_state: dict[str, Any] | None,
+    ) -> str:
+        current = now or datetime.now(timezone.utc)
+        zone_name = str(
+            getattr(self.plugin, "rp_time_timezone", "")
+            or self.settings.get("time_zone")
+            or "Asia/Shanghai"
+        )
+        try:
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=timezone.utc)
+            local = current.astimezone(ZoneInfo(zone_name))
+        except Exception:
+            zone_name = "UTC"
+            local = current.replace(tzinfo=timezone.utc) if current.tzinfo is None else current.astimezone(timezone.utc)
+        lines = [
+            f"当前时间快照：{local.strftime('%Y-%m-%d %H:%M:%S')}（{zone_name}）。",
+            "它只属于本轮现实对话；历史日记日期、梦境日期和当前身体节律不得互相替换。",
+        ]
+        body = body_state if isinstance(body_state, dict) else {}
+        if body.get("available"):
+            phase = str(body.get("phaseLabel") or body.get("phase") or "").strip()
+            band = str(body.get("timeLabel") or body.get("timeBand") or "").strip()
+            lines.append(
+                f"当前身体节律快照：日期 {body.get('date') or local.date().isoformat()}"
+                f"，阶段 {phase or '未标注'}，时段 {band or '未标注'}；仅调节角色此刻感受。"
+            )
+        return "\n".join(lines)
+
+    async def _appraise_current_input(
+        self,
+        umo: str,
+        user_text: str,
+        *,
+        now: datetime | None = None,
+        body_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         fallback = self._rule_appraisal(user_text)
         result = fallback
         source = "rules"
@@ -974,7 +1290,12 @@ class XinchaoController:
                 diagnostics = {"reason": "provider_missing"}
             else:
                 try:
-                    parsed = await self._llm_live_appraisal(umo, user_text)
+                    parsed = await self._llm_live_appraisal(
+                        umo,
+                        user_text,
+                        now=now,
+                        body_state=body_state,
+                    )
                     diagnostics = dict(parsed.get("_llm_meta") or {}) if parsed else {}
                     if parsed and float(parsed.get("confidence") or 0) >= self.settings["perception_min_confidence"]:
                         result = parsed
@@ -1003,6 +1324,7 @@ class XinchaoController:
         clean = self._sanitize_live_appraisal(result)
         clean["_source"] = source
         clean["_diagnostics"] = diagnostics
+        clean["_request_context"] = self._request_context(now, body_state)
         self._record("perception", f"本轮即时评估完成 ({source})", {
             "activated": clean["activatedDrives"],
             "confidence": clean["confidence"],
@@ -1119,7 +1441,14 @@ class XinchaoController:
             "confidence": 0.55,
         }
 
-    async def _llm_live_appraisal(self, umo: str, user_text: str) -> dict[str, Any] | None:
+    async def _llm_live_appraisal(
+        self,
+        umo: str,
+        user_text: str,
+        *,
+        now: datetime | None = None,
+        body_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         provider = self._provider(self.settings["live_perception_provider_id"], umo)
         if provider is None:
             return None
@@ -1127,6 +1456,9 @@ class XinchaoController:
         prompt = f"""你是角色持续心理状态的即时评估器。只判断“这条用户输入会立刻触发角色怎样的内在反应”，不要续写剧情，也不要把用户的情绪直接冒充角色的情绪。
 角色背景：
 {self._character_context()}
+
+本轮现实基准：
+{self._request_context(now, body_state)}
 
 可用驱动力：
 {labels}
@@ -1185,14 +1517,50 @@ class XinchaoController:
             "confidence": common["confidence"],
         }
 
-    async def _llm_perception(self, umo: str, user_text: str, assistant_text: str) -> dict[str, Any] | None:
+    async def _llm_perception(
+        self,
+        umo: str,
+        user_text: Any,
+        assistant_text: Any,
+        live_appraisal: dict[str, Any] | None = None,
+        request_context: str = "",
+    ) -> dict[str, Any] | None:
         provider = self._provider(self.settings["perception_provider_id"], umo)
         if provider is None:
             return None
+        user_turns = self._as_turn_list(user_text)
+        assistant_turns = self._as_turn_list(assistant_text)
         labels = "\n".join(f"- {key}: {DIMENSIONS[key]['label']}" for key in DRIVE_KEYS)
-        prompt = f"""你是角色心理状态的保守事件感知器。只判断这一轮实际发生的互动，不续写剧情。
+        if len(user_turns) > 1 or len(assistant_turns) > 1:
+            transcript_lines: list[str] = []
+            for index in range(max(len(user_turns), len(assistant_turns))):
+                spoken = user_turns[index] if index < len(user_turns) else ""
+                replied = assistant_turns[index] if index < len(assistant_turns) else ""
+                if spoken:
+                    transcript_lines.append(f"第{index + 1}轮 用户：{spoken}")
+                if replied:
+                    transcript_lines.append(f"第{index + 1}轮 角色：{replied}")
+            rounds = max(len(user_turns), len(assistant_turns))
+            scope_line = (
+                f"这是同一段连续互动中的 {rounds} 轮对话，"
+                "请把它们当作一次整体互动来判断累积结果，不要逐轮相加。较晚的轮次权重更高。"
+            )
+            material = scope_line + "\n\n" + "\n".join(transcript_lines)
+        else:
+            material = f"用户：{user_turns[0] if user_turns else ''}\n角色：{assistant_turns[0] if assistant_turns else ''}"
+        live_material = self._public_live_appraisal(live_appraisal)
+        request_context = str(
+            request_context or (live_appraisal or {}).get("_request_context") or ""
+        ).strip()
+        prompt = f"""你是角色心理状态的保守事件感知器。只判断实际发生的互动，不续写剧情。
 角色背景：
 {self._character_context()}
+
+本轮现实基准：
+{request_context or "未保留额外时间快照；只按下面实际对话结算。"}
+
+回答前即时评估（暂定观察，不是已经落库的结论）：
+{json.dumps(live_material, ensure_ascii=False, separators=(",", ":")) if live_material else "无"}
 
 可用驱动力：
 {labels}
@@ -1216,9 +1584,9 @@ class XinchaoController:
 4. driveDeltas 主要用于 grieve/anger 的持续余波，范围 -0.20 到 0.20；没有依据就留空。
 5. flashThoughts 最多2条，不得编造对话中没有的事实。
 6. confidence 表示“判断有多少对话依据”，不是满足或激活强度；证据清楚但变化轻微时仍应给 0.75 以上，真正模糊时才低于 0.65。
+7. 必须用角色的实际回复复核即时评估：若某驱动力已被充分满足，可降低或移除其即时激活；若回复后仍未解决，才保留。不能把前后两次判断重复累计。
 
-用户：{user_text}
-角色：{assistant_text}
+{material}
 """
         return await self._call_perception_json(
             provider,
@@ -1298,7 +1666,12 @@ class XinchaoController:
                         "activationLevels", "driveDeltas", "confidence",
                     }
                 )
-                if (required - {"confidence"}).intersection(normalized) and "confidence" in normalized:
+                present = (required - {"confidence"}).intersection(normalized)
+                minimum_fields = 2 if stage == "live" else 3
+                if len(present) >= minimum_fields and "confidence" in normalized:
+                    for key in required - {"confidence"}:
+                        if key not in normalized:
+                            normalized[key] = {} if key.endswith("Levels") or key == "driveDeltas" else []
                     self._mark_perception_success(provider, stage)
                     normalized["_llm_meta"] = {
                         "attempts": attempt,
@@ -1308,7 +1681,7 @@ class XinchaoController:
                     }
                     return normalized
                 last_kind = "schema_error"
-                last_error = "JSON 缺少感知字段或 confidence"
+                last_error = f"JSON 感知字段不足（需要至少 {minimum_fields} 项）或缺少 confidence"
             else:
                 last_kind = "parse_error" if raw_text else "empty_response"
                 last_error = "返回内容不是可解析的 JSON" if raw_text else "模型返回空内容"
@@ -1541,6 +1914,7 @@ class XinchaoController:
             "provider": self._provider_name(provider),
             "consecutive_failures": 0,
             "circuit_until": 0.0,
+            "circuit_backoff_seconds": 0.0,
             "last_error": "",
             "last_error_kind": "",
             "last_success_at": time.time(),
@@ -1559,7 +1933,14 @@ class XinchaoController:
             "last_failure_at": time.time(),
         })
         if failures >= _PERCEPTION_CIRCUIT_FAILURES:
-            health["circuit_until"] = time.monotonic() + _PERCEPTION_CIRCUIT_SECONDS
+            # A provider that is still broken when the circuit reopens should not
+            # cost another full timeout every three minutes, so each reopen-then-fail
+            # doubles the cooldown up to the ceiling.
+            previous = float(health.get("circuit_backoff_seconds") or 0.0)
+            backoff = _PERCEPTION_CIRCUIT_SECONDS if previous <= 0 else previous * 2
+            backoff = min(backoff, _PERCEPTION_CIRCUIT_MAX_SECONDS)
+            health["circuit_backoff_seconds"] = backoff
+            health["circuit_until"] = time.monotonic() + backoff
 
     def _perception_circuit_open(self, provider: Any, stage: str) -> bool:
         health = self._perception_health["live" if stage == "live" else "post"]
@@ -1570,6 +1951,7 @@ class XinchaoController:
                 "provider": provider_name,
                 "consecutive_failures": 0,
                 "circuit_until": 0.0,
+                "circuit_backoff_seconds": 0.0,
                 "last_error": "",
                 "last_error_kind": "",
             })
@@ -1579,6 +1961,20 @@ class XinchaoController:
     def _character_context(self) -> str:
         name = str(getattr(self.plugin, "character_name", "") or "当前角色").strip()
         lines = [f"角色名：{name}"]
+        state_reader = getattr(self.plugin, "_semantic_state_status", None)
+        if callable(state_reader):
+            try:
+                status = state_reader()
+                state = status.get("state") if isinstance(status, dict) else {}
+                rendered = " ".join(
+                    str((state or {}).get("rendered_text") or "").split()
+                )[:1400]
+                if rendered:
+                    lines.append(
+                        "当前滚动人格状态（已融合的现在，不是本轮事件证据）：" + rendered
+                    )
+            except Exception:
+                pass
         reader = getattr(self.plugin, "_affiliate_profile_status", None)
         if callable(reader):
             try:
@@ -2008,9 +2404,21 @@ class XinchaoController:
             "lastPerception": self._last_perception.get(key),
             "perceptionHealth": self._perception_health_payload(),
             "perceptionHealthByStage": self._perception_health_by_stage_payload(),
+            "lastBatch": copy.deepcopy(self._perception_batch_stats.get(key) or {}),
+            "perceptionQueue": self._perception_queue_payload(key),
             "logs": self._event_history[-100:],
         })
         return payload
+
+    def _perception_queue_payload(self, key: str) -> dict[str, Any]:
+        worker = self._perception_workers.get(key)
+        return {
+            "pending": len(self._pending_turns.get(key) or []),
+            "running": bool(worker is not None and not worker.done()),
+            "coalesceEnable": bool(self.settings.get("post_perception_coalesce_enable", True)),
+            "maxBatchTurns": int(self.settings.get("post_perception_max_batch_turns") or 4),
+            "lastBatch": copy.deepcopy(self._perception_batch_stats.get(key) or {}),
+        }
 
     async def settle_now(self, key: str) -> dict[str, Any]:
         selected = self.scope_key_from_query(key)

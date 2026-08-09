@@ -4,6 +4,7 @@ import asyncio
 import tempfile
 import unittest
 import json
+import time
 from pathlib import Path
 
 from astrbot_plugin_memos_memory.episodic_store import EpisodicStore
@@ -203,7 +204,7 @@ class EpisodicStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.source_turns(batch_id)[0]["content"], "这是 4.0 保留下来的原始轮次。")
         self.assertEqual(first._connect().execute(
             "SELECT value FROM meta WHERE key='schema_version'"
-        ).fetchone()["value"], "3")
+        ).fetchone()["value"], str(EpisodicStore.SCHEMA_VERSION))
         first.close()
 
         second = EpisodicStore(path, 3, "test-embedding")
@@ -262,6 +263,212 @@ class EpisodicStoreTests(unittest.IsolatedAsyncioTestCase):
             self.store.list_eval_cases()[0]["expected_memos"],
             ["memos/rain", "memos/roof"],
         )
+
+    async def test_adaptive_state_cadence_defers_daily_batches_but_never_decisive_change(self):
+        scope = "character:爱莉"
+        self.store.upsert_semantic_state(
+            scope, {"relationship_position": "关系稳定"}, reason="bootstrap",
+        )
+        plugin = object.__new__(MemosMemoryPlugin)
+        plugin._episodes = self.store
+        plugin.character_name = "爱莉"
+        plugin.semantic_state_update_policy = "adaptive"
+        plugin.semantic_state_batch_threshold = 3
+        plugin.semantic_state_max_wait_hours = 72
+        plugin.semantic_state_significance_threshold = 0.72
+        ordinary = [{
+            "memory_type": "daily_texture", "importance": 3,
+            "scene_anchor": "一起吃了晚饭", "evidence": [],
+        }]
+        one = [{"batch_id": "b1", "status": "pending", "created_ts": time.time()}]
+        decision = plugin._semantic_state_update_decision(one, ordinary)
+        self.assertFalse(decision["update"])
+        self.assertEqual(decision["reason"], "deferred")
+        casual_agreement = [{
+            "memory_type": "daily_texture", "importance": 3,
+            "scene_anchor": "早饭时约定晚点一起去买菜",
+            "state_change": "日常安排更自然", "long_effect": "", "evidence": [],
+        }]
+        casual_signal = plugin._semantic_state_change_score(casual_agreement)
+        self.assertFalse(casual_signal["hard"])
+        self.assertFalse(plugin._semantic_state_update_decision(one, casual_agreement)["update"])
+
+        three = [
+            {"batch_id": f"b{i}", "status": "pending", "created_ts": time.time()}
+            for i in range(3)
+        ]
+        self.assertEqual(
+            plugin._semantic_state_update_decision(three, ordinary)["reason"],
+            "batch_threshold",
+        )
+        decisive = plugin._semantic_state_update_decision(one, [self._episode()])
+        self.assertTrue(decisive["update"])
+        self.assertEqual(decisive["reason"], "significant_change")
+        self.assertTrue(decisive["signal"]["hard"])
+
+    async def test_adaptive_state_cadence_uses_max_wait_and_marks_merged_batches(self):
+        scope = "character:爱莉"
+        self.store.upsert_semantic_state(
+            scope, {"relationship_position": "关系稳定"}, reason="bootstrap",
+        )
+        plugin = object.__new__(MemosMemoryPlugin)
+        plugin._episodes = self.store
+        plugin.character_name = "爱莉"
+        plugin.semantic_state_update_policy = "adaptive"
+        plugin.semantic_state_batch_threshold = 3
+        plugin.semantic_state_max_wait_hours = 72
+        plugin.semantic_state_significance_threshold = 0.72
+        old = [{
+            "batch_id": "old", "status": "pending",
+            "created_ts": time.time() - 73 * 3600,
+        }]
+        ordinary = [{"memory_type": "daily_texture", "importance": 2, "evidence": []}]
+        self.assertEqual(
+            plugin._semantic_state_update_decision(old, ordinary)["reason"],
+            "max_wait",
+        )
+
+        batch_ids = [
+            self.store.archive_batch(
+                session_id, [{"role": "user", "content": session_id}], "auto",
+            )
+            for session_id in ("merge-a", "merge-b")
+        ]
+        for batch_id in batch_ids:
+            self.store.enqueue_state_update(batch_id, scope, [])
+        self.assertEqual(
+            self.store.mark_state_updates(batch_ids, "done"), 2,
+        )
+        self.assertFalse(any(
+            item["batch_id"] in set(batch_ids)
+            for item in self.store.pending_state_updates()
+        ))
+
+    async def test_state_pending_preview_is_read_only_and_explains_decision(self):
+        scope = "character:爱莉"
+        self.store.upsert_semantic_state(
+            scope, {"relationship_position": "关系稳定"}, reason="bootstrap",
+        )
+        batch_id = self.store.archive_batch(
+            "preview", [{"role": "user", "content": "一起吃了晚饭"}], "auto",
+        )
+        episode = {
+            **self._episode(),
+            "memory_type": "daily_texture",
+            "importance": 2,
+            "scene_anchor": "一起吃了晚饭",
+            "retrieval_key": "晚饭 日常",
+            "state_change": "",
+            "long_effect": "",
+            "trigger_hint": "",
+            "entities": ["晚饭"],
+            "affect_before": "平静",
+            "affect_after": "平静",
+            "unresolved": [],
+            "evidence": [],
+        }
+        self.store.upsert_episode(
+            memo_name="memos/preview", episode=episode,
+            card_text="一起吃了晚饭", embedding=[1.0, 0.0, 0.0],
+            source_batch_id=batch_id, evidence_quality="source_grounded",
+        )
+        self.store.enqueue_state_update(batch_id, scope, [])
+        plugin = object.__new__(MemosMemoryPlugin)
+        plugin._episodes = self.store
+        plugin.character_name = "爱莉"
+        plugin.semantic_state_update_policy = "adaptive"
+        plugin.semantic_state_batch_threshold = 3
+        plugin.semantic_state_max_wait_hours = 72
+        plugin.semantic_state_significance_threshold = 0.72
+        plugin.semantic_state_merge_max_batches = 6
+
+        before = self.store.pending_state_updates()
+        preview = plugin._semantic_state_pending_preview()
+        after = self.store.pending_state_updates()
+        self.assertEqual(preview["reason"], "deferred")
+        self.assertFalse(preview["update"])
+        self.assertEqual(preview["pending_batches"], 1)
+        self.assertEqual(before, after)
+
+    async def test_cluster_diagnostics_do_not_compute_clusters_when_apply_is_off(self):
+        plugin = object.__new__(MemosMemoryPlugin)
+        plugin.recall_cluster_fold_enable = True
+        plugin.recall_cluster_fold_apply = False
+        plugin._cluster_candidate_hits = lambda _hits: self.fail(
+            "diagnostic-only clusters must not run in the request path"
+        )
+        hits = [{"memo_name": "memos/a"}, {"memo_name": "memos/b"}]
+        kept, diagnostics = plugin._apply_cluster_fold(hits)
+        self.assertEqual(kept, hits)
+        self.assertEqual(diagnostics["reason"], "diagnostic_only")
+        self.assertEqual(diagnostics["folded"], 0)
+
+    async def test_adaptive_state_drain_merges_three_ordinary_batches_into_one_version(self):
+        scope = "character:爱莉"
+        self.store.upsert_semantic_state(
+            scope, {"relationship_position": "关系稳定"}, reason="bootstrap",
+        )
+        batch_ids = []
+        for index in range(3):
+            batch_id = self.store.archive_batch(
+                f"ordinary-{index}",
+                [{"role": "user", "content": f"普通日常 {index}"}],
+                "auto",
+            )
+            episode = {
+                **self._episode(),
+                "memory_type": "daily_texture",
+                "importance": 2,
+                "scene_anchor": f"普通日常 {index}",
+                "retrieval_key": f"日常 {index}",
+                "state_change": "",
+                "long_effect": "",
+                "unresolved": [],
+                "evidence": [],
+            }
+            self.store.upsert_episode(
+                memo_name=f"memos/ordinary-{index}", episode=episode,
+                card_text=f"普通日常 {index}", embedding=[1.0, 0.0, 0.0],
+                source_batch_id=batch_id, evidence_quality="source_grounded",
+            )
+            self.store.enqueue_state_update(batch_id, scope, [])
+            batch_ids.append(batch_id)
+
+        plugin = object.__new__(MemosMemoryPlugin)
+        plugin._episodes = self.store
+        plugin.character_name = "爱莉"
+        plugin.semantic_state_enable = True
+        plugin.semantic_state_update_policy = "adaptive"
+        plugin.semantic_state_batch_threshold = 3
+        plugin.semantic_state_max_wait_hours = 72
+        plugin.semantic_state_significance_threshold = 0.72
+        plugin.semantic_state_merge_max_batches = 6
+        plugin.semantic_state_target_chars = 1800
+        plugin.semantic_state_provider_id = ""
+        plugin.semantic_state_timeout = 30
+        plugin.enable_affiliate_profile = False
+        plugin._semantic_state_lock = asyncio.Lock()
+        plugin._semantic_state_last_defer_key = ""
+        plugin._log_event = lambda *_args, **_kwargs: None
+        calls = []
+
+        async def call(prompt, **_kwargs):
+            calls.append(prompt)
+            return json.dumps({
+                "relationship_position": "关系稳定，日常相处更自然",
+                "commitments_boundaries": "",
+                "behavior_tendencies": "更自然地分享日常",
+                "emotional_baseline": "平静亲近",
+                "open_loops": "",
+            }, ensure_ascii=False)
+
+        plugin._call_memory_generation_llm = call
+        result = await plugin._drain_semantic_state_queue(limit=6)
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(result["merged_batches"], 3)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.store.get_semantic_state(scope)["version"], 2)
+        self.assertFalse(self.store.pending_state_updates())
 
     async def test_forced_state_rebuild_does_not_seed_from_deleted_current_state(self):
         self.store.upsert_semantic_state(
@@ -731,6 +938,42 @@ class EvidenceFirstGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(diaries[0]["_evidence_quality"], "source_grounded")
         self.assertEqual(diaries[0]["_render_coverage"], 1.0)
         self.assertIn("离开前一定告诉", diaries[0]["content"])
+
+    async def test_persistently_invalid_render_uses_grounded_fallback(self):
+        plugin = self.make_plugin()
+        messages = [
+            {"role": "user", "content": "把银色钥匙放进蓝色盒子。"},
+            {"role": "assistant", "content": "好，我会记得钥匙在蓝色盒子里。"},
+        ]
+        episodes = [{
+            "episode_key": "e1", "event_date": "2026-08-04",
+            "scene_anchor": "收好银色钥匙", "memory_type": "plot_fact",
+            "evidence": [{
+                "actor": "assistant", "detail": "银色钥匙放在蓝色盒子里",
+                "quote": "钥匙在蓝色盒子里", "turn_indexes": [1],
+            }],
+            "state_change": "关系变得更稳定",
+        }]
+        invalid = [{"episode_key": "e1", "content": "用户要求保存一件物品。"}]
+        calls = []
+
+        async def call(_prompt, *, provider_id, timeout, label):
+            calls.append(label)
+            if label == "episode_extract":
+                return json.dumps(episodes, ensure_ascii=False)
+            return json.dumps(invalid, ensure_ascii=False)
+
+        plugin._call_memory_generation_llm = call
+        diaries = await plugin._generate_evidence_first_diaries(
+            messages,
+            "\n".join(f"[turn:{i}] {item['content']}" for i, item in enumerate(messages)),
+            1,
+        )
+        self.assertEqual(calls, ["episode_extract", "diary_render", "diary_render_retry"])
+        self.assertTrue(diaries[0]["_render_fallback"])
+        self.assertTrue(diaries[0]["_render_retry_reason"].startswith("grounded_fallback_after:"))
+        self.assertIn("银色钥匙", diaries[0]["content"])
+        self.assertIn("我", diaries[0]["content"])
 
     async def test_two_stage_failure_falls_back_without_losing_raw_batch(self):
         class Context:

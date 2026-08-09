@@ -1,5 +1,5 @@
 """
-AstrBot Memos 长期记忆插件 v4.5.4。
+AstrBot Memos 长期记忆插件 v4.6.2。
 
 时间模型严格区分事件发生时间、Memos 来源时间、本地索引时间和本轮当前时间。
 
@@ -34,15 +34,34 @@ from astrbot.api.star import Context, Star, register
 
 from .compress import (
     build_compress_prompt,
+    build_diary_literary_rewrite_prompt,
     build_diary_render_prompt,
     build_episode_extraction_prompt,
+    build_query_plan_disambiguation_prompt,
     build_semantic_state_update_prompt,
     format_messages,
+    format_messages_for_prompt,
     recorded_message_dates,
     recorded_time_context,
     recorded_time_labels_by_date,
 )
+from .archive_guard import (
+    copy_db_files as _copy_db_files,
+    migrate_episode_db_location,
+    record_episode_db_location,
+    resolve_plugin_data_db,
+)
+from .diary_pipeline import DiaryPipeline
+from .data_backup import DataBackupManager
 from .episodic_store import EpisodicStore
+from .query_planner import QueryPlanner
+from .retrieval_optimizer import (
+    classify_memory_intent,
+    intent_target,
+    optimize_fused_hits,
+    parse_temporal_constraint,
+)
+from .scene_splitter import SceneSplitter, as_prompt_payload
 from .memos_client import MemosClient
 from .temporal import (
     memo_source_times,
@@ -69,7 +88,7 @@ try:
 except Exception:  # aiohttp 缺失等极端情况不阻塞主插件
     WebUIServer = None
 
-_PLUGIN_VERSION = "4.5.4"
+_PLUGIN_VERSION = "4.6.2"
 _PASSAGE_VECTOR_STRATEGY = "local_passage_v2"
 _DEFAULT_CHUNK_CHARS = 120
 _DEFAULT_OVERLAP_CHARS = 30
@@ -725,9 +744,43 @@ class MemosMemoryPlugin(Star):
             Path(self.vec_db_path).expanduser().parent / "episodic_memory.db"
         )
         self.episodic_memory_enable: bool = bool(config.get("episodic_memory_enable", True))
-        self.episodic_db_path: str = str(config.get("episodic_db_path", default_episode_db)).strip()
+        configured_episode_db = str(config.get("episodic_db_path", default_episode_db)).strip()
+        self.episodic_db_path: str = migrate_episode_db_location(configured_episode_db)
         self.evidence_first_generation_enable: bool = bool(config.get("evidence_first_generation_enable", True))
         self.raw_evidence_archive_enable: bool = bool(config.get("raw_evidence_archive_enable", True))
+        # 4.6.0-test3: 原文永远完整落库，下面两个值只控制提示视图/分块。
+        self.raw_archive_full_assistant_text: bool = bool(config.get("raw_archive_full_assistant_text", True))
+        self.raw_archive_assistant_max_chars: int = max(0, int(config.get("raw_archive_assistant_max_chars", 0)))
+        self.raw_archive_index_chunk_chars: int = max(200, min(4000, int(config.get("raw_archive_index_chunk_chars", 800))))
+        self.raw_archive_prompt_view_max_chars: int = max(0, min(12000, int(config.get("raw_archive_prompt_view_max_chars", 1200))))
+        self.scene_split_enable: bool = bool(config.get("scene_split_enable", True))
+        self.scene_split_gap_seconds: float = max(60.0, min(172800.0, float(config.get("scene_split_gap_seconds", 10800))))
+        self.diary_count_max_cap: int = max(1, min(12, int(config.get("diary_count_max_cap", 6))))
+        self.evidence_tier_enable: bool = bool(config.get("evidence_tier_enable", True))
+        self.diary_literary_mode: bool = bool(config.get("diary_literary_mode", True))
+        self.diary_transcript_check_enable: bool = bool(config.get("diary_transcript_check_enable", True))
+        self.diary_first_person_check_enable: bool = bool(config.get("diary_first_person_check_enable", True))
+        self.diary_must_coverage_threshold: float = max(0.3, min(1.0, float(config.get("diary_must_coverage_threshold", 0.9))))
+        self.diary_rewrite_preview_min_chars: int = max(800, min(12000, int(config.get("diary_rewrite_preview_min_chars", 2200))))
+        self.db_snapshot_keep: int = max(1, min(20, int(config.get("db_snapshot_keep", 3))))
+        self.data_backup_enable: bool = bool(config.get("data_backup_enable", True))
+        self.data_backup_interval_days: int = max(
+            1, min(365, int(config.get("data_backup_interval_days", 14)))
+        )
+        self.data_backup_keep: int = max(
+            1, min(52, int(config.get("data_backup_keep", 6)))
+        )
+        default_backup_dir = str(
+            Path(self.vec_db_path).expanduser().parent / "data_backups"
+        )
+        self.data_backup_dir: str = str(
+            config.get("data_backup_dir", default_backup_dir)
+        ).strip() or default_backup_dir
+        self.query_plan_enable: bool = bool(config.get("query_plan_enable", True))
+        self.query_plan_context_window: int = max(1, min(20, int(config.get("query_plan_context_window", 8))))
+        self.query_plan_llm_disambiguate: bool = bool(config.get("query_plan_llm_disambiguate", False))
+        self.query_plan_llm_provider_id: str = str(config.get("query_plan_llm_provider_id", "")).strip()
+        self.query_plan_llm_confidence_threshold: float = max(0.1, min(0.95, float(config.get("query_plan_llm_confidence_threshold", 0.5))))
         self.episode_extraction_provider_id: str = str(config.get("episode_extraction_provider_id", "")).strip()
         self.episode_extraction_timeout: float = max(20.0, float(config.get("episode_extraction_timeout", 120)))
         self.diary_render_provider_id: str = str(config.get("diary_render_provider_id", "")).strip()
@@ -755,6 +808,25 @@ class MemosMemoryPlugin(Star):
         self.semantic_state_provider_id: str = str(config.get("semantic_state_provider_id", "")).strip()
         self.semantic_state_timeout: float = max(20.0, float(config.get("semantic_state_timeout", 120)))
         self.semantic_state_target_chars: int = max(600, min(6000, int(config.get("semantic_state_target_chars", 1800))))
+        self.semantic_state_update_policy: str = str(
+            config.get("semantic_state_update_policy", "adaptive")
+        ).strip().lower() or "adaptive"
+        if self.semantic_state_update_policy not in {"adaptive", "every_batch"}:
+            self.semantic_state_update_policy = "adaptive"
+        self.semantic_state_batch_threshold: int = max(
+            1, min(12, int(config.get("semantic_state_batch_threshold", 3)))
+        )
+        self.semantic_state_max_wait_hours: float = max(
+            1.0, min(720.0, float(config.get("semantic_state_max_wait_hours", 72)))
+        )
+        self.semantic_state_significance_threshold: float = max(
+            0.35,
+            min(0.95, float(config.get("semantic_state_significance_threshold", 0.72))),
+        )
+        self.semantic_state_merge_max_batches: int = max(
+            self.semantic_state_batch_threshold,
+            min(20, int(config.get("semantic_state_merge_max_batches", 6))),
+        )
         self.semantic_state_auto_bootstrap: bool = bool(config.get("semantic_state_auto_bootstrap", True))
         self.semantic_state_bootstrap_episode_limit: int = max(
             20, min(500, int(config.get("semantic_state_bootstrap_episode_limit", 120)))
@@ -774,6 +846,21 @@ class MemosMemoryPlugin(Star):
         self.passage_vector_auto_migrate: bool = bool(config.get("passage_vector_auto_migrate", True))
         self.source_turn_vector_auto_migrate: bool = bool(config.get("source_turn_vector_auto_migrate", True))
         self.lean_temporal_enable: bool = bool(config.get("lean_temporal_enable", True))
+        self.recall_cross_layer_consistency_enable: bool = bool(
+            config.get("recall_cross_layer_consistency_enable", True)
+        )
+        self.recall_temporal_constraints_enable: bool = bool(
+            config.get("recall_temporal_constraints_enable", True)
+        )
+        self.recall_intent_layer_weights_enable: bool = bool(
+            config.get("recall_intent_layer_weights_enable", True)
+        )
+        self.recall_observation_enable: bool = bool(
+            config.get("recall_observation_enable", True)
+        )
+        self.recall_auto_eval_limit: int = max(
+            20, min(200, int(config.get("recall_auto_eval_limit", 80)))
+        )
         self.lean_story_min_inject: int = max(0, min(6, int(config.get("lean_story_min_inject", 1))))
         self.lean_story_max_inject: int = max(
             self.lean_story_min_inject,
@@ -999,6 +1086,13 @@ class MemosMemoryPlugin(Star):
         self._memos: MemosClient | None = None
         self._vec: VectorStore | None = None
         self._episodes: EpisodicStore | None = None
+        # 4.6.0-test3：独立职责模块；main 只负责调用顺序与生命周期。
+        self._diary_pipeline = DiaryPipeline(self)
+        self._query_planner = QueryPlanner(self)
+        self._scene_splitter = SceneSplitter(
+            gap_seconds=self.scene_split_gap_seconds,
+            max_scenes=self.diary_count_max_cap,
+        )
         self._emb_provider = None
         self._rerank_provider = None
         self._emb_dim: int | None = None
@@ -1041,6 +1135,10 @@ class MemosMemoryPlugin(Star):
         self._reconcile_task = None
         self._profile_task = None
         self._context_archive_task = None
+        self._data_backup_task = None
+        self._restore_apply_lock = asyncio.Lock()
+        self._pending_restore_checked = False
+        self._startup_restore_result: dict[str, Any] = {}
         self._episode_migration_task = None
         self._passage_vector_migration_task = None
         self._source_turn_vector_migration_task = None
@@ -1049,6 +1147,7 @@ class MemosMemoryPlugin(Star):
         self._semantic_state_task = None
         self._semantic_state_lock = asyncio.Lock()
         self._semantic_state_pending_tasks: set[asyncio.Task] = set()
+        self._semantic_state_last_defer_key = ""
         self._episode_migration_ready: bool = False
         self._episode_migration_state: dict[str, Any] = {"status": "pending"}
         self._last_reconcile_ts: float = 0.0
@@ -1070,6 +1169,15 @@ class MemosMemoryPlugin(Star):
         self._xinchao = XinchaoController(
             self,
             Path(self.vec_db_path).expanduser().resolve().parent,
+        )
+        self._data_backup = DataBackupManager(
+            backup_dir=self.data_backup_dir,
+            vec_db_path=self.vec_db_path,
+            episodic_db_path=self.episodic_db_path,
+            plugin_version=_PLUGIN_VERSION,
+            interval_days=self.data_backup_interval_days,
+            keep=self.data_backup_keep,
+            enabled=self.data_backup_enable,
         )
         self._time_insight = IntegratedTimeInsightService(self)
         # v1.3 WebUI
@@ -1120,6 +1228,7 @@ class MemosMemoryPlugin(Star):
             return True
 
     async def _ensure_init_inner(self) -> bool:
+        await self._apply_pending_data_restore_once()
         if self._init_error:
             # v1.6: allow retry (provider may load after plugin)
             self._init_error = None
@@ -1166,7 +1275,20 @@ class MemosMemoryPlugin(Star):
                     self._emb_dim,
                     self._emb_model_id,
                 )
+                self._episodes._snapshot_keep = self.db_snapshot_keep
+                self._episodes._preview_keep = 20
                 await self._episodes.init()
+                diagnosis = self._episodes.startup_diagnosis()
+                identity = diagnosis.get("identity") or {}
+                record_episode_db_location(self.episodic_db_path)
+                logger.info(
+                    "[memory][archive] startup uuid=%s path=%s schema=%s gen=%s issue=%s",
+                    str(identity.get("database_uuid") or "")[:12],
+                    identity.get("canonical_db_path") or identity.get("db_path") or "",
+                    identity.get("schema_version") or "",
+                    str((self._episodes.stats().get("active_generation") or ""))[:8],
+                    diagnosis.get("startup_issue") or "none",
+                )
                 if not self.episodic_auto_migrate:
                     self._episode_migration_ready = True
                     self._episode_migration_state = {"status": "manual_mode"}
@@ -1216,6 +1338,8 @@ class MemosMemoryPlugin(Star):
                 logger.warning("[memos-memory] extra tables init failed: %s", e)
             self._initialized = True
             self._eod_flush_task = asyncio.ensure_future(self._eod_flush_loop())
+            if self.data_backup_enable and self._data_backup_task is None:
+                self._data_backup_task = asyncio.create_task(self._data_backup_loop())
             logger.info("[memos-memory] init ok | emb=%s dim=%s vec=%s",
                         self._emb_model_id, self._emb_dim, self.vec_db_path)
 
@@ -2596,22 +2720,58 @@ class MemosMemoryPlugin(Star):
         content = " ".join(str(row.get("content") or "").split()).strip()
         return ((role_label + ": ") if role_label else "") + content
 
+    @staticmethod
+    def _chunk_text(text: str, max_chars: int) -> list[str]:
+        """Split an embedding view while the source turn itself remains lossless."""
+        source = str(text or "").strip()
+        size = max(1, int(max_chars or 1))
+        if not source:
+            return []
+        return [source[position:position + size] for position in range(0, len(source), size)]
+
     async def _index_source_batch_turns(self, batch_id: str) -> int:
         if self._episodes is None or not batch_id:
             return 0
         rows = self._episodes.source_turn_embedding_rows(
             batch_id=batch_id, limit=500, missing_only=True,
         )
-        if not rows:
-            return 0
-        vectors = await self._embed_batch([
-            self._source_turn_embedding_text(row) for row in rows
-        ])
-        if len(vectors) != len(rows):
-            raise RuntimeError(f"source turn embedding count mismatch: {len(vectors)}/{len(rows)}")
-        return self._episodes.replace_source_turn_embeddings([
-            (int(row["id"]), vector) for row, vector in zip(rows, vectors)
-        ])
+        chunk_chars = max(200, int(getattr(self, "raw_archive_index_chunk_chars", 800) or 800))
+        turn_rows: list[tuple[int, str]] = []
+        for row in rows:
+            row_id = int(row["id"])
+            text = self._source_turn_embedding_text(row)
+            # Every source turn stays in SourceArchive. Long turns additionally
+            # get bounded child rows; search uses those without truncating source.
+            turn_rows.append((row_id, text))
+            if len(text) > chunk_chars and not self._episodes.turn_chunks_for_turn(row_id):
+                self._episodes.add_turn_chunks(row_id, self._chunk_text(text, chunk_chars))
+
+        indexed = 0
+        if turn_rows:
+            vectors = await self._embed_batch([text for _row_id, text in turn_rows])
+            if len(vectors) != len(turn_rows):
+                raise RuntimeError(
+                    f"source turn embedding count mismatch: {len(vectors)}/{len(turn_rows)}"
+                )
+            indexed += self._episodes.replace_source_turn_embeddings([
+                (row_id, vector) for (row_id, _text), vector in zip(turn_rows, vectors)
+            ])
+
+        chunk_rows = self._episodes.source_turn_chunk_rows(
+            after_id=0, limit=max(500, len(rows) * 16), missing_only=True,
+        )
+        if chunk_rows:
+            chunk_vectors = await self._embed_batch([
+                str(row.get("chunk_text") or "") for row in chunk_rows
+            ])
+            if len(chunk_vectors) != len(chunk_rows):
+                raise RuntimeError(
+                    f"source chunk embedding count mismatch: {len(chunk_vectors)}/{len(chunk_rows)}"
+                )
+            indexed += self._episodes.replace_source_chunk_embeddings([
+                (int(row["id"]), vector) for row, vector in zip(chunk_rows, chunk_vectors)
+            ])
+        return indexed
 
     async def _auto_migrate_source_turn_vectors(self) -> None:
         """Build a rebuildable first-hand evidence index without touching Memos."""
@@ -2626,17 +2786,30 @@ class MemosMemoryPlugin(Star):
             if self._episodes is None or self._emb_provider is None:
                 self._source_turn_vector_migration_state = {"status": "unavailable"}
                 return
+            runtime_gen = self._episodes._gen.runtime_generation(
+                self._emb_model_id or "unknown", int(self._emb_dim or 0)
+            )
             self._source_turn_vector_migration_state = {
-                "status": "running", "updated": 0, "started_ts": time.time(),
+                "status": "running", "updated": 0, "generation": runtime_gen,
+                "started_ts": time.time(),
             }
-            cursor = 0
             updated = 0
+            chunk_chars = max(200, int(self.raw_archive_index_chunk_chars or 800))
+
+            # 1) full source turns for the runtime generation
+            cursor = 0
             while True:
                 rows = self._episodes.source_turn_embedding_rows(
                     after_id=cursor, limit=64, missing_only=True,
+                    target_generation=runtime_gen,
                 )
                 if not rows:
                     break
+                for row in rows:
+                    text = self._source_turn_embedding_text(row)
+                    row_id = int(row["id"])
+                    if len(text) > chunk_chars and not self._episodes.turn_chunks_for_turn(row_id):
+                        self._episodes.add_turn_chunks(row_id, self._chunk_text(text, chunk_chars))
                 vectors = await self._embed_batch([
                     self._source_turn_embedding_text(row) for row in rows
                 ])
@@ -2644,18 +2817,52 @@ class MemosMemoryPlugin(Star):
                     raise RuntimeError(
                         f"source turn embedding count mismatch: {len(vectors)}/{len(rows)}"
                     )
-                changed = self._episodes.replace_source_turn_embeddings([
-                    (int(row["id"]), vector) for row, vector in zip(rows, vectors)
-                ])
-                updated += changed
+                updated += self._episodes.replace_source_turn_embeddings(
+                    [(int(row["id"]), vector) for row, vector in zip(rows, vectors)],
+                    runtime_gen=runtime_gen,
+                )
                 cursor = int(rows[-1]["id"])
                 self._source_turn_vector_migration_state.update({
                     "updated": updated, "last_id": cursor, "updated_ts": time.time(),
                 })
                 await asyncio.sleep(0)
+
+            # 2) child chunks, rolled up to their full turn at search time
+            cursor = 0
+            while True:
+                rows = self._episodes.source_turn_chunk_rows(
+                    after_id=cursor, limit=64, missing_only=True,
+                    target_generation=runtime_gen,
+                )
+                if not rows:
+                    break
+                vectors = await self._embed_batch([str(row.get("chunk_text") or "") for row in rows])
+                updated += self._episodes.replace_source_chunk_embeddings(
+                    [(int(row["id"]), vector) for row, vector in zip(rows, vectors)],
+                    runtime_gen=runtime_gen,
+                )
+                cursor = int(rows[-1]["id"])
+                await asyncio.sleep(0)
+
+            # 3) episode/card embeddings for the same runtime generation
+            cursor = 0
+            while True:
+                rows = self._episodes.episode_card_embedding_rows(
+                    after_id=cursor, limit=64, target_generation=runtime_gen,
+                )
+                if not rows:
+                    break
+                vectors = await self._embed_batch([str(row.get("card_text") or "") for row in rows])
+                updated += self._episodes.replace_episode_card_embeddings(
+                    [(int(row["id"]), vector) for row, vector in zip(rows, vectors)],
+                    runtime_gen=runtime_gen,
+                )
+                cursor = int(rows[-1]["id"])
+                await asyncio.sleep(0)
+
             stats = self._episodes.stats()
             self._source_turn_vector_migration_state = {
-                "status": "ready", "updated": updated,
+                "status": "ready", "updated": updated, "generation": runtime_gen,
                 "indexed": int(stats.get("source_turn_vectors") or 0),
                 "total": int(stats.get("source_turns") or 0),
                 "updated_ts": time.time(),
@@ -2676,7 +2883,52 @@ class MemosMemoryPlugin(Star):
         name = " ".join(str(self.character_name or "default").split()).strip() or "default"
         return "character:" + name
 
-    def _semantic_state_status(self, include_history: bool = False) -> dict[str, Any]:
+    def _semantic_state_pending_preview(self) -> dict[str, Any]:
+        """Explain the next adaptive state decision without calling an LLM or mutating data."""
+        if self._episodes is None:
+            return {"available": False, "reason": "store_unavailable"}
+        limit = int(getattr(self, "semantic_state_merge_max_batches", 6))
+        pending = self._episodes.pending_state_updates(limit=limit)
+        if not pending:
+            return {"available": True, "pending_batches": 0, "reason": "empty"}
+        episodes: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        batch_ids: list[str] = []
+        missing_batches: list[str] = []
+        for item in pending:
+            batch_id = str(item.get("batch_id") or "")
+            batch_ids.append(batch_id)
+            batch_episodes = self._episodes.episodes_for_batch(batch_id)
+            if not batch_episodes:
+                missing_batches.append(batch_id)
+                continue
+            for episode in batch_episodes:
+                key = str(episode.get("episode_id") or episode.get("memo_name") or "")
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                episodes.append(episode)
+        if missing_batches:
+            return {
+                "available": True,
+                "pending_batches": len(pending),
+                "batch_ids": batch_ids,
+                "missing_episode_batches": missing_batches,
+                "reason": "waiting_for_episode_view",
+            }
+        return {
+            "available": True,
+            "batch_ids": batch_ids,
+            "episode_count": len(episodes),
+            **self._semantic_state_update_decision(pending, episodes),
+        }
+
+    def _semantic_state_status(
+        self,
+        include_history: bool = False,
+        include_pending_preview: bool = False,
+    ) -> dict[str, Any]:
         if not self.semantic_state_enable:
             return {"enabled": False, "ready": False, "reason": "disabled"}
         if self._episodes is None:
@@ -2691,9 +2943,17 @@ class MemosMemoryPlugin(Star):
             "target_chars": self.semantic_state_target_chars,
             "replaces_profile": self.semantic_state_replace_profile,
             "pending": int(self._episodes.stats().get("pending_state_updates") or 0),
+            "update_policy": getattr(self, "semantic_state_update_policy", "adaptive"),
+            "batch_threshold": getattr(self, "semantic_state_batch_threshold", 3),
+            "max_wait_hours": getattr(self, "semantic_state_max_wait_hours", 72.0),
+            "significance_threshold": getattr(
+                self, "semantic_state_significance_threshold", 0.72
+            ),
         }
         if include_history:
             data["history"] = self._episodes.semantic_state_history(scope_id, limit=60)
+        if include_pending_preview:
+            data["pending_preview"] = self._semantic_state_pending_preview()
         return data
 
     @staticmethod
@@ -2746,6 +3006,167 @@ class MemosMemoryPlugin(Star):
                 return {"rendered_text": "[旧画像，仅作为首次状态融合的种子]\n" + seed}
         return {}
 
+    @staticmethod
+    def _semantic_state_change_score(
+        episodes: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Estimate whether new episodes should rewrite the durable current state.
+
+        This gate is deliberately deterministic: an extra LLM call just to decide
+        whether another LLM call is needed would add cost and another failure mode.
+        It never drops an episode; ordinary changes remain queued for batch fusion.
+        """
+        type_weight = {
+            "promise_or_rule": 0.48,
+            "relationship_shift": 0.42,
+            "emotional_anchor": 0.28,
+            "behavior_bias": 0.24,
+            "plot_fact": 0.10,
+            "daily_texture": 0.03,
+        }
+        hard_patterns = {
+            "commitment": (
+                "承诺", "答应", "约定", "誓言", "永远", "不会离开", "说定了",
+                "promise", "commitment",
+            ),
+            "boundary": (
+                "边界", "底线", "禁忌", "禁止", "不许", "拒绝", "分手", "结束关系",
+                "boundary", "break up",
+            ),
+            "identity": (
+                "真实身份", "真名", "身世", "身份揭示", "坦白身份", "认出",
+                "identity", "real name",
+            ),
+            "relationship": (
+                "告白", "确认关系", "成为恋人", "结婚", "重逢", "和好", "决裂",
+                "背叛", "原谅", "彻底离开", "relationship shift",
+            ),
+        }
+        hard_type_gate = {
+            "commitment": {"promise_or_rule"},
+            "boundary": {"promise_or_rule", "relationship_shift"},
+            "identity": {"plot_fact", "relationship_shift"},
+            "relationship": {"relationship_shift"},
+        }
+        best = 0.0
+        reasons: set[str] = set()
+        hard = False
+        for episode in episodes:
+            if not isinstance(episode, dict):
+                continue
+            memory_type = str(episode.get("memory_type") or "plot_fact").strip()
+            score = float(type_weight.get(memory_type, 0.08))
+            if memory_type in {"promise_or_rule", "relationship_shift"}:
+                reasons.add(memory_type)
+            try:
+                importance = max(1, min(5, int(episode.get("importance") or 3)))
+            except (TypeError, ValueError):
+                importance = 3
+            if importance >= 5:
+                score += 0.24
+                reasons.add("importance_5")
+            elif importance >= 4:
+                score += 0.13
+                reasons.add("importance_4")
+            state_change = str(episode.get("state_change") or "").strip()
+            long_effect = str(episode.get("long_effect") or "").strip()
+            unresolved = episode.get("unresolved") or []
+            if state_change:
+                score += 0.14
+                reasons.add("state_change")
+            if long_effect:
+                score += 0.08
+                reasons.add("long_effect")
+            if unresolved:
+                score += 0.10
+                reasons.add("unresolved")
+            evidence = [
+                item for item in (episode.get("evidence") or [])
+                if isinstance(item, dict) and str(item.get("tier") or "supporting") == "must_write"
+            ]
+            if evidence:
+                score += min(0.12, len(evidence) * 0.03)
+                reasons.add("must_write")
+            decisive_text = " ".join(
+                [
+                    state_change,
+                    long_effect,
+                    str(episode.get("retrieval_key") or ""),
+                    str(episode.get("scene_anchor") or ""),
+                ]
+                + [
+                    " ".join(
+                        str(item.get(key) or "")
+                        for key in ("detail", "quote", "quote_text")
+                    )
+                    for item in evidence
+                ]
+            ).lower()
+            for category, patterns in hard_patterns.items():
+                type_matches = memory_type in hard_type_gate.get(category, set())
+                # Episode classification is not infallible. A high-importance
+                # emotional anchor may still contain a decisive commitment or
+                # relationship turn, but low-importance daily texture must not
+                # force a state rewrite merely because it says "约定" casually.
+                if memory_type == "emotional_anchor" and importance >= 4:
+                    type_matches = category in {"commitment", "boundary", "relationship"}
+                if type_matches and any(
+                    pattern.lower() in decisive_text for pattern in patterns
+                ):
+                    hard = True
+                    score = max(score, 0.96)
+                    reasons.add("hard_" + category)
+            best = max(best, min(1.0, score))
+        return {
+            "score": round(best, 4),
+            "hard": hard,
+            "reasons": sorted(reasons),
+            "episodes": len(episodes),
+        }
+
+    def _semantic_state_update_decision(
+        self,
+        pending: list[dict[str, Any]],
+        episodes: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        policy = getattr(self, "semantic_state_update_policy", "adaptive")
+        signal = self._semantic_state_change_score(episodes)
+        now = time.time()
+        oldest_ts = min(
+            (float(item.get("created_ts") or now) for item in pending),
+            default=now,
+        )
+        age_hours = max(0.0, (now - oldest_ts) / 3600.0)
+        failed = any(str(item.get("status") or "") == "failed" for item in pending)
+        state_ready = bool(
+            self._episodes
+            and self._episodes.get_semantic_state(self._semantic_state_scope_id())
+        )
+        reason = "deferred"
+        should_update = False
+        if policy == "every_batch":
+            should_update, reason = True, "every_batch"
+        elif not state_ready:
+            should_update, reason = True, "initial_state"
+        elif failed:
+            should_update, reason = True, "failed_retry"
+        elif bool(signal.get("hard")) or float(signal.get("score") or 0.0) >= float(
+            getattr(self, "semantic_state_significance_threshold", 0.72)
+        ):
+            should_update, reason = True, "significant_change"
+        elif len(pending) >= int(getattr(self, "semantic_state_batch_threshold", 3)):
+            should_update, reason = True, "batch_threshold"
+        elif age_hours >= float(getattr(self, "semantic_state_max_wait_hours", 72.0)):
+            should_update, reason = True, "max_wait"
+        return {
+            "update": should_update,
+            "reason": reason,
+            "pending_batches": len(pending),
+            "oldest_hours": round(age_hours, 2),
+            "signal": signal,
+            "policy": policy,
+        }
+
     async def _update_semantic_state(
         self,
         episodes: list[dict[str, Any]],
@@ -2753,6 +3174,7 @@ class MemosMemoryPlugin(Star):
         source_batch_id: str = "",
         reason: str = "compression",
         seed_override: dict[str, Any] | None = None,
+        queue_batch_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         async with self._semantic_state_lock:
             return await self._update_semantic_state_locked(
@@ -2760,6 +3182,7 @@ class MemosMemoryPlugin(Star):
                 source_batch_id=source_batch_id,
                 reason=reason,
                 seed_override=seed_override,
+                queue_batch_ids=queue_batch_ids,
             )
 
     async def _update_semantic_state_locked(
@@ -2769,6 +3192,7 @@ class MemosMemoryPlugin(Star):
         source_batch_id: str = "",
         reason: str = "compression",
         seed_override: dict[str, Any] | None = None,
+        queue_batch_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         if not self.semantic_state_enable or self._episodes is None or not episodes:
             return {"updated": False, "reason": "disabled_or_empty"}
@@ -2778,7 +3202,8 @@ class MemosMemoryPlugin(Star):
             for item in episodes if isinstance(item, dict)
         ]
         episode_ids = [value for value in episode_ids if value]
-        if source_batch_id:
+        queue_batch_ids = [str(value) for value in (queue_batch_ids or []) if str(value)]
+        if source_batch_id and not queue_batch_ids:
             self._episodes.enqueue_state_update(source_batch_id, scope_id, episode_ids)
         current = self._semantic_state_seed() if seed_override is None else seed_override
         prompt = build_semantic_state_update_prompt(
@@ -2822,11 +3247,14 @@ class MemosMemoryPlugin(Star):
                 source_batch_id=source_batch_id,
                 source_episode_ids=episode_ids,
             )
-            if source_batch_id:
+            if queue_batch_ids:
+                self._episodes.mark_state_updates(queue_batch_ids, "done")
+            elif source_batch_id:
                 self._episodes.mark_state_update(source_batch_id, "done")
             self._log_event("state", f"滚动状态更新 v{saved.get('version')}", {
                 "scope": scope_id, "chars": len(saved.get("rendered_text") or ""),
                 "episodes": len(episodes), "reason": reason,
+                "batches": len(queue_batch_ids) if queue_batch_ids else (1 if source_batch_id else 0),
             })
             logger.info(
                 "[memos-memory][state] updated v%s chars=%s episodes=%s reason=%s",
@@ -2834,7 +3262,9 @@ class MemosMemoryPlugin(Star):
             )
             return {"updated": True, **saved}
         except Exception as exc:
-            if source_batch_id:
+            if queue_batch_ids:
+                self._episodes.mark_state_updates(queue_batch_ids, "failed", str(exc))
+            elif source_batch_id:
                 self._episodes.mark_state_update(source_batch_id, "failed", str(exc))
             self._log_event("state", "滚动状态更新失败，已排队重试", {
                 "batch_id": source_batch_id, "error": str(exc)[:300],
@@ -2873,32 +3303,72 @@ class MemosMemoryPlugin(Star):
         task.add_done_callback(self._semantic_state_pending_tasks.discard)
 
     async def _drain_semantic_state_queue(self, limit: int = 20) -> dict[str, Any]:
-        """Apply queued state deltas in source order without letting newer batches overtake failures."""
+        """Coalesce queued deltas without delaying decisive relationship changes."""
         if self._episodes is None:
             return {"updated": 0, "reason": "store_unavailable"}
-        updated = 0
-        for _ in range(max(1, min(100, int(limit)))):
-            pending = self._episodes.pending_state_updates(limit=1)
-            if not pending:
-                break
-            item = pending[0]
+        merge_limit = min(
+            max(1, min(100, int(limit))),
+            int(getattr(self, "semantic_state_merge_max_batches", 6)),
+        )
+        pending = self._episodes.pending_state_updates(limit=merge_limit)
+        if not pending:
+            return {"updated": 0, "reason": "empty"}
+        batch_ids: list[str] = []
+        episodes: list[dict[str, Any]] = []
+        seen_episode_ids: set[str] = set()
+        for item in pending:
             batch_id = str(item.get("batch_id") or "")
-            episodes = self._episodes.episodes_for_batch(batch_id)
-            if not episodes:
-                return {"updated": updated, "reason": "waiting_for_episode_view", "batch_id": batch_id}
-            result = await self._update_semantic_state(
-                episodes,
-                source_batch_id=batch_id,
-                reason="queued_compression",
-            )
-            if not result.get("updated"):
+            batch_episodes = self._episodes.episodes_for_batch(batch_id)
+            if not batch_episodes:
                 return {
-                    "updated": updated,
-                    "reason": result.get("reason") or "update_failed",
+                    "updated": 0,
+                    "reason": "waiting_for_episode_view",
                     "batch_id": batch_id,
                 }
-            updated += 1
-        return {"updated": updated}
+            batch_ids.append(batch_id)
+            for episode in batch_episodes:
+                key = str(episode.get("episode_id") or episode.get("memo_name") or "")
+                if key and key in seen_episode_ids:
+                    continue
+                if key:
+                    seen_episode_ids.add(key)
+                episodes.append(episode)
+        decision = self._semantic_state_update_decision(pending, episodes)
+        if not decision.get("update"):
+            defer_key = ":".join(
+                [batch_ids[-1], str(decision.get("pending_batches")), str(decision.get("reason"))]
+            )
+            if defer_key != getattr(self, "_semantic_state_last_defer_key", ""):
+                self._semantic_state_last_defer_key = defer_key
+                self._log_event("state", "普通变化已累计，暂不重写滚动状态", decision)
+                logger.info(
+                    "[memos-memory][state] deferred batches=%s signal=%.2f oldest=%.1fh",
+                    decision.get("pending_batches"),
+                    float((decision.get("signal") or {}).get("score") or 0.0),
+                    float(decision.get("oldest_hours") or 0.0),
+                )
+            return {"updated": 0, **decision}
+        self._semantic_state_last_defer_key = ""
+        reason = "adaptive_" + str(decision.get("reason") or "queued")
+        result = await self._update_semantic_state(
+            episodes,
+            source_batch_id=batch_ids[-1],
+            reason=reason,
+            queue_batch_ids=batch_ids,
+        )
+        if not result.get("updated"):
+            return {
+                "updated": 0,
+                "reason": result.get("reason") or "update_failed",
+                "batch_ids": batch_ids,
+                "decision": decision,
+            }
+        return {
+            "updated": 1,
+            "merged_batches": len(batch_ids),
+            "episodes": len(episodes),
+            "decision": decision,
+        }
 
     async def _bootstrap_semantic_state(
         self,
@@ -2964,9 +3434,10 @@ class MemosMemoryPlugin(Star):
                 if self.episodic_auto_migrate and not self._episode_migration_ready:
                     await asyncio.sleep(10)
                     continue
-                pending = self._episodes.pending_state_updates(limit=5)
+                queue_limit = int(getattr(self, "semantic_state_merge_max_batches", 6))
+                pending = self._episodes.pending_state_updates(limit=queue_limit)
                 if pending:
-                    await self._drain_semantic_state_queue(limit=5)
+                    await self._drain_semantic_state_queue(limit=queue_limit)
                 elif self.semantic_state_auto_bootstrap:
                     await self._bootstrap_semantic_state()
                 await asyncio.sleep(300)
@@ -3291,14 +3762,36 @@ class MemosMemoryPlugin(Star):
                     confidence = min(confidence, 0.55)
                 if not grounded:
                     confidence = min(confidence, 0.45)
+                kind = str(evidence.get("kind") or "event").strip().lower()[:40]
+                tier = str(evidence.get("tier") or "supporting").strip().lower()
+                if tier not in {"must_write", "supporting", "archive_only"}:
+                    tier = "supporting"
+                if getattr(self, "evidence_tier_enable", True):
+                    fact_text = " ".join((detail, quote)).strip()
+                    commitment_words = (
+                        "答应", "承诺", "约定", "发誓", "一定", "不许", "边界",
+                        "底线", "拒绝", "关系", "在一起", "分开", "离开", "原谅",
+                    )
+                    if kind in {
+                        "commitment", "promise", "boundary", "relationship-decision",
+                        "relationship_decision", "relationship decision",
+                    } or any(word in fact_text for word in commitment_words):
+                        tier = "must_write"
+                    elif (not grounded or confidence < 0.46 or kind in {
+                        "greeting", "backchannel", "meta", "repetition", "generic",
+                    }):
+                        tier = "archive_only"
+                else:
+                    tier = "must_write"
                 evidence_out.append({
-                    "kind": str(evidence.get("kind") or "event")[:40],
+                    "kind": kind or "event",
                     "actor": actor[:20],
                     "detail": detail or quote,
                     "quote": quote,
                     "turn_indexes": indexes,
                     "confidence": round(max(0.0, min(1.0, confidence)), 3),
                     "grounded": grounded,
+                    "tier": tier,
                 })
             if not evidence_out:
                 continue
@@ -3313,6 +3806,21 @@ class MemosMemoryPlugin(Star):
                 "time_label": str(item.get("time_label") or "").strip(),
                 "time_basis": str(item.get("time_basis") or "unknown").strip(),
                 "scene_anchor": _safe_meta_text(item.get("scene_anchor"), 160),
+                "scene_start_turn": (
+                    item.get("scene_start_turn")
+                    if isinstance(item.get("scene_start_turn"), int)
+                    and not isinstance(item.get("scene_start_turn"), bool) else -1
+                ),
+                "scene_end_turn": (
+                    item.get("scene_end_turn")
+                    if isinstance(item.get("scene_end_turn"), int)
+                    and not isinstance(item.get("scene_end_turn"), bool) else -1
+                ),
+                "scene_boundary_reasons": [
+                    str(value).strip()[:80]
+                    for value in (item.get("scene_boundary_reasons") or item.get("reasons") or [])
+                    if str(value).strip()
+                ][:8],
                 "memory_type": _normalize_memory_type(item.get("memory_type"), content_stub, raw_tags),
                 "evidence": evidence_out,
                 "affect_before": _safe_meta_text(item.get("affect_before"), 260),
@@ -3329,80 +3837,29 @@ class MemosMemoryPlugin(Star):
         return out
 
     def _diary_render_coverage(self, content: str, episode: dict[str, Any]) -> tuple[float, list[str]]:
-        evidence_items = [
-            item for item in (episode.get("evidence") or [])
-            if isinstance(item, dict)
-            and str(item.get("detail") or item.get("quote") or "").strip()
-        ]
-        if not evidence_items:
-            return 1.0, []
-        covered = 0
-        missing: list[str] = []
-        for item in evidence_items:
-            detail = str(item.get("detail") or "").strip()
-            quote = str(item.get("quote") or "").strip()
-            candidates = [value for value in (detail, quote) if value]
-            # A literary render may preserve the verbatim quote while naturally
-            # paraphrasing the machine-oriented detail (or vice versa). Either is
-            # sufficient evidence coverage; requiring the detail only caused
-            # false omissions on otherwise faithful diaries.
-            overlap = max((self._evidence_overlap(value, content) for value in candidates), default=0.0)
-            if overlap >= 0.16:
-                covered += 1
-            else:
-                missing.append(detail or quote)
-        return covered / len(evidence_items), missing
+        pipeline = getattr(self, "_diary_pipeline", None) or DiaryPipeline(self)
+        return pipeline.coverage(content, episode)
+
+    def _diary_transcript_risk(
+        self, content: str, episode: dict[str, Any], raw: str,
+    ) -> float:
+        del episode  # kept in the compatibility signature for old callers/tests
+        pipeline = getattr(self, "_diary_pipeline", None) or DiaryPipeline(self)
+        report = pipeline.risk_report(content, raw)
+        return float(report.risk)
+
+    def _diary_first_person_check(
+        self, content: str, episode: dict[str, Any],
+    ) -> tuple[bool, str]:
+        if not getattr(self, "diary_first_person_check_enable", True):
+            return True, ""
+        pipeline = getattr(self, "_diary_pipeline", None) or DiaryPipeline(self)
+        report = pipeline.first_person_check(content, episode)
+        return bool(report.passed), str(report.reason or "")
 
     @staticmethod
     def _grounded_episode_fallback_diary(episode: dict[str, Any]) -> str:
-        """Render a factual first-person diary when the LLM omits an Episode key."""
-        lines: list[str] = []
-        occurred = str(episode.get("occurred_at") or episode.get("event_date") or "").strip()
-        scene = str(episode.get("scene_anchor") or "").strip()
-        if occurred and scene:
-            lines.append(f"{occurred}，{scene}。")
-        elif occurred:
-            lines.append(f"{occurred}。")
-        elif scene:
-            lines.append(scene + "。")
-
-        facts: list[str] = []
-        for item in (episode.get("evidence") or [])[:16]:
-            if not isinstance(item, dict):
-                continue
-            detail = " ".join(str(item.get("detail") or "").split()).strip()
-            quote = " ".join(str(item.get("quote") or "").split()).strip()
-            if detail:
-                fact = detail
-                if quote and quote not in detail:
-                    fact += f"（「{quote}」）"
-            else:
-                fact = f"「{quote}」" if quote else ""
-            if fact and fact not in facts:
-                facts.append(fact)
-        if facts:
-            lines.append("我记得，" + "；".join(facts) + "。")
-
-        affect_before = str(episode.get("affect_before") or "").strip()
-        affect_after = str(episode.get("affect_after") or "").strip()
-        if affect_before and affect_after:
-            lines.append(f"我的感受从{affect_before}，走到了{affect_after}。")
-        elif affect_after:
-            lines.append(f"那之后，我感到{affect_after}。")
-
-        state_change = str(episode.get("state_change") or "").strip()
-        long_effect = str(episode.get("long_effect") or "").strip()
-        unresolved = [
-            str(value).strip() for value in (episode.get("unresolved") or [])
-            if str(value).strip()
-        ]
-        if state_change:
-            lines.append(state_change.rstrip("。") + "。")
-        if long_effect:
-            lines.append(long_effect.rstrip("。") + "。")
-        if unresolved:
-            lines.append("仍未结束的是：" + "；".join(unresolved[:8]) + "。")
-        return "\n".join(value for value in lines if value.strip()).strip()
+        return DiaryPipeline.fallback_diary(episode)
 
     async def _generate_evidence_first_diaries(
         self,
@@ -3410,15 +3867,35 @@ class MemosMemoryPlugin(Star):
         messages_text: str,
         diary_count: int,
         *,
+        diary_cap: int = 0,
         exact_count: bool = False,
     ) -> list[dict[str, Any]]:
+        splitter = getattr(self, "_scene_splitter", None) or SceneSplitter(
+            gap_seconds=float(getattr(self, "scene_split_gap_seconds", 10800) or 10800),
+            max_scenes=int(getattr(self, "diary_count_max_cap", 6) or 6),
+        )
+        scene_enabled = bool(getattr(self, "scene_split_enable", True))
+        candidates = splitter.detect(messages) if scene_enabled else []
+        cap = max(1, int(diary_cap or getattr(self, "diary_count_max_cap", 6) or diary_count or 1))
+        target = max(1, int(diary_count or 1))
+        if scene_enabled:
+            target = splitter.dynamic_diary_count(
+                target, messages, candidates, cap, source_kind="eod" if exact_count else "auto",
+            )
+        logger.info(
+            "[memory][scene] candidates=%d turns=%d target=%d cap=%d boundaries=%s",
+            len(candidates), len(messages), target, cap,
+            ",".join(sorted({reason for item in candidates for reason in item.reasons})) or "none",
+        )
         extraction_prompt = build_episode_extraction_prompt(
             self.character_name,
             messages_text,
-            diary_count,
+            target,
             exact_count=exact_count,
             timezone_name=self.rp_time_timezone,
             message_time_context=recorded_time_context(messages, self.rp_time_timezone),
+            scene_candidates=as_prompt_payload(candidates),
+            diary_cap=cap,
         )
         extraction_text = await self._call_memory_generation_llm(
             extraction_prompt,
@@ -3426,24 +3903,48 @@ class MemosMemoryPlugin(Star):
             timeout=self.episode_extraction_timeout,
             label="episode_extract",
         )
-        episodes = self._parse_episode_blueprints(extraction_text, messages, diary_count)
-        if exact_count and 0 < len(episodes) < diary_count:
+        episodes = self._parse_episode_blueprints(extraction_text, messages, cap)
+        scene_report = (
+            splitter.validate(episodes, messages, candidates)
+            if scene_enabled else {"fixed": [], "overlaps": [], "uncovered": [], "invalid": []}
+        )
+        logger.info(
+            "[memory][scene] validated episodes=%d fixed=%d overlaps=%d uncovered=%d invalid=%d",
+            len(episodes), len(scene_report.get("fixed") or []),
+            len(scene_report.get("overlaps") or []), len(scene_report.get("uncovered") or []),
+            len(scene_report.get("invalid") or []),
+        )
+        if exact_count and 0 < len(episodes) < target:
             retry_text = await self._call_memory_generation_llm(
                 extraction_prompt
                 + "\n\n【覆盖修正】首轮只提取了 " + str(len(episodes))
-                + " 个情景，目标是 " + str(diary_count)
-                + " 个。请重新检查不同日期、地点、目标、关系阶段、情绪转折和未解决事项，"
-                "补回确实独立且有证据的情景。仍然禁止重复、虚构或切碎同一完整情感弧。"
-                "重新输出完整 JSON 数组。",
+                + " 个情景，目标是 " + str(target)
+                + " 个。请重新检查候选范围、不同日期、地点、目标、关系阶段和情绪转折；"
+                  "补回有来源证据的独立情景，禁止重复、虚构或切碎同一情感弧。重新输出完整 JSON 数组。",
                 provider_id=self.episode_extraction_provider_id,
                 timeout=self.episode_extraction_timeout,
                 label="episode_extract_retry",
             )
-            retry_episodes = self._parse_episode_blueprints(retry_text, messages, diary_count)
+            retry_episodes = self._parse_episode_blueprints(retry_text, messages, cap)
             if len(retry_episodes) > len(episodes):
                 episodes = retry_episodes
+                scene_report = splitter.validate(episodes, messages, candidates)
+                logger.info(
+                    "[memory][scene] retry validated episodes=%d fixed=%d overlaps=%d uncovered=%d invalid=%d",
+                    len(episodes), len(scene_report.get("fixed") or []),
+                    len(scene_report.get("overlaps") or []), len(scene_report.get("uncovered") or []),
+                    len(scene_report.get("invalid") or []),
+                )
         if not episodes:
             raise ValueError("episode extraction returned no grounded episodes")
+
+        tier_counts: dict[str, int] = {}
+        for episode in episodes:
+            for item in episode.get("evidence") or []:
+                tier = str(item.get("tier") or "supporting")
+                tier_counts[tier] = tier_counts.get(tier, 0) + 1
+        logger.info("[memory][episode] episodes=%d tiers=%s", len(episodes), tier_counts)
+
         render_prompt = build_diary_render_prompt(self.character_name, messages_text, episodes)
         render_text = await self._call_memory_generation_llm(
             render_prompt,
@@ -3456,47 +3957,57 @@ class MemosMemoryPlugin(Star):
             for item in self._parse_json_array(render_text)
             if str(item.get("episode_key") or "").strip() and str(item.get("content") or "").strip()
         }
-        first_coverage = {
-            episode["episode_key"]: self._diary_render_coverage(
-                rendered[episode["episode_key"]], episode,
-            )
-            for episode in episodes
-            if episode["episode_key"] in rendered
+        raw_text = "\n".join(str(message.get("content") or "") for message in messages)
+        threshold = float(getattr(self, "diary_must_coverage_threshold", 0.72) or 0.72)
+        pipeline = getattr(self, "_diary_pipeline", None) or DiaryPipeline(self)
+
+        def assess(content: str, episode: dict[str, Any]) -> dict[str, Any]:
+            coverage, missing = self._diary_render_coverage(content, episode)
+            support = pipeline.support_coverage(content, episode)
+            person_ok, person_reason = self._diary_first_person_check(content, episode)
+            risk_detail = pipeline.risk_report(content, raw_text)
+            risk = float(risk_detail.risk) if getattr(
+                self, "diary_transcript_check_enable", True
+            ) else 0.0
+            reasons: list[str] = []
+            if coverage < threshold:
+                reasons.append("coverage_below_threshold")
+            if not person_ok:
+                reasons.append("first_person:" + person_reason)
+            if risk >= 0.42:
+                reasons.append("transcript_risk>=0.42")
+            return {
+                "coverage": float(coverage), "support": float(support),
+                "missing": list(missing), "person_ok": bool(person_ok),
+                "person_reason": person_reason, "risk": float(risk), "reasons": reasons,
+                "source_overlap_ratio": float(risk_detail.longest_common_ratio),
+                "direct_quote_ratio": float(risk_detail.quote_ratio),
+                "compression_ratio": float(risk_detail.compression_ratio),
+            }
+
+        assessments = {
+            episode["episode_key"]: assess(rendered[episode["episode_key"]], episode)
+            for episode in episodes if episode["episode_key"] in rendered
         }
-        missing_keys = [
+        retry_reasons = {
+            key: ",".join(report["reasons"])
+            for key, report in assessments.items() if report["reasons"]
+        }
+        initial_missing_keys = [
             episode["episode_key"] for episode in episodes
             if episode["episode_key"] not in rendered
         ]
-        incomplete = {
-            key: missing
-            for key, (coverage, missing) in first_coverage.items()
-            if coverage < 0.72
-        }
-        for episode in episodes:
-            key = episode["episode_key"]
-            if key in missing_keys:
-                incomplete[key] = [
-                    "整篇日记缺失",
-                    *[
-                        str(item.get("detail") or item.get("quote") or "").strip()
-                        for item in (episode.get("evidence") or [])
-                        if isinstance(item, dict)
-                        and str(item.get("detail") or item.get("quote") or "").strip()
-                    ][:8],
-                ]
-        if incomplete:
-            correction = {
-                key: values[:8]
-                for key, values in incomplete.items()
-            }
+        for key in initial_missing_keys:
+            retry_reasons[key] = "missing_episode_key"
+        if retry_reasons:
             retry_rendered: dict[str, str] = {}
             try:
                 retry_text = await self._call_memory_generation_llm(
                     render_prompt
-                    + "\n\n【完整性修正】首轮日记缺失或遗漏了下列已核验情景/证据：\n"
-                    + json.dumps(correction, ensure_ascii=False, indent=2)
-                    + "\n请重新输出所有 episode_key 的完整 JSON 数组。不得删掉这些事实，"
-                    "也不得为衔接而新增原始对话中不存在的人物、动作、物件、承诺或结果。",
+                    + "\n\n【渲染质量修正】以下 episode_key 各自只因所列精确原因需要重写：\n"
+                    + json.dumps(retry_reasons, ensure_ascii=False, indent=2)
+                    + "\n这是唯一一次重试。重新输出完整 JSON 数组；must_write 不得遗漏，"
+                      "必须保持第一人称私密日记体并降低聊天转录密度，不得新增事实。",
                     provider_id=self.diary_render_provider_id,
                     timeout=self.diary_render_timeout,
                     label="diary_render_retry",
@@ -3504,74 +4015,86 @@ class MemosMemoryPlugin(Star):
                 retry_rendered = {
                     str(item.get("episode_key") or "").strip(): str(item.get("content") or "").strip()
                     for item in self._parse_json_array(retry_text)
-                    if str(item.get("episode_key") or "").strip()
-                    and str(item.get("content") or "").strip()
+                    if str(item.get("episode_key") or "").strip() and str(item.get("content") or "").strip()
                 }
             except Exception as exc:
-                logger.warning(
-                    "[memos-memory] diary render completeness retry failed; "
-                    "preserving grounded Episodes: %s",
-                    exc,
-                )
-            # Merge per Episode instead of requiring the retry to repeat every
-            # already-good key. This tolerates providers that return only the
-            # corrected subset and never discards a stronger first render.
-            for episode in episodes:
-                key = episode["episode_key"]
-                retry_content = retry_rendered.get(key, "")
-                if not retry_content:
+                logger.warning("[memos-memory] diary render retry failed; keeping grounded episodes: %s", exc)
+            by_key = {episode["episode_key"]: episode for episode in episodes}
+            for key, retry_content in retry_rendered.items():
+                if key not in retry_reasons or key not in by_key:
                     continue
-                retry_result = self._diary_render_coverage(retry_content, episode)
-                current_result = first_coverage.get(key, (-1.0, []))
-                if key not in rendered or retry_result[0] > current_result[0]:
+                retry_report = assess(retry_content, by_key[key])
+                current_report = assessments.get(key)
+                if current_report is None:
                     rendered[key] = retry_content
-                    first_coverage[key] = retry_result
+                    assessments[key] = retry_report
+                    continue
+                retry_quality = (
+                    not bool(retry_report["reasons"]), retry_report["person_ok"],
+                    retry_report["coverage"], retry_report["support"], -retry_report["risk"],
+                )
+                current_quality = (
+                    not bool(current_report["reasons"]), current_report["person_ok"],
+                    current_report["coverage"], current_report["support"], -current_report["risk"],
+                )
+                if retry_quality > current_quality:
+                    rendered[key] = retry_content
+                    assessments[key] = retry_report
 
         fallback_keys: list[str] = []
+        fallback_reasons: dict[str, str] = {}
+        missing_keys = [episode["episode_key"] for episode in episodes if episode["episode_key"] not in rendered]
         for episode in episodes:
             key = episode["episode_key"]
-            if key in rendered:
+            current_report = assessments.get(key)
+            if key in rendered and current_report is not None and not current_report["reasons"]:
                 continue
+            if key not in rendered:
+                fallback_reasons[key] = "missing_key_fallback"
+            else:
+                fallback_reasons[key] = "grounded_fallback_after:" + ",".join(
+                    current_report["reasons"]
+                )
             fallback = self._grounded_episode_fallback_diary(episode)
             if not fallback:
-                # A parsed grounded Episode always has evidence, so reaching
-                # this branch indicates corrupted structured output rather than
-                # a harmless literary omission.
                 raise ValueError(f"grounded episode {key} has no renderable evidence")
             rendered[key] = fallback
-            first_coverage[key] = self._diary_render_coverage(fallback, episode)
+            assessments[key] = assess(fallback, episode)
             fallback_keys.append(key)
         if fallback_keys:
             logger.warning(
-                "[memos-memory] diary renderer omitted episode keys (%s); "
-                "stored grounded evidence-preserving fallback diaries",
-                ",".join(fallback_keys),
+                "[memos-memory] renderer left invalid or missing keys (%s); "
+                "using evidence-preserving fallback reasons=%s",
+                ",".join(fallback_keys), fallback_reasons,
             )
-        low_coverage = [
-            key for key, (coverage, _missing) in first_coverage.items() if coverage < 0.5
-        ]
-        if low_coverage:
-            # v4.5: a low-coverage render used to raise and fall back to the
-            # legacy single-stage path, discarding the whole grounded episode
-            # structure — strictly worse for detail retention. Keep the
-            # grounded result; omitted evidence stays retrievable through the
-            # episode card (_render_missing) and the evidence table.
-            logger.warning(
-                "[memos-memory] diary render omitted much grounded evidence (%s); "
-                "keeping evidence-first result, omissions preserved on episode card",
-                ",".join(low_coverage),
-            )
-        diaries = []
+
+        diaries: list[dict[str, Any]] = []
         for episode in episodes:
+            key = episode["episode_key"]
+            report = assessments[key]
             diary = dict(episode)
-            diary["content"] = rendered[episode["episode_key"]]
+            diary["content"] = rendered[key]
             diary["_evidence_quality"] = "source_grounded"
-            diary["_render_coverage"] = round(first_coverage[episode["episode_key"]][0], 3)
-            diary["_render_fallback"] = episode["episode_key"] in fallback_keys
-            # v4.5: evidence the render still omitted is recorded so the episode
-            # card prioritizes it — details absent from the literary body remain
-            # retrievable through the machine view.
-            diary["_render_missing"] = list(first_coverage[episode["episode_key"]][1])[:8]
+            diary["_render_coverage"] = round(report["coverage"], 3)
+            diary["_must_coverage"] = round(report["coverage"], 3)
+            diary["_support_coverage"] = round(report["support"], 3)
+            diary["_transcript_risk"] = round(report["risk"], 3)
+            diary["_source_overlap_ratio"] = round(report["source_overlap_ratio"], 4)
+            diary["_direct_quote_ratio"] = round(report["direct_quote_ratio"], 4)
+            diary["_compression_ratio"] = round(report["compression_ratio"], 4)
+            diary["_render_retry_reason"] = fallback_reasons.get(key, retry_reasons.get(key, ""))
+            diary["_render_version"] = "4.6.2"
+            diary["_diary_render_version"] = "4.6.2"
+            diary["_render_missing"] = list(report["missing"])[:8]
+            diary["_render_fallback"] = key in fallback_keys
+            if key in missing_keys:
+                diary["_render_retry_reason"] = "missing_key_fallback"
+            logger.info(
+                "[memory][diary] %s chars=%d must=%.3f support=%.3f risk=%.3f retry=%s fallback=%s",
+                key, len(diary["content"]), diary["_must_coverage"],
+                diary["_support_coverage"], diary["_transcript_risk"],
+                diary["_render_retry_reason"] or "none", diary["_render_fallback"],
+            )
             diaries.append(diary)
         return diaries
 
@@ -4164,8 +4687,269 @@ class MemosMemoryPlugin(Star):
             evidence_quality=quality,
             diary_content_hash=self._content_hash(content),
             source_updated_ts=float(diary.get("_stored_source_updated_ts") or 0),
+            diary_render_version=str(
+                diary.get("_diary_render_version") or diary.get("_render_version") or ""
+            ),
+            must_coverage=float(diary.get("_must_coverage", -1.0)),
+            support_coverage=float(diary.get("_support_coverage", -1.0)),
+            transcript_risk=float(diary.get("_transcript_risk", -1.0)),
+            render_retry_reason=str(diary.get("_render_retry_reason") or ""),
+            original_memo_version=str(diary.get("_original_memo_version") or ""),
+            source_overlap_ratio=float(diary.get("_source_overlap_ratio", -1.0)),
+            direct_quote_ratio=float(diary.get("_direct_quote_ratio", -1.0)),
+            compression_ratio=float(diary.get("_compression_ratio", -1.0)),
+            render_fallback=bool(diary.get("_render_fallback", False)),
         )
         return True
+
+    # ---------- 4.6.0-test3 persistent long-diary workflow ----------
+
+    def _long_diaries_list(
+        self, limit: int = 20, min_chars: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if self._episodes is None:
+            return []
+        threshold = max(1, int(
+            self.diary_rewrite_preview_min_chars if min_chars is None else min_chars
+        ))
+        output: list[dict[str, Any]] = []
+        for episode in self._episodes.list_episodes(limit=max(20, min(500, int(limit) * 10))):
+            card_text = str(episode.get("card_text") or "")
+            if len(card_text) < threshold:
+                continue
+            batch_id = str(episode.get("source_batch_id") or "")
+            turns = self._episodes.source_turns(batch_id) if batch_id else []
+            if not turns:
+                continue
+            output.append({
+                "episode_id": episode.get("episode_id"),
+                "memo_name": episode.get("memo_name"),
+                "card_len": len(card_text),
+                "source_batch_id": batch_id,
+                "source_turns": len(turns),
+                "occurred_at": episode.get("occurred_at") or "",
+                "evidence_quality": episode.get("evidence_quality") or "",
+                "render_version": episode.get("diary_render_version") or "",
+                "must_coverage": float(episode.get("must_coverage", -1.0)),
+                "support_coverage": float(episode.get("support_coverage", -1.0)),
+                "transcript_risk": float(episode.get("transcript_risk", -1.0)),
+            })
+            if len(output) >= max(1, int(limit)):
+                break
+        return output
+
+    async def _create_diary_rewrite_preview(self, episode_id: str) -> dict[str, Any]:
+        if self._episodes is None:
+            raise RuntimeError("原文库未就绪")
+        episode = self._episodes.get_episode_by_id(str(episode_id or ""))
+        if not episode:
+            raise RuntimeError("情景不存在")
+        batch_id = str(episode.get("source_batch_id") or "")
+        turns = self._episodes.source_turns(batch_id) if batch_id else []
+        if not turns:
+            raise RuntimeError("来源轮次不可读，无法重构")
+        messages = [{
+            "role": str(turn.get("role") or ""),
+            "content": str(turn.get("content") or ""),
+            "event_ts": float(turn.get("event_ts") or 0),
+            "event_timezone": str(turn.get("event_timezone") or self.rp_time_timezone),
+        } for turn in turns]
+        messages_text = format_messages_for_prompt(
+            messages,
+            max_turns=max(1, (len(messages) + 1) // 2),
+            timezone_name=self.rp_time_timezone,
+            max_chars_per_turn=self.raw_archive_prompt_view_max_chars,
+        )
+        candidates = self._scene_splitter.detect(messages) if self.scene_split_enable else []
+        cap = max(1, int(self.diary_count_max_cap or 1))
+        diaries = await self._generate_evidence_first_diaries(
+            messages, messages_text, self.diary_count, diary_cap=cap, exact_count=False,
+        )
+        preview_id = "rw_" + hashlib.sha256(
+            f"{episode_id}|{time.time_ns()}".encode("utf-8")
+        ).hexdigest()[:20]
+        new_diaries = []
+        for diary in diaries:
+            item = dict(diary)
+            item["must_coverage"] = float(diary.get("_must_coverage", -1.0))
+            item["support_coverage"] = float(diary.get("_support_coverage", -1.0))
+            item["transcript_risk"] = float(diary.get("_transcript_risk", -1.0))
+            item["render_retry_reason"] = str(diary.get("_render_retry_reason") or "")
+            new_diaries.append(item)
+        payload = {
+            "preview_id": preview_id,
+            "episode_id": str(episode_id),
+            "old_memo_name": str(episode.get("memo_name") or ""),
+            "old_card_text": str(episode.get("card_text") or ""),
+            "source_batch_id": batch_id,
+            "source_turns": len(messages),
+            "scene_candidates": len(candidates),
+            "new_diaries": new_diaries,
+            "created_ts": time.time(),
+        }
+        saved = self._episodes.save_diary_preview(payload)
+        self._episodes.discard_old_previews(keep=20)
+        return saved
+
+    async def _confirm_diary_rewrite(self, preview_id: str) -> dict[str, Any]:
+        if self._episodes is None:
+            raise RuntimeError("原文库未就绪")
+        preview = self._episodes.get_diary_preview(str(preview_id or ""))
+        if not preview:
+            raise RuntimeError("预览不存在或已过期")
+        payload = preview.get("payload") if isinstance(preview.get("payload"), dict) else {}
+        source_batch_id = str(preview.get("source_batch_id") or payload.get("source_batch_id") or "")
+        old_card_text = str(preview.get("old_card_text") or payload.get("old_card_text") or "")
+        loop = asyncio.get_running_loop()
+        stored_payloads: dict[int, dict[str, Any]] = {}
+
+        async def store_item(item: dict[str, Any], item_index: int) -> str:
+            diary = dict(item)
+            diary["_source_batch_id"] = source_batch_id
+            diary["_evidence_quality"] = "source_grounded"
+            diary["_original_memo_version"] = old_card_text[:60000]
+            diary["_render_version"] = "4.6.2-rewrite"
+            diary["_diary_render_version"] = "4.6.2-rewrite"
+            diary["_must_coverage"] = float(
+                diary.get("_must_coverage", diary.get("must_coverage", -1.0))
+            )
+            diary["_support_coverage"] = float(
+                diary.get("_support_coverage", diary.get("support_coverage", -1.0))
+            )
+            diary["_transcript_risk"] = float(
+                diary.get("_transcript_risk", diary.get("transcript_risk", -1.0))
+            )
+            diary["_render_retry_reason"] = str(
+                diary.get("_render_retry_reason") or diary.get("render_retry_reason") or ""
+            )
+            stored = await self._store_one_diary(
+                diary, source_session="rewrite:" + str(preview_id),
+                importance=_normalize_importance(diary.get("importance"), 3),
+                source_kind="rewrite",
+            )
+            memo_name = str(diary.get("_stored_memo_name") or "")
+            if not stored or not memo_name:
+                raise RuntimeError(f"第 {item_index + 1} 篇写入失败")
+            # PreviewStore owns the episode DB lock while invoking this callback;
+            # defer episode-card upsert until its per-item transaction completes.
+            stored_payloads[item_index] = diary
+            return memo_name
+
+        def apply_item(item: dict[str, Any], item_index: int) -> str:
+            future = asyncio.run_coroutine_threadsafe(store_item(item, item_index), loop)
+            # _store_one_diary / MemosClient already enforce provider/network
+            # timeouts. A second local timeout would leave the coroutine running
+            # and could create an orphan memo after this callback returned.
+            return future.result()
+
+        def record_rollback(old_name: str, episode_id_value: str,
+                            new_names: list[str], note: str) -> int:
+            return self._episodes.record_diary_rollback_atomic(
+                old_memo_name=old_name, episode_id=episode_id_value,
+                new_memo_names=new_names, note=note,
+            )
+
+        async def compensate_item_async(new_name: str, item_index: int) -> None:
+            try:
+                if self._memos is not None:
+                    await self._memos.delete_memo(new_name)
+                if self._vec is not None:
+                    self._vec.delete_memo_index(new_name)
+                self._episodes.delete_by_memo_name(new_name)
+                logger.warning(
+                    "[memory][diary] compensated orphan preview item=%d memo=%s",
+                    item_index, new_name,
+                )
+            except Exception as exc:
+                logger.error(
+                    "[memory][diary] preview compensation failed item=%d memo=%s: %s",
+                    item_index, new_name, exc,
+                )
+                raise
+
+        def compensate_item(new_name: str, item_index: int) -> None:
+            future = asyncio.run_coroutine_threadsafe(
+                compensate_item_async(new_name, item_index), loop,
+            )
+            future.result()
+
+        result = await asyncio.to_thread(
+            self._episodes.confirm_diary_preview,
+            str(preview_id), apply_item, record_rollback, compensate_item,
+        )
+        for item_result in result.get("results") or []:
+            if str(item_result.get("status") or "") != "succeeded":
+                continue
+            diary = stored_payloads.get(int(item_result.get("index") or 0))
+            if diary is not None:
+                try:
+                    await self._persist_episode_for_diary(
+                        diary, source_batch_id=source_batch_id, source_kind="rewrite",
+                    )
+                except Exception as exc:
+                    logger.warning("[memory][diary] rewrite episode view deferred: %s", exc)
+        return result
+
+    async def _rollback_diary_rewrite(
+        self, memo_name: str = "", preview_id: str = "",
+    ) -> dict[str, Any]:
+        if self._episodes is None or self._memos is None:
+            raise RuntimeError("Memos 或原文库未就绪")
+        rows: list[dict[str, Any]] = []
+        if preview_id:
+            rows = self._episodes.diary_preview_rollback_targets(str(preview_id))
+        elif memo_name:
+            rows = self._episodes.rollback_rows_for_memo(str(memo_name))
+        deleted = 0
+        errors: list[str] = []
+        for row in rows:
+            new_name = str(row.get("new_memo_name") or row.get("new_content") or "")
+            if not new_name:
+                continue
+            try:
+                if await self._memos.delete_memo(new_name):
+                    deleted += 1
+                    if self._vec is not None:
+                        self._vec.delete_memo_index(new_name)
+                    self._episodes.delete_by_memo_name(new_name)
+                    rollback_id = int(row.get("rollback_id") or row.get("id") or 0)
+                    if rollback_id:
+                        self._episodes.mark_rollback_reverted(rollback_id)
+            except Exception as exc:
+                errors.append(f"{new_name}: {exc}")
+        if preview_id and deleted == len([row for row in rows if row.get("new_memo_name")]):
+            self._episodes.update_diary_preview_status(str(preview_id), "discarded")
+        return {"deleted": deleted, "rows": len(rows), "errors": errors}
+
+    async def _discard_diary_preview(self, preview_id: str) -> dict[str, Any]:
+        if self._episodes is None:
+            raise RuntimeError("原文库未就绪")
+        return {
+            "discarded": self._episodes.discard_diary_preview(str(preview_id or "")),
+            "preview_id": preview_id,
+        }
+
+    def _list_diary_previews(self, limit: int = 30) -> list[dict[str, Any]]:
+        if self._episodes is None:
+            return []
+        return self._episodes.list_diary_previews(limit=max(1, min(200, int(limit))))
+
+    async def _production_generation_switch(self) -> dict[str, Any]:
+        if not await self._ensure_init() or self._episodes is None:
+            raise RuntimeError("原文库未就绪")
+        if not self._emb_dim or not self._emb_model_id:
+            raise RuntimeError("embedding 代际信息不可用")
+        return self._episodes.switch_generation(self._emb_dim, self._emb_model_id)
+
+    async def _production_generation_rollback(self) -> dict[str, Any]:
+        if not await self._ensure_init() or self._episodes is None:
+            raise RuntimeError("原文库未就绪")
+        return self._episodes.rollback_generation()
+
+    async def _production_restore_snapshot(self, file_name: str) -> dict[str, Any]:
+        if not await self._ensure_init() or self._episodes is None:
+            raise RuntimeError("原文库未就绪")
+        return await asyncio.to_thread(self._episodes.restore_snapshot, str(file_name or ""))
 
     async def _compress_and_store(self, umo: str, msgs: list[dict[str, Any]], diary_count: int | None = None,
                                   source_kind: str = "auto", buffer_up_to_seq: int | None = None) -> int:
@@ -4185,27 +4969,41 @@ class MemosMemoryPlugin(Star):
         n_msg = len(msgs)
         recorded_dates = recorded_message_dates(msgs, self.rp_time_timezone)
         requested_dc = diary_count or self.diary_count
-        # A cross-day buffer needs at least one output opportunity per recorded
-        # date. This is a lower bound for coverage, not permission to split one
-        # continuous scene into duplicates.
-        dc = max(requested_dc, len(recorded_dates))
-        logger.info("[memos-memory] 开始压缩 %d 条消息 (session=%s, dc=%d)", n_msg, umo[:12], dc)
-        self._log_event("compress", f"开始压缩 {n_msg}条 -> {dc}篇", {
-            "session": umo[:12], "msg_count": n_msg, "diary_count": dc, "source": source_kind,
-            "recorded_dates": recorded_dates,
+        candidates = self._scene_splitter.detect(msgs) if self.scene_split_enable else []
+        diary_cap = max(1, int(self.diary_count_max_cap or 1))
+        base_target = min(diary_cap, max(requested_dc, len(recorded_dates), 1))
+        dc = (
+            self._scene_splitter.dynamic_diary_count(
+                base_target, msgs, candidates, diary_cap, source_kind=source_kind,
+            )
+            if self.scene_split_enable else base_target
+        )
+        logger.info(
+            "[memos-memory] 开始压缩 %d 条消息 (session=%s, target=%d, cap=%d)",
+            n_msg, umo[:12], dc, diary_cap,
+        )
+        logger.info(
+            "[memory][scene] candidates=%d turns=%d target=%d cap=%d",
+            len(candidates), n_msg, dc, diary_cap,
+        )
+        self._log_event("compress", f"开始压缩 {n_msg}条 -> 目标{dc}篇/上限{diary_cap}篇", {
+            "session": umo[:12], "msg_count": n_msg, "diary_count": dc,
+            "diary_cap": diary_cap, "scene_candidates": len(candidates),
+            "source": source_kind, "recorded_dates": recorded_dates,
         })
         # This is only the compression task reference time. Persisted per-message
         # timestamps below remain authoritative for when the events occurred.
         time_ctx = self._compression_time_context(umo, source_kind)
-        messages_text = format_messages(
+        messages_text = format_messages_for_prompt(
             msgs,
             max_turns=max(1, (len(msgs) + 1) // 2),
             timezone_name=self.rp_time_timezone,
+            max_chars_per_turn=self.raw_archive_prompt_view_max_chars,
         )
         prompt = build_compress_prompt(
             self.character_name,
             messages_text,
-            dc,
+            base_target,
             enhancer_time=time_ctx,
             exact_diary_count=False,
             timezone_name=self.rp_time_timezone,
@@ -4214,7 +5012,16 @@ class MemosMemoryPlugin(Star):
         source_batch_id = ""
         if self._episodes is not None and self.raw_evidence_archive_enable:
             try:
+                # Archive ownership is lossless: prompt truncation above never
+                # changes the original messages written to SourceArchive.
                 source_batch_id = self._episodes.archive_batch(umo, msgs, source_kind)
+                logger.info(
+                    "[memory][archive] complete turns=%d user=%d assistant=%d batch=%s truncated=0",
+                    n_msg,
+                    sum(1 for message in msgs if str(message.get("role") or "") == "user"),
+                    sum(1 for message in msgs if str(message.get("role") or "") == "assistant"),
+                    source_batch_id,
+                )
             except Exception as e:
                 logger.warning("[memos-memory][episode] 原始证据归档失败，保留 buffer: %s", e)
                 return 0
@@ -4238,6 +5045,7 @@ class MemosMemoryPlugin(Star):
                     msgs,
                     messages_text,
                     dc,
+                    diary_cap=diary_cap,
                     exact_count=False,
                 )
                 generation_mode = "evidence_first"
@@ -4457,7 +5265,9 @@ class MemosMemoryPlugin(Star):
         if user_text:
             new_msgs.append({"role": "user", "content": user_text, **message_time})
         if asst_text:
-            new_msgs.append({"role": "assistant", "content": asst_text[:2000], **message_time})
+            # 4.6 source ownership is lossless. Prompt/index limits are applied
+            # later as views and child chunks, never to the buffered source turn.
+            new_msgs.append({"role": "assistant", "content": asst_text, **message_time})
         if not new_msgs:
             return
         # 落 sqlite(进程重启不丢),也维护内存 _buffer 给 _compress_and_store 同步读
@@ -4629,49 +5439,143 @@ class MemosMemoryPlugin(Star):
             add("key_terms", term)
         return facets
 
-    def _plan_episodic_query(self, user_query: str, context_text: str = "") -> dict[str, Any]:
-        user_query = " ".join(str(user_query or "").split())
-        context_text = " ".join(str(context_text or "").split())
-        facets = self._extract_recall_facets(user_query)
-        narrative_words = (
-            "为什么", "怎么", "后来", "之后", "以前", "过程", "发生了什么",
-            "从头", "来龙去脉", "完整", "全部", "所有", "每次", "哪些",
-        )
-        broad_words = ("都", "全部", "所有", "每次", "哪些", "几次", "从头")
-        ambiguous_markers = (
-            "这", "那", "他", "她", "它", "刚才", "之前", "然后", "为什么", "怎么了",
-            "不用我说", "你记得", "你都记得", "你懂", "还记得", "算了", "还是", "又",
-            "没可能", "没有可能", "就这样", "继续", "接着", "那件事", "那时候", "说不出口",
-        )
-        narrative = any(word in user_query for word in narrative_words)
-        broad = any(word in user_query for word in broad_words)
-        temporal = bool(facets.get("temporal"))
-        ambiguous = len(user_query) <= 14 or any(marker in user_query for marker in ambiguous_markers)
-        sparse_subject = not facets.get("entities") and not facets.get("key_terms")
-        use_context = bool(context_text and (ambiguous or (broad and sparse_subject)))
-        search_text = user_query
-        if use_context:
-            search_text += "\n相关上文：" + context_text[-600:]
-        if broad or narrative:
-            target = self.episodic_narrative_inject
-            intent = "narrative"
-        elif temporal or facets.get("entities") or facets.get("relation"):
-            target = min(self.episodic_default_inject, 4)
-            intent = "specific"
-        else:
-            target = self.episodic_default_inject
-            intent = "normal"
+    # ---- 4.6 compatibility facade over split test2 modules -----------
+
+    @staticmethod
+    def _resolve_plugin_data_db(filename: str) -> str:
+        return resolve_plugin_data_db(filename)
+
+    def _migrate_episode_db_location(self) -> str:
+        self.episodic_db_path = migrate_episode_db_location(self.episodic_db_path)
+        return self.episodic_db_path
+
+    def _build_query_plan(self, user_query: str, contexts: list[Any] | None) -> dict[str, Any] | None:
+        planner = getattr(self, "_query_planner", None) or QueryPlanner(self)
+        result = planner.rewrite(user_query, contexts)
+        if result is None:
+            return None
         return {
-            "intent": intent,
-            "search_text": search_text,
-            "use_context": use_context,
-            "target": max(1, int(target)),
-            "candidate_pool": max(self.episodic_candidate_pool, int(target) * 3),
-            "narrative": narrative,
-            "broad": broad,
-            "temporal": temporal,
-            "facets": facets,
+            "query": result.search_text,
+            "standalone_query": result.search_text,
+            "resolved_entities": list(result.resolved_entities),
+            "entities": list(result.resolved_entities),
+            "relation_cues": list(result.relation_cues),
+            "emotion_cues": list(result.emotion_cues),
+            "temporal_constraints": list(result.temporal_constraints),
+            "intent": result.intent,
+            "context_turn_indexes": list(result.context_turn_indexes),
+            "confidence": result.confidence,
+            "use_context": result.use_context,
+            "use_context_reason": result.context_used_reason,
+            "context_used_reason": result.context_used_reason,
+            "rewritten": result.rewritten,
+            "_plan_object": result,
         }
+
+    async def _query_plan_llm_disambiguate(
+        self, user_query: str, context_text: str, local_plan: dict[str, Any]
+    ) -> dict[str, Any]:
+        planner = getattr(self, "_query_planner", None) or QueryPlanner(self)
+        plan_obj = local_plan.get("_plan_object")
+        if plan_obj is None:
+            from .query_planner import QueryPlan
+            plan_obj = QueryPlan(
+                intent=str(local_plan.get("intent") or "specific"),
+                search_text=str(local_plan.get("query") or user_query),
+                use_context=bool(local_plan.get("use_context")),
+                context_used_reason=str(local_plan.get("context_used_reason") or "specific_query"),
+                confidence=float(local_plan.get("confidence") or 0.0),
+                resolved_entities=list(local_plan.get("resolved_entities") or []),
+                raw_standalone=user_query,
+            )
+        async def _caller(prompt: str) -> str:
+            return await self._call_memory_generation_llm(
+                prompt,
+                provider_id=self.query_plan_llm_provider_id,
+                timeout=self.episode_extraction_timeout,
+                label="query_plan",
+            )
+        updated = await planner.maybe_llm_disambiguate(
+            plan_obj, context_text, _caller, build_query_plan_disambiguation_prompt,
+        )
+        out = dict(local_plan)
+        out.update({
+            "query": updated.search_text,
+            "standalone_query": updated.search_text,
+            "resolved_entities": list(updated.resolved_entities),
+            "entities": list(updated.resolved_entities),
+            "relation_cues": list(updated.relation_cues),
+            "emotion_cues": list(updated.emotion_cues),
+            "temporal_constraints": list(updated.temporal_constraints),
+            "intent": updated.intent,
+            "confidence": updated.confidence,
+            "use_context": updated.use_context,
+            "context_used_reason": updated.context_used_reason,
+            "rewritten": updated.rewritten,
+            "_plan_object": updated,
+        })
+        return out
+
+    def _detect_scene_candidates(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        splitter = getattr(self, "_scene_splitter", None) or SceneSplitter(
+            gap_seconds=float(getattr(self, "scene_split_gap_seconds", 10800) or 10800),
+            max_scenes=int(getattr(self, "diary_count_max_cap", 6) or 6),
+        )
+        return as_prompt_payload(splitter.detect(messages))
+
+    def _validate_episode_ranges(
+        self, episodes: list[dict[str, Any]], messages: list[dict[str, Any]],
+        candidates: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        from .scene_splitter import SceneCandidate
+        splitter = getattr(self, "_scene_splitter", None) or SceneSplitter(
+            gap_seconds=float(getattr(self, "scene_split_gap_seconds", 10800) or 10800),
+            max_scenes=int(getattr(self, "diary_count_max_cap", 6) or 6),
+        )
+        prepared = [SceneCandidate(
+            start_turn=int(item.get("start_turn", 0)),
+            end_turn=int(item.get("end_turn", 0)),
+            reasons=list(item.get("reasons") or []),
+            score=float(item.get("score") or 0.0),
+        ) for item in (candidates or []) if isinstance(item, dict)]
+        report = splitter.validate(episodes, messages, prepared or None)
+        # Historical diagnostic compatibility: fixed entries were strings
+        # containing the episode key. The splitter itself keeps structured
+        # dicts; this facade exposes both in a compact readable form.
+        fixed_items = []
+        for item in report.get("fixed") or []:
+            index = int(item.get("episode_index", -1)) if isinstance(item, dict) else -1
+            key = str(episodes[index].get("episode_key") or f"e{index + 1}") if 0 <= index < len(episodes) else "episode"
+            fixed_items.append(f"{key}: {item.get('from')} -> {item.get('to')}" if isinstance(item, dict) else str(item))
+        report["fixed"] = fixed_items
+        return report
+
+    def _plan_episodic_query(self, user_query: str, context_text: str = "") -> dict[str, Any]:
+        planner = getattr(self, "_query_planner", None) or QueryPlanner(self)
+        plan = planner.plan_for_search(user_query, context_text)
+        facets = plan.get("facets") if isinstance(plan.get("facets"), dict) else {}
+        legacy_facets = self._extract_recall_facets(user_query)
+        # Keep the long-standing facet shape consumed by lean/episodic ranking,
+        # while letting QueryPlanner own intent and context decisions.
+        merged_facets = {
+            key: (list(values) if isinstance(values, (list, tuple, set)) else ([] if not values else [str(values)]))
+            for key, values in legacy_facets.items()
+        }
+        for key, values in facets.items():
+            bucket = merged_facets.setdefault(key, [])
+            for value in values or []:
+                if value not in bucket:
+                    bucket.append(value)
+        plan["facets"] = merged_facets
+        if plan.get("use_context") and context_text and "相关上文" not in str(plan.get("search_text") or ""):
+            plan["search_text"] = str(plan.get("search_text") or user_query) + "\n相关上文：" + context_text[-600:]
+        narrative = bool(plan.get("narrative") or plan.get("intent") == "narrative")
+        target = self.episodic_narrative_inject if narrative else self.episodic_default_inject
+        plan["target"] = max(1, int(target))
+        plan["candidate_pool"] = max(self.episodic_candidate_pool, int(target) * 3)
+        plan["narrative"] = narrative
+        plan["temporal"] = bool(plan.get("temporal") or plan.get("intent") == "temporal")
+        return plan
 
     async def _episodic_recall_search(
         self,
@@ -4799,6 +5703,19 @@ class MemosMemoryPlugin(Star):
             if value and value not in keys:
                 keys.append(value)
 
+        constraint = parse_temporal_constraint(source, now)
+        for start, end, _reason in constraint.ranges:
+            if start == end:
+                add(start.isoformat())
+                add(f"{start.year}年{start.month}月{start.day}日")
+                add(f"{start.month}月{start.day}日")
+            else:
+                add(f"{start.year:04d}-{start.month:02d}")
+                add(f"{start.year}年{start.month}月")
+                if (end.year, end.month) != (start.year, start.month):
+                    add(f"{end.year:04d}-{end.month:02d}")
+                    add(f"{end.year}年{end.month}月")
+
         for year, month, day in re.findall(r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})(?:日)?", source):
             add(f"{int(year):04d}-{int(month):02d}-{int(day):02d}")
             add(f"{int(year)}年{int(month)}月{int(day)}日")
@@ -4832,17 +5749,18 @@ class MemosMemoryPlugin(Star):
         event_index_enabled: bool | None = None,
         source_evidence_enabled: bool | None = None,
         bm25_weight: float = 0.30,
+        optimizer_enabled: bool | None = None,
     ) -> tuple[list[dict], dict[str, Any], dict[str, list[str]]]:
         if self._vec is None:
             return [], {"mode": "lean", "ready": False}, {}
         plan = self._plan_episodic_query(user_query, context_text)
-        plan["target"] = (
-            self.lean_story_max_inject
-            if plan.get("narrative") or plan.get("temporal")
-            else min(
-                self.lean_story_max_inject,
-                max(self.lean_story_min_inject, int(getattr(self, "lean_story_normal_inject", 3))),
-            )
+        memory_intent = classify_memory_intent(user_query, str(plan.get("intent") or ""))
+        plan["memory_intent"] = memory_intent
+        plan["target"] = intent_target(
+            memory_intent,
+            int(getattr(self, "lean_story_normal_inject", 3)),
+            self.lean_story_max_inject,
+            self.lean_story_min_inject,
         )
         plan["candidate_pool"] = self.lean_recall_candidate_k
         query_vec = await asyncio.wait_for(
@@ -5142,6 +6060,27 @@ class MemosMemoryPlugin(Star):
         )
         if self._rerank_provider is not None and hits:
             hits = await self._rerank_fn(plan["search_text"], hits, pool_limit=self.lean_recall_candidate_k)
+        optimizer_on = True if optimizer_enabled is None else bool(optimizer_enabled)
+        optimization_diag = optimize_fused_hits(
+            user_query,
+            hits,
+            plan,
+            reference_now=self._request_now(),
+            cross_layer=optimizer_on
+            and getattr(self, "recall_cross_layer_consistency_enable", True),
+            temporal=optimizer_on
+            and getattr(self, "recall_temporal_constraints_enable", True),
+            intent_weights=optimizer_on
+            and getattr(self, "recall_intent_layer_weights_enable", True),
+        )
+        hits.sort(
+            key=lambda item: (
+                float(item.get("_rerank_score") or item.get("score") or item.get("relevance") or 0.0)
+                + float(item.get("_retrieval_bonus") or 0.0),
+                float(item.get("relevance") or 0.0),
+            ),
+            reverse=True,
+        )
         return hits, {
             "mode": "lean_full_memory_fusion",
             "ready": True,
@@ -5174,6 +6113,7 @@ class MemosMemoryPlugin(Star):
             "month_branch": False,
             "episode_card_route": event_enabled,
             "source_evidence_route": source_enabled,
+            "retrieval_optimizer": optimization_diag,
         }, plan["facets"]
 
     def _lean_coverage_features(self, hit: dict[str, Any], query_terms: set[str]) -> dict[str, Any]:
@@ -5377,6 +6317,7 @@ class MemosMemoryPlugin(Star):
                 if rank_score > 0 and coarse_score > 0
                 else (rank_score if rank_score > 0 else coarse_score)
             )
+            base += float(hit.get("_retrieval_bonus") or 0.0)
             representation_count = sum(bool(value) for value in (
                 hit.get("_passage_hit"), hit.get("_event_card_hit"), hit.get("_source_evidence_hit"),
             ))
@@ -6006,7 +6947,11 @@ class MemosMemoryPlugin(Star):
         state_chars = self._inject_semantic_state_for_request(req, request_stat)
         time_insight_result: dict[str, Any] = {"chars": 0, "selected": 0, "mode": "disabled"}
         try:
-            time_insight_result = await self._time_insight.on_request(event, req)
+            time_insight_result = await self._time_insight.on_request(
+                event,
+                req,
+                request_now=request_now,
+            )
             time_insight_chars = int(time_insight_result.get("chars") or 0)
             request_stat["time_insight"] = time_insight_result
             request_stat.setdefault("composition", {})["time_insight"] = time_insight_chars
@@ -6053,43 +6998,94 @@ class MemosMemoryPlugin(Star):
         contexts_total = 0
         user_query = query
         context_query_text = ""
+        query_plan = None
+        context_ready = False
+        context_used = False
+        context_used_reason = "no_candidate"
         try:
             ctxs = self._normalize_contexts(getattr(req, "contexts", None))
             contexts_total = len(ctxs)
-            if ctxs and self.recall_context_query_messages > 0 and self.recall_context_query_max_chars > 0:
+            context_ready = bool(ctxs)
+            query_plan = self._query_planner.rewrite(user_query, ctxs)
+            if query_plan is not None:
+                window_texts = [
+                    self._ctx_content(item) for item in ctxs[-self.query_plan_context_window:]
+                    if self._ctx_role(item) in {"user", "assistant"} and self._ctx_content(item)
+                ]
+                disambiguation_context = "\n".join(window_texts)[-self.recall_context_query_max_chars:]
+                if self.query_plan_llm_disambiguate:
+                    async def _query_llm(prompt_text: str) -> str:
+                        return await self._call_memory_generation_llm(
+                            prompt_text,
+                            provider_id=self.query_plan_llm_provider_id or self.episode_extraction_provider_id,
+                            timeout=30.0,
+                            label="query_plan_disambiguate",
+                        )
+                    query_plan = await self._query_planner.maybe_llm_disambiguate(
+                        query_plan, disambiguation_context, _query_llm,
+                        build_query_plan_disambiguation_prompt,
+                    )
+                query = query_plan.search_text or user_query
+                context_used = bool(query_plan.use_context)
+                context_used_reason = str(query_plan.context_used_reason or "planned")
+                if context_used:
+                    context_query_text = disambiguation_context
+                    context_query_parts = len(window_texts)
+            elif ctxs and self.recall_context_query_messages > 0 and self.recall_context_query_max_chars > 0:
+                # Compatibility fallback only when QueryPlanner did not produce a
+                # decision. A plan that says false never gets blind full context.
                 recent = []
                 base_norm = " ".join(query.split())
                 budget = self.recall_context_query_max_chars
-                for m in reversed(ctxs):
+                for item in reversed(ctxs):
                     if len(recent) >= self.recall_context_query_messages or budget <= 0:
                         break
-                    role = self._ctx_role(m)
-                    if role not in {"user", "assistant"}:
+                    if self._ctx_role(item) not in {"user", "assistant"}:
                         continue
-                    c = self._ctx_content(m)
-                    if c and isinstance(c, str) and c.strip():
-                        clean = " ".join(c.strip().split())
-                        if clean == base_norm:
-                            continue
-                        clean = clean[-min(len(clean), budget, 360):]
-                        if clean:
-                            recent.append(clean)
-                            budget -= len(clean)
+                    clean = " ".join(str(self._ctx_content(item) or "").split())
+                    if not clean or clean == base_norm:
+                        continue
+                    clean = clean[-min(len(clean), budget, 360):]
+                    recent.append(clean)
+                    budget -= len(clean)
                 if recent:
                     recent.reverse()
                     context_query_parts = len(recent)
                     context_query_text = "\n".join(recent)
-                    query = query + "\n[最近对话线索]\n" + context_query_text
-        except Exception:
-            pass
+                    query = user_query + "\n[最近对话线索]\n" + context_query_text
+                    context_used = True
+                    context_used_reason = "legacy_fallback"
+        except Exception as exc:
+            logger.debug("[memory][query] planner failed open: %s", exc)
+            query = user_query
+            context_used = False
+            context_used_reason = "planner_failure_local_fallback"
+        intent = str(getattr(query_plan, "intent", "specific"))
+        confidence = float(getattr(query_plan, "confidence", 0.0) or 0.0)
+        resolved_entities = list(getattr(query_plan, "resolved_entities", []) or [])
+        logger.info(
+            "[memory][query] intent=%s use_context=%s use_context_reason=%s confidence=%.3f",
+            intent, context_used, context_used_reason, confidence,
+        )
+        query_detail = {
+            "intent": intent, "confidence": confidence,
+            "resolved_entities": resolved_entities,
+            "context_ready": context_ready, "context_used": context_used,
+            "context_used_reason": context_used_reason,
+        }
+        request_stat.update(query_detail)
         request_stat["query"] = user_query[:1200]
         request_stat["query_with_context"] = query[:1800]
         self._log_event("recall", f"query: {query[:80]}", {
-            "query_len": len(query),
-            "user_input": (event.message_str or "")[:60],
-            "context_query_parts": context_query_parts,
-            "contexts_total": contexts_total,
+            "query_len": len(query), "user_input": user_query[:60],
+            "context_query_parts": context_query_parts, "contexts_total": contexts_total,
+            **query_detail,
         })
+
+        # QueryPlanner's standalone text is authoritative for retrieval. Context
+        # is passed separately only when the planner explicitly approved it.
+        retrieval_user_query = query
+        retrieval_context_text = context_query_text if context_used else ""
 
         episodic_ready = False
         try:
@@ -6169,7 +7165,7 @@ class MemosMemoryPlugin(Star):
                     "candidate_pool": self.lean_recall_candidate_k,
                 })
                 hits, recall_routes_diag, recall_facets = await asyncio.wait_for(
-                    self._lean_recall_search(user_query, context_query_text, current_md),
+                    self._lean_recall_search(retrieval_user_query, retrieval_context_text, current_md),
                     timeout=max(2.0, float(self.recall_search_timeout or 18)),
                 )
                 self._log_event("recall", f"lean recall: {len(hits)} candidates", recall_routes_diag)
@@ -6179,7 +7175,7 @@ class MemosMemoryPlugin(Star):
                     "candidate_pool": self.episodic_candidate_pool,
                 })
                 hits, recall_routes_diag, recall_facets = await asyncio.wait_for(
-                    self._episodic_recall_search(user_query, context_query_text, current_md),
+                    self._episodic_recall_search(retrieval_user_query, retrieval_context_text, current_md),
                     timeout=max(2.0, float(self.recall_search_timeout or 18)),
                 )
             else:
@@ -6188,7 +7184,7 @@ class MemosMemoryPlugin(Star):
                     "context_parts": context_query_parts,
                 })
                 hits, recall_routes_diag, recall_facets = await asyncio.wait_for(
-                    self._parallel_recall_search(user_query, context_query_text, layered_k, current_md),
+                    self._parallel_recall_search(retrieval_user_query, retrieval_context_text, layered_k, current_md),
                     timeout=max(2.0, float(self.recall_search_timeout or 18)),
                 )
                 self._log_event("recall", f"multi-query merged: {len(hits)} candidates", recall_routes_diag)
@@ -6289,7 +7285,7 @@ class MemosMemoryPlugin(Star):
             safety_net_ran = True
             try:
                 hits, _rescue_routes, _rescue_facets = await asyncio.wait_for(
-                    self._parallel_recall_search(user_query, context_query_text, layered_k, current_md),
+                    self._parallel_recall_search(retrieval_user_query, retrieval_context_text, layered_k, current_md),
                     timeout=max(2.0, float(self.recall_search_timeout or 18)),
                 )
                 for item in hits:
@@ -6302,6 +7298,24 @@ class MemosMemoryPlugin(Star):
 
         if not hits:
             self._log_event("recall", "no hits", {"min_sim": self.min_similarity_to_inject, "top_k": dynamic_k})
+            if (
+                lean_ready
+                and getattr(self, "recall_observation_enable", True)
+                and self._episodes is not None
+            ):
+                try:
+                    empty_plan = recall_routes_diag.get("plan") if isinstance(recall_routes_diag, dict) else {}
+                    self._episodes.record_recall_observation({
+                        "request_id": str(request_stat.get("request_id") or ""),
+                        "query": retrieval_user_query,
+                        "intent": str((empty_plan or {}).get("memory_intent") or (empty_plan or {}).get("intent") or ""),
+                        "safety_triggered": bool(safety_net_ran),
+                        "safety_reason": "empty_lean_recall" if safety_net_ran else "",
+                        "selected_before": [], "selected_after": [], "rescue_selected": [],
+                        "outcome": "no_selection",
+                    })
+                except Exception as exc:
+                    logger.debug("[memos-memory][recall] empty observation write failed open: %s", exc)
             self._finish_request_injection_stat(request_stat, "no_hits")
             return
 
@@ -6354,12 +7368,29 @@ class MemosMemoryPlugin(Star):
         if lean_ready:
             plan = recall_routes_diag.get("plan") if isinstance(recall_routes_diag.get("plan"), dict) else {}
             selection_query = str(plan.get("search_text") or user_query)
+            recall_routes_diag["retrieval_optimizer"] = optimize_fused_hits(
+                retrieval_user_query,
+                hits,
+                plan,
+                reference_now=request_now,
+                cross_layer=getattr(
+                    self, "recall_cross_layer_consistency_enable", True
+                ),
+                temporal=getattr(self, "recall_temporal_constraints_enable", True),
+                intent_weights=getattr(
+                    self, "recall_intent_layer_weights_enable", True
+                ),
+            )
             selected_hits, recall_diag, _annotated_hits = self._postprocess_lean_hits(
                 selection_query,
                 hits,
                 plan,
                 recent_seen,
             )
+            selected_before_safety = [] if safety_net_ran else [
+                str(hit.get("memo_name") or "") for hit in selected_hits
+                if str(hit.get("memo_name") or "")
+            ]
             recall_diag["lean"] = recall_routes_diag
             recall_diag["facets"] = recall_facets
             # v4.5 safety net: if the lean path selected nothing (or a lone weak
@@ -6391,7 +7422,7 @@ class MemosMemoryPlugin(Star):
                     rescue_hits: list[dict[str, Any]] = []
                     try:
                         rescue_hits, _rescue_routes, _rescue_facets = await asyncio.wait_for(
-                            self._parallel_recall_search(user_query, context_query_text, layered_k, current_md),
+                            self._parallel_recall_search(retrieval_user_query, retrieval_context_text, layered_k, current_md),
                             timeout=max(2.0, float(self.recall_search_timeout or 18)),
                         )
                     except Exception as exc:
@@ -6442,6 +7473,21 @@ class MemosMemoryPlugin(Star):
                     safety_diag["added"] = added
                     safety_diag["merged"] = merged
                     if added or merged:
+                        recall_routes_diag["retrieval_optimizer"] = optimize_fused_hits(
+                            retrieval_user_query,
+                            hits,
+                            plan,
+                            reference_now=request_now,
+                            cross_layer=getattr(
+                                self, "recall_cross_layer_consistency_enable", True
+                            ),
+                            temporal=getattr(
+                                self, "recall_temporal_constraints_enable", True
+                            ),
+                            intent_weights=getattr(
+                                self, "recall_intent_layer_weights_enable", True
+                            ),
+                        )
                         selected_hits, recall_diag, _annotated_hits = self._postprocess_lean_hits(
                             selection_query,
                             hits,
@@ -6456,6 +7502,50 @@ class MemosMemoryPlugin(Star):
                         f"safety net: +{added} new / {merged} strengthened, final={len(selected_hits)}",
                         safety_diag,
                     )
+            selected_after_safety = [
+                str(hit.get("memo_name") or "") for hit in selected_hits
+                if str(hit.get("memo_name") or "")
+            ]
+            rescue_selected = [
+                str(hit.get("memo_name") or "") for hit in selected_hits
+                if hit.get("_safety_net_rescue") and str(hit.get("memo_name") or "")
+            ]
+            if safety_diag.get("triggered"):
+                if not selected_after_safety:
+                    observation_outcome = "no_selection"
+                elif rescue_selected or len(selected_after_safety) > len(selected_before_safety):
+                    observation_outcome = "helped"
+                else:
+                    observation_outcome = "no_change"
+            else:
+                observation_outcome = "not_triggered"
+            safety_diag.update({
+                "selected_before": len(selected_before_safety),
+                "selected_after": len(selected_after_safety),
+                "rescue_selected": len(rescue_selected),
+                "outcome": observation_outcome,
+            })
+            if (
+                getattr(self, "recall_observation_enable", True)
+                and self._episodes is not None
+            ):
+                try:
+                    self._episodes.record_recall_observation({
+                        "request_id": str(request_stat.get("request_id") or ""),
+                        "query": retrieval_user_query,
+                        "intent": str(plan.get("memory_intent") or plan.get("intent") or ""),
+                        "safety_triggered": bool(safety_diag.get("triggered")),
+                        "safety_reason": str(safety_diag.get("reason") or ""),
+                        "rescue_candidates": int(safety_diag.get("rescue_candidates") or 0),
+                        "rescue_added": int(safety_diag.get("added") or 0),
+                        "rescue_merged": int(safety_diag.get("merged") or 0),
+                        "selected_before": selected_before_safety,
+                        "selected_after": selected_after_safety,
+                        "rescue_selected": rescue_selected,
+                        "outcome": observation_outcome,
+                    })
+                except Exception as exc:
+                    logger.debug("[memos-memory][recall] observation write failed open: %s", exc)
             recall_diag["safety_net"] = safety_diag
         elif episodic_ready:
             target = int((recall_routes_diag.get("plan") or {}).get("target") or self.episodic_default_inject)
@@ -6495,12 +7585,41 @@ class MemosMemoryPlugin(Star):
                     "fallback": not bool(direct_hits),
                 },
             }
+        route_context_used = context_used
+        route_context_reason = context_used_reason
+        route_plan = recall_routes_diag.get("plan") if isinstance(recall_routes_diag, dict) else None
+        if isinstance(route_plan, dict) and "use_context" in route_plan:
+            route_context_used = bool(route_plan.get("use_context"))
+            route_context_reason = str(route_plan.get("context_used_reason") or "route_plan")
+        elif isinstance(recall_routes_diag, dict) and recall_routes_diag.get("multi_query"):
+            route_context_used = bool(context_query_text)
+            route_context_reason = "multi_query_context" if route_context_used else "multi_query_current_only"
+        request_stat["context_used"] = route_context_used
+        request_stat["context_used_reason"] = route_context_reason
+        recall_diag["context_ready"] = context_ready
+        recall_diag["context_used"] = route_context_used
+        recall_diag["context_used_reason"] = route_context_reason
         self._log_event(
             "recall",
             f"postprocess: pool={recall_diag.get('candidate_pool')} qualified={recall_diag.get('qualified')} "
             f"folded={recall_diag.get('folded')} final={recall_diag.get('selected')}",
             recall_diag,
         )
+        evidence_expansion_names: set[str] = set()
+        evidence_expansion_mode = "inactive"
+        if lean_ready:
+            evidence_hits, evidence_expansion_mode = self._select_lean_evidence_hits(
+                user_query, selected_hits,
+            )
+            evidence_expansion_names = {
+                str(hit.get("memo_name") or "") for hit in evidence_hits if hit.get("memo_name")
+            }
+            recall_diag["source_evidence_expansion"] = {
+                "mode": evidence_expansion_mode,
+                "selected": len(evidence_expansion_names),
+                "memos": sorted(evidence_expansion_names),
+                "per_memory_limit": int(self.episodic_evidence_per_memory),
+            }
         blocks: list[dict[str, Any]] = []
         total = 0
         injection_modes = {"full": 0, "passage": 0, "compact": 0}
@@ -6521,7 +7640,11 @@ class MemosMemoryPlugin(Star):
             h["_injection_mode"] = mode
             h["_injection_mode_reason"] = mode_reason
             if lean_ready:
-                self._prepare_fused_memory_hit(user_query, h)
+                self._prepare_fused_memory_hit(
+                    user_query,
+                    h,
+                    include_source_evidence=mn in evidence_expansion_names,
+                )
             block = self._format_inject_block(
                 h, inject_content, passage_mode=not use_full, passage_detail=passage_detail,
                 reference_now_ts=request_now.timestamp(),
@@ -7362,11 +8485,19 @@ class MemosMemoryPlugin(Star):
         return cluster_map
 
     def _apply_cluster_fold(self, hits: list[dict]) -> tuple[list[dict], dict[str, Any]]:
-        if not self.recall_cluster_fold_enable:
+        enabled = bool(self.recall_cluster_fold_enable)
+        apply = bool(self.recall_cluster_fold_apply)
+        if not enabled or not apply:
             for h in hits:
                 h["_cluster_id"] = ""
                 h["_folded"] = False
-            return hits, {"enabled": False, "apply": False, "folded": 0, "groups": {}}
+            return hits, {
+                "enabled": enabled,
+                "apply": apply,
+                "folded": 0,
+                "groups": {},
+                "reason": "disabled" if not enabled else "diagnostic_only",
+            }
         cluster_map = self._cluster_candidate_hits(hits)
         base_per = max(1, int(self.recall_cluster_base_per_group or 2))
         allow_protected = bool(self.recall_cluster_allow_protected)
@@ -7877,7 +9008,13 @@ class MemosMemoryPlugin(Star):
             or self._extract_recall_facets(source).get("temporal")
         )
 
-    def _prepare_fused_memory_hit(self, query: str, hit: dict[str, Any]) -> None:
+    def _prepare_fused_memory_hit(
+        self,
+        query: str,
+        hit: dict[str, Any],
+        *,
+        include_source_evidence: bool = True,
+    ) -> None:
         """Attach compact event and first-hand evidence layers to one diary hit."""
         hit["_fusion_event_core"] = []
         hit["_fusion_source_evidence"] = []
@@ -7903,6 +9040,12 @@ class MemosMemoryPlugin(Star):
                 core.append("承诺/边界: " + boundary[:320])
         hit["_fusion_event_core"] = list(dict.fromkeys(core))[:4]
 
+        if not include_source_evidence:
+            hit["_fusion_evidence_quality"] = str(
+                episode.get("evidence_quality") or "diary_derived"
+            )
+            return
+
         precise = self._is_precise_memory_query(query)
         source_lines: list[str] = []
         direct_turns = sorted(
@@ -7912,7 +9055,10 @@ class MemosMemoryPlugin(Star):
             ),
             reverse=True,
         )
-        direct_limit = 2 if precise else 1
+        configured_limit = max(
+            1, min(8, int(getattr(self, "episodic_evidence_per_memory", 3) or 3))
+        )
+        direct_limit = configured_limit if precise else 1
         for item in direct_turns[:direct_limit]:
             content = " ".join(str(item.get("content") or "").split()).strip()
             if not content:
@@ -8388,6 +9534,13 @@ class MemosMemoryPlugin(Star):
                 "affect_before": h.get("_affect_before", ""),
                 "affect_after": h.get("_affect_after", ""),
                 "unresolved": h.get("_unresolved") or [],
+                "retrieval_bonus": round(float(h.get("_retrieval_bonus") or 0.0), 4),
+                "retrieval_bonus_reasons": h.get("_retrieval_bonus_reasons") or [],
+                "cross_layer_available": h.get("_cross_layer_available") or [],
+                "cross_layer_supported": h.get("_cross_layer_supported") or [],
+                "cross_layer_consistency": round(float(h.get("_cross_layer_consistency") or 0.0), 4),
+                "layer_signals": h.get("_layer_signals") or {},
+                "temporal_constraint_match": bool(h.get("_temporal_constraint_match")),
                 "cluster_id": h.get("_cluster_id", ""),
                 "folded": bool(h.get("_folded")),
                 "reasons": h.get("_injection_reasons") or [],
@@ -8424,6 +9577,96 @@ class MemosMemoryPlugin(Star):
             "keyword_hits": keyword_hits[:10],
         }
 
+    def _generate_recall_eval_cases(self, limit: int | None = None) -> dict[str, Any]:
+        """Build a reproducible local eval set without calling an LLM or changing memories."""
+        if self._episodes is None:
+            raise RuntimeError("episodic memory store is not ready")
+        limit = max(20, min(200, int(limit or self.recall_auto_eval_limit)))
+        generated: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+
+        def add(query: str, memo_name: str, source: str, note: str) -> None:
+            query = " ".join(str(query or "").split()).strip()
+            memo_name = str(memo_name or "").strip()
+            key = (query, memo_name)
+            if len(query) < 3 or not memo_name or key in seen or len(generated) >= limit:
+                return
+            seen.add(key)
+            case_id = "auto_" + hashlib.sha256(
+                f"{source}|{query}|{memo_name}".encode("utf-8")
+            ).hexdigest()[:22]
+            result = self._episodes.upsert_eval_case(
+                query, [memo_name], case_id=case_id, note=note,
+                source=source, enabled=True,
+            )
+            generated.append({**result, "source": source})
+
+        if self._vec is not None:
+            try:
+                for item in self._vec.feedback_event_list(limit=500):
+                    if str(item.get("action") or "") not in {"useful", "key"}:
+                        continue
+                    add(
+                        str(item.get("query_text") or ""),
+                        str(item.get("memo_name") or ""),
+                        "positive_feedback",
+                        "用户在 WebUI 明确认定为有帮助或关键记忆；高置信评测样本。",
+                    )
+            except Exception as exc:
+                logger.debug("[memos-memory][eval] positive feedback sampling failed: %s", exc)
+
+        for item in reversed(list(self._last_injection_stats or [])):
+            query = str(item.get("query") or "").strip()
+            for memo_name in list(item.get("memos") or [])[:2]:
+                add(
+                    query, str(memo_name), "telemetry_regression",
+                    "来自真实历史注入，仅用于检测新版是否丢失旧版已能找到的结果，不等同人工正确性标注。",
+                )
+                if len(generated) >= max(8, limit // 3):
+                    break
+            if len(generated) >= max(8, limit // 3):
+                break
+
+        episodes = self._episodes.list_episodes(limit=min(1000, max(limit * 4, 120)))
+        for episode in episodes:
+            if len(generated) >= limit:
+                break
+            memo_name = str(episode.get("memo_name") or "")
+            detail = self._episodes.episode_detail(memo_name) or episode
+            evidence = list(detail.get("evidence") or [])
+            evidence_text = next((
+                str(ev.get("detail") or ev.get("quote_text") or "").strip()
+                for ev in evidence
+                if 8 <= len(str(ev.get("detail") or ev.get("quote_text") or "").strip()) <= 180
+            ), "")
+            cue = (
+                evidence_text
+                or str(episode.get("trigger_hint") or "").strip()
+                or str(episode.get("scene_anchor") or "").strip()
+                or str(episode.get("retrieval_key") or "").strip()
+            )
+            if not cue:
+                continue
+            cue = cue[:180]
+            occurred = str(episode.get("occurred_at") or "").strip()
+            query = f"关于{cue}，你还记得当时发生了什么？"
+            if occurred and any(ch.isdigit() for ch in occurred):
+                query = f"{occurred}，关于{cue}，当时发生了什么？"
+            add(
+                query, memo_name, "episode_holdout",
+                "从已有情景证据生成的留出查询；不调用 LLM，不改写日记或原文。",
+            )
+        by_source: dict[str, int] = {}
+        for item in generated:
+            source = str(item.get("source") or "unknown")
+            by_source[source] = by_source.get(source, 0) + 1
+        return {
+            "generated": len(generated), "limit": limit, "by_source": by_source,
+            "total_enabled": len(self._episodes.list_eval_cases(enabled_only=True, limit=2000)),
+            "writes": "local_eval_tables_only",
+            "memory_content_changed": False,
+        }
+
     async def _run_recall_ablation(
         self,
         modes: list[str] | None = None,
@@ -8435,10 +9678,10 @@ class MemosMemoryPlugin(Star):
         cases = self._episodes.list_eval_cases(enabled_only=True, limit=case_limit)
         if not cases:
             raise ValueError("recall evaluation set is empty")
-        requested = modes or ["lean", "no_source", "direct", "vector", "legacy"]
+        requested = modes or ["optimized", "baseline", "no_source", "direct", "vector"]
         valid_modes = [
             mode for mode in requested
-            if mode in {"lean", "no_source", "direct", "vector", "legacy"}
+            if mode in {"optimized", "baseline", "lean", "no_source", "direct", "vector", "legacy"}
         ]
         if not valid_modes:
             raise ValueError("no valid evaluation mode")
@@ -8460,8 +9703,12 @@ class MemosMemoryPlugin(Star):
             }
             for mode in valid_modes:
                 started = time.perf_counter()
-                if mode == "lean":
+                if mode in {"optimized", "lean"}:
                     hits, diag, _ = await self._lean_recall_search(query, "", current_md)
+                elif mode == "baseline":
+                    hits, diag, _ = await self._lean_recall_search(
+                        query, "", current_md, optimizer_enabled=False,
+                    )
                 elif mode == "no_source":
                     hits, diag, _ = await self._lean_recall_search(
                         query, "", current_md, source_evidence_enabled=False,
@@ -8470,13 +9717,13 @@ class MemosMemoryPlugin(Star):
                     hits, diag, _ = await self._lean_recall_search(
                         query, "", current_md, temporal_enabled=False,
                         event_index_enabled=False, source_evidence_enabled=False,
-                        bm25_weight=0.30,
+                        bm25_weight=0.30, optimizer_enabled=False,
                     )
                 elif mode == "vector":
                     hits, diag, _ = await self._lean_recall_search(
                         query, "", current_md, temporal_enabled=False,
                         event_index_enabled=False, source_evidence_enabled=False,
-                        bm25_weight=0.0,
+                        bm25_weight=0.0, optimizer_enabled=False,
                     )
                 else:
                     hits, diag, _ = await self._parallel_recall_search(
@@ -9426,6 +10673,7 @@ class MemosMemoryPlugin(Star):
     async def initialize(self) -> None:
         """AstrBot 插件激活时调用(事件循环已在运行),启动 WebUI。"""
         try:
+            await self._apply_pending_data_restore_once()
             # v4.5.0: warm up the core index and legacy-episode bridge in the
             # background at activation so the first real request does not race
             # the migration and fall back to the legacy recall chain. Fail-open:
@@ -9814,6 +11062,119 @@ class MemosMemoryPlugin(Star):
             except Exception as e:
                 logger.debug("[memos-memory][eod] error: %s", e)
 
+    def _data_backup_status(self) -> dict[str, Any]:
+        try:
+            status = self._data_backup.status()
+            status["startup_restore"] = dict(self._startup_restore_result)
+            return status
+        except Exception as exc:
+            return {
+                "enabled": self.data_backup_enable,
+                "interval_days": self.data_backup_interval_days,
+                "keep": self.data_backup_keep,
+                "backup_dir": self.data_backup_dir,
+                "due": False,
+                "error": str(exc),
+            }
+
+    async def _apply_pending_data_restore_once(self) -> dict[str, Any]:
+        if self._pending_restore_checked:
+            return dict(self._startup_restore_result)
+        async with self._restore_apply_lock:
+            if self._pending_restore_checked:
+                return dict(self._startup_restore_result)
+            try:
+                result = await asyncio.to_thread(self._data_backup.apply_pending_restore)
+            except Exception as exc:
+                result = {"applied": False, "reason": "failed", "error": str(exc)[:500]}
+            self._startup_restore_result = dict(result or {})
+            self._pending_restore_checked = True
+            if result.get("applied"):
+                logger.warning(
+                    "[memos-memory][backup] startup restore applied file=%s safety=%s",
+                    result.get("file"), result.get("safety_backup"),
+                )
+            elif result.get("reason") == "failed":
+                logger.error(
+                    "[memos-memory][backup] startup restore failed open: %s",
+                    result.get("error"),
+                )
+            return dict(self._startup_restore_result)
+
+    async def _data_backup_list(self) -> dict[str, Any]:
+        return await asyncio.to_thread(self._data_backup.list_archives)
+
+    async def _data_backup_inspect(self, file_name: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._data_backup.inspect, file_name)
+
+    async def _prepare_data_restore(self, file_name: str) -> dict[str, Any]:
+        result = await asyncio.to_thread(self._data_backup.prepare_restore, file_name)
+        pending = result.get("pending_restore") or {}
+        logger.warning(
+            "[memos-memory][backup] restore scheduled for next reload file=%s safety=%s",
+            file_name, pending.get("safety_backup"),
+        )
+        self._log_event("system", "已预约下次重载恢复插件数据", {
+            "file": file_name,
+            "safety_backup": pending.get("safety_backup"),
+        })
+        return result
+
+    async def _cancel_data_restore(self) -> dict[str, Any]:
+        result = await asyncio.to_thread(self._data_backup.cancel_restore)
+        if result.get("cancelled"):
+            logger.info("[memos-memory][backup] pending restore cancelled")
+        return result
+
+    async def _delete_data_backup(self, file_name: str) -> dict[str, Any]:
+        result = await asyncio.to_thread(self._data_backup.delete_archive, file_name)
+        logger.info("[memos-memory][backup] deleted %s", file_name)
+        return result
+
+    async def _run_data_backup_once(
+        self,
+        *,
+        force: bool = False,
+        reason: str = "scheduled",
+    ) -> dict[str, Any]:
+        result = await asyncio.to_thread(
+            self._data_backup.create,
+            force=force,
+            reason=reason,
+        )
+        if result.get("created"):
+            self._log_event("system", "插件数据备份完成", {
+                "file": result.get("file"),
+                "bytes": result.get("bytes"),
+                "reason": reason,
+                "pruned": result.get("pruned", 0),
+            })
+            logger.info(
+                "[memos-memory][backup] created %s bytes=%s reason=%s",
+                result.get("file"), result.get("bytes"), reason,
+            )
+        elif result.get("reason") == "failed":
+            self._log_event("system", "插件数据备份失败", {
+                "error": result.get("error", "")[:300],
+                "reason": reason,
+            })
+            logger.warning(
+                "[memos-memory][backup] failed open: %s", result.get("error")
+            )
+        return result
+
+    async def _data_backup_loop(self) -> None:
+        await asyncio.sleep(45)
+        while True:
+            try:
+                await self._run_data_backup_once(reason="scheduled")
+                await asyncio.sleep(6 * 3600)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("[memos-memory][backup] scheduler failed open: %s", exc)
+                await asyncio.sleep(1800)
+
     async def terminate(self):
         try:
             self._save_runtime_telemetry(force=True)
@@ -9830,7 +11191,7 @@ class MemosMemoryPlugin(Star):
         owned_tasks = []
         for tn in (
             "_warmup_task", "_reconcile_task", "_eod_flush_task", "_profile_task",
-            "_context_archive_task", "_episode_migration_task", "_passage_vector_migration_task",
+            "_context_archive_task", "_data_backup_task", "_episode_migration_task", "_passage_vector_migration_task",
             "_source_turn_vector_migration_task",
             "_semantic_state_task",
         ):

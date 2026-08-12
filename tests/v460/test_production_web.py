@@ -42,7 +42,7 @@ class ProductionWebTests(unittest.IsolatedAsyncioTestCase):
             # A user-edited Episode is still recoverable when its exact links survive.
             evidence_quality="mixed_user_edited",
             diary_content_hash="web-hash",
-            diary_render_version="4.6.2",
+            diary_render_version="4.6.3",
             must_coverage=1.0,
             support_coverage=0.75,
             transcript_risk=0.1,
@@ -86,7 +86,7 @@ class ProductionWebTests(unittest.IsolatedAsyncioTestCase):
             _episodes=self.store,
             _emb_dim=4,
             _emb_model_id="model-b",
-            _PLUGIN_VERSION="4.6.2",
+            _PLUGIN_VERSION="4.6.4",
             _log_events=[],
             _last_injection_stats=[],
             _long_diaries_list=lambda: [{"episode_id": "ep-web-one", "memo_name": "memos/web-one",

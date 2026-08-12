@@ -293,6 +293,7 @@
   "episode_extraction_timeout": {
     "type": "float",
     "description": "情景证据提取超时秒数",
+    "hint": "首轮完整抽取使用本值。超时或结构无效后会自动执行一次更短的紧凑恢复；仍失败时从已归档原文建立可追溯 Episode，不再让整批退回二手日记结构。",
     "min": 10,
     "max": 600,
     "default": 120

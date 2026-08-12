@@ -818,6 +818,130 @@ class EvidenceFirstGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(diaries[0]["_render_coverage"], 0.5)
         self.assertTrue(all(item["grounded"] for item in diaries[0]["evidence"]))
 
+    async def test_extraction_timeout_uses_compact_grounded_recovery(self):
+        plugin = self.make_plugin()
+        messages = [
+            {"role": "user", "content": "我害怕你不告而别。"},
+            {"role": "assistant", "content": "我答应离开前一定告诉你。"},
+        ]
+        extraction = [{
+            "episode_key": "e1", "event_date": "2026-08-11",
+            "scene_anchor": "离开前说明的约定", "memory_type": "promise_or_rule",
+            "evidence": [{
+                "kind": "commitment", "actor": "assistant",
+                "detail": "我答应离开前一定告诉他", "quote": "我答应离开前一定告诉你。",
+                "turn_indexes": [1], "tier": "must_write", "confidence": 0.99,
+            }],
+            "retrieval_key": "离开前说明 约定", "importance": 5,
+        }]
+        rendered = [{
+            "episode_key": "e1",
+            "content": "我答应过他，离开前一定告诉他；这份约定会被我认真记住。",
+        }]
+        calls = []
+
+        async def call(_prompt, *, provider_id, timeout, label):
+            calls.append((label, timeout))
+            if label == "episode_extract":
+                raise asyncio.TimeoutError()
+            if label == "episode_extract_compact_retry":
+                return json.dumps(extraction, ensure_ascii=False)
+            return json.dumps(rendered, ensure_ascii=False)
+
+        plugin._call_memory_generation_llm = call
+        diaries = await plugin._generate_evidence_first_diaries(
+            messages,
+            "\n".join(f"[turn:{i}] {item['content']}" for i, item in enumerate(messages)),
+            1,
+        )
+        self.assertEqual([item[0] for item in calls], [
+            "episode_extract", "episode_extract_compact_retry", "diary_render",
+        ])
+        self.assertEqual(calls[1][1], 30.0)
+        self.assertEqual(diaries[0]["_episode_extraction_mode"], "llm_compact_recovery")
+        self.assertEqual(diaries[0]["_evidence_quality"], "source_grounded")
+
+    async def test_double_extraction_failure_keeps_local_source_links(self):
+        plugin = self.make_plugin()
+        messages = [
+            {"role": "user", "content": "离开前一定要告诉我。", "event_ts": 1786462200},
+            {"role": "assistant", "content": "我答应离开前一定告诉你。", "event_ts": 1786462260},
+        ]
+        calls = []
+
+        async def call(_prompt, *, provider_id, timeout, label):
+            calls.append(label)
+            if label.startswith("episode_extract"):
+                raise asyncio.TimeoutError()
+            return json.dumps([
+                {
+                    "episode_key": "recovery_e1",
+                    "content": "他要我离开前一定告诉他，我把这句话认真记住了。",
+                },
+                {
+                    "episode_key": "recovery_e2",
+                    "content": "我答应离开前一定告诉他，这份约定我会守住。",
+                },
+            ], ensure_ascii=False)
+
+        plugin._call_memory_generation_llm = call
+        diaries = await plugin._generate_evidence_first_diaries(
+            messages,
+            "\n".join(f"[turn:{i}] {item['content']}" for i, item in enumerate(messages)),
+            1,
+        )
+        self.assertEqual(calls, [
+            "episode_extract", "episode_extract_compact_retry", "diary_render",
+        ])
+        self.assertTrue(all(
+            item["_episode_extraction_mode"] == "local_grounded_recovery" for item in diaries
+        ))
+        self.assertTrue(all(item["event_date"] == "2026-08-11" for item in diaries))
+        self.assertEqual(
+            {
+                index for diary in diaries for item in diary["evidence"]
+                for index in item["turn_indexes"]
+            },
+            {0, 1},
+        )
+        self.assertTrue(all(
+            item["grounded"] for diary in diaries for item in diary["evidence"]
+        ))
+
+    async def test_render_timeout_stays_inside_evidence_first_pipeline(self):
+        plugin = self.make_plugin()
+        messages = [
+            {"role": "user", "content": "离开前告诉我。"},
+            {"role": "assistant", "content": "我答应离开前一定告诉你。"},
+        ]
+        extraction = [{
+            "episode_key": "e1", "scene_anchor": "离开前说明的约定",
+            "memory_type": "promise_or_rule",
+            "evidence": [{
+                "kind": "commitment", "actor": "assistant",
+                "detail": "我答应离开前一定告诉他", "quote": "我答应离开前一定告诉你。",
+                "turn_indexes": [1], "tier": "must_write", "confidence": 1.0,
+            }],
+        }]
+        calls = []
+
+        async def call(_prompt, *, provider_id, timeout, label):
+            calls.append(label)
+            if label == "episode_extract":
+                return json.dumps(extraction, ensure_ascii=False)
+            raise asyncio.TimeoutError()
+
+        plugin._call_memory_generation_llm = call
+        diaries = await plugin._generate_evidence_first_diaries(
+            messages,
+            "\n".join(f"[turn:{i}] {item['content']}" for i, item in enumerate(messages)),
+            1,
+        )
+        self.assertEqual(calls, ["episode_extract", "diary_render"])
+        self.assertTrue(diaries[0]["_render_fallback"])
+        self.assertTrue(diaries[0]["_render_retry_reason"].startswith("render_call_failed:"))
+        self.assertEqual(diaries[0]["_evidence_quality"], "source_grounded")
+
     async def test_eod_capacity_does_not_force_split_one_grounded_scene(self):
         plugin = self.make_plugin()
         messages = [

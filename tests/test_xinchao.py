@@ -685,7 +685,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cfg["scope"], "character")
         self.assertEqual(cfg["injection_max_chars"], 2400)
         self.assertEqual(cfg["perception_min_confidence"], 0.4)
-        self.assertEqual(cfg["live_perception_timeout_seconds"], 10)
+        self.assertEqual(cfg["live_perception_timeout_seconds"], 15)
         self.assertEqual(cfg["post_perception_timeout_seconds"], 60)
         self.assertTrue(cfg["proactive_enable"])
         self.assertEqual(cfg["body_cycle_length"], 21)
@@ -696,10 +696,17 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cfg["daytime_memory_cooldown_hours"], 720)
 
         migrated = validate_settings({"perception_timeout_seconds": 20})
-        self.assertEqual(migrated["live_perception_timeout_seconds"], 10)
+        self.assertEqual(migrated["live_perception_timeout_seconds"], 15)
         self.assertEqual(migrated["post_perception_timeout_seconds"], 60)
         custom = validate_settings({"perception_timeout_seconds": 90})
         self.assertEqual(custom["post_perception_timeout_seconds"], 90)
+        old_live_default = validate_settings({"live_perception_timeout_seconds": 10})
+        self.assertEqual(old_live_default["live_perception_timeout_seconds"], 15)
+        explicit_live_custom = validate_settings({
+            "settings_schema_version": 2,
+            "live_perception_timeout_seconds": 10,
+        })
+        self.assertEqual(explicit_live_custom["live_perception_timeout_seconds"], 10)
 
     async def test_provider_options_use_astr_chat_provider_instances(self):
         await self.controller.terminate()
@@ -759,7 +766,61 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_malformed_live_llm_falls_back_to_rules(self):
         await self.controller.terminate()
-        provider = FakeProvider(["not-json"])
+        provider = FakeProvider(["not-json", "still-not-json"])
+        self.plugin = FakePlugin(ProviderContext(provider))
+        self.controller = XinchaoController(self.plugin, Path(self.temp.name))
+        await self.controller.initialize()
+        appraisal = await self.controller._appraise_current_input(
+            "default:friend", "我们没有可能了。",
+        )
+        self.assertEqual(provider.calls, 2)
+        self.assertEqual(appraisal["_source"], "rules_fallback")
+        self.assertEqual(appraisal["_diagnostics"]["reason"], "parse_error")
+        self.assertIn("grieve", appraisal["activatedDrives"])
+
+    async def test_live_format_failure_recovers_once_inside_same_budget(self):
+        await self.controller.terminate()
+        provider = FakeProvider([
+            "not-json",
+            '{"activatedDrives":["monitor"],"confidence":0.9}',
+        ])
+        self.plugin = FakePlugin(ProviderContext(provider))
+        self.controller = XinchaoController(self.plugin, Path(self.temp.name))
+        await self.controller.initialize()
+        self.controller.settings["perception_mode"] = "llm"
+        appraisal = await self.controller._appraise_current_input(
+            "default:friend", "你怎么突然不说话了？",
+        )
+        self.assertEqual(provider.calls, 2)
+        self.assertEqual(appraisal["_source"], "llm")
+        self.assertTrue(appraisal["_diagnostics"]["recovered"])
+        self.assertEqual(appraisal["_diagnostics"]["recovered_from"], "parse_error")
+        self.assertEqual(appraisal["activationLevels"]["monitor"], 0.5)
+        self.assertIn("上一次输出未通过结构校验", provider.requests[1]["prompt"])
+
+    async def test_live_schema_failures_do_not_open_transport_circuit(self):
+        await self.controller.terminate()
+        provider = FakeProvider(["bad", "still bad"] * 4)
+        self.plugin = FakePlugin(ProviderContext(provider))
+        self.controller = XinchaoController(self.plugin, Path(self.temp.name))
+        await self.controller.initialize()
+        for _ in range(3):
+            await self.controller._appraise_current_input(
+                "default:friend", "我们没有可能了。",
+            )
+        health = self.controller._perception_health_payload("live")
+        self.assertEqual(health["state"], "degraded")
+        self.assertEqual(health["consecutive_failures"], 0)
+        self.assertEqual(health["consecutive_soft_failures"], 3)
+        calls_before = provider.calls
+        await self.controller._appraise_current_input(
+            "default:friend", "我们没有可能了。",
+        )
+        self.assertEqual(provider.calls, calls_before + 2)
+
+    async def test_live_provider_error_is_not_retried_before_response(self):
+        await self.controller.terminate()
+        provider = FakeProvider([RuntimeError("provider down"), "unused"])
         self.plugin = FakePlugin(ProviderContext(provider))
         self.controller = XinchaoController(self.plugin, Path(self.temp.name))
         await self.controller.initialize()
@@ -768,8 +829,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(provider.calls, 1)
         self.assertEqual(appraisal["_source"], "rules_fallback")
-        self.assertEqual(appraisal["_diagnostics"]["reason"], "parse_error")
-        self.assertIn("grieve", appraisal["activatedDrives"])
+        self.assertEqual(appraisal["_diagnostics"]["reason"], "provider_error")
 
     async def test_live_llm_accepts_fenced_repairable_json_and_aliases(self):
         await self.controller.terminate()
@@ -790,7 +850,9 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(appraisal["_source"], "llm")
         self.assertEqual(appraisal["_diagnostics"]["attempts"], 1)
         self.assertIn("grieve", appraisal["activatedDrives"])
-        self.assertAlmostEqual(appraisal["activationLevels"]["grieve"], 0.82)
+        # Explicit relationship-break evidence from the deterministic guard is
+        # retained as a floor even when the LLM gives a slightly lower level.
+        self.assertAlmostEqual(appraisal["activationLevels"]["grieve"], 0.88)
         self.assertAlmostEqual(appraisal["confidence"], 0.86)
 
     async def test_background_llm_retries_format_failure_within_one_budget(self):
@@ -1800,7 +1862,7 @@ class WebUIRouteTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
                 self.assertTrue(overview["ok"])
-                self.assertEqual(overview["data"]["version"], "4.6.2")
+                self.assertEqual(overview["data"]["version"], "4.6.4")
                 self.assertIn("providerOptions", overview["data"])
                 self.assertEqual(overview["data"]["providerOptions"][0]["id"], "chat_main")
                 insight = await asyncio.to_thread(

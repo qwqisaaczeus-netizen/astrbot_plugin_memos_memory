@@ -1,5 +1,5 @@
 """
-AstrBot Memos 长期记忆插件 v4.6.2。
+AstrBot Memos 长期记忆插件 v4.6.4。
 
 时间模型严格区分事件发生时间、Memos 来源时间、本地索引时间和本轮当前时间。
 
@@ -36,6 +36,7 @@ from .compress import (
     build_compress_prompt,
     build_diary_literary_rewrite_prompt,
     build_diary_render_prompt,
+    build_episode_compact_recovery_prompt,
     build_episode_extraction_prompt,
     build_query_plan_disambiguation_prompt,
     build_semantic_state_update_prompt,
@@ -52,6 +53,7 @@ from .archive_guard import (
     resolve_plugin_data_db,
 )
 from .diary_pipeline import DiaryPipeline
+from .episode_recovery import build_local_grounded_episodes
 from .data_backup import DataBackupManager
 from .episodic_store import EpisodicStore
 from .query_planner import QueryPlanner
@@ -88,7 +90,7 @@ try:
 except Exception:  # aiohttp 缺失等极端情况不阻塞主插件
     WebUIServer = None
 
-_PLUGIN_VERSION = "4.6.2"
+_PLUGIN_VERSION = "4.6.4"
 _PASSAGE_VECTOR_STRATEGY = "local_passage_v2"
 _DEFAULT_CHUNK_CHARS = 120
 _DEFAULT_OVERLAP_CHARS = 30
@@ -3861,6 +3863,99 @@ class MemosMemoryPlugin(Star):
     def _grounded_episode_fallback_diary(episode: dict[str, Any]) -> str:
         return DiaryPipeline.fallback_diary(episode)
 
+    async def _extract_episode_blueprints_resilient(
+        self,
+        messages: list[dict[str, Any]],
+        messages_text: str,
+        target: int,
+        cap: int,
+        candidates: list[Any],
+        *,
+        exact_count: bool,
+    ) -> tuple[list[dict[str, Any]], str, list[str]]:
+        """Keep source grounding when the structured extraction model is unstable."""
+        time_context = recorded_time_context(messages, self.rp_time_timezone)
+        candidate_payload = as_prompt_payload(candidates)
+        extraction_prompt = build_episode_extraction_prompt(
+            self.character_name,
+            messages_text,
+            target,
+            exact_count=exact_count,
+            timezone_name=self.rp_time_timezone,
+            message_time_context=time_context,
+            scene_candidates=candidate_payload,
+            diary_cap=cap,
+        )
+        errors: list[str] = []
+        try:
+            extraction_text = await self._call_memory_generation_llm(
+                extraction_prompt,
+                provider_id=self.episode_extraction_provider_id,
+                timeout=self.episode_extraction_timeout,
+                label="episode_extract",
+            )
+            episodes = self._parse_episode_blueprints(extraction_text, messages, cap)
+            if episodes:
+                return episodes, "llm_primary", errors
+            errors.append("primary:no_grounded_episodes")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error_text = (str(exc).strip() or type(exc).__name__)[:240]
+            errors.append("primary:" + error_text)
+            logger.warning(
+                "[memos-memory][episode] 完整证据抽取失败，启动紧凑恢复: %s", error_text,
+            )
+
+        recovery_timeout = max(
+            30.0,
+            min(90.0, float(self.episode_extraction_timeout or 120.0) * 0.65),
+        )
+        recovery_prompt = build_episode_compact_recovery_prompt(
+            self.character_name,
+            messages_text,
+            cap,
+            message_time_context=time_context,
+            scene_candidates=candidate_payload,
+        )
+        try:
+            recovery_text = await self._call_memory_generation_llm(
+                recovery_prompt,
+                provider_id=self.episode_extraction_provider_id,
+                timeout=recovery_timeout,
+                label="episode_extract_compact_retry",
+            )
+            episodes = self._parse_episode_blueprints(recovery_text, messages, cap)
+            if episodes:
+                logger.info(
+                    "[memory][episode] compact recovery succeeded episodes=%d timeout=%.1fs",
+                    len(episodes), recovery_timeout,
+                )
+                return episodes, "llm_compact_recovery", errors
+            errors.append("compact:no_grounded_episodes")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error_text = (str(exc).strip() or type(exc).__name__)[:240]
+            errors.append("compact:" + error_text)
+            logger.warning(
+                "[memos-memory][episode] 紧凑证据抽取仍失败，改用本地原文证据保底: %s", error_text,
+            )
+
+        episodes = build_local_grounded_episodes(
+            messages,
+            candidates,
+            max_episodes=cap,
+            timezone_name=self.rp_time_timezone,
+        )
+        if not episodes:
+            raise ValueError("episode recovery could not build grounded evidence")
+        logger.warning(
+            "[memos-memory][episode] 已启用本地原文证据保底: episodes=%d errors=%s",
+            len(episodes), " | ".join(errors),
+        )
+        return episodes, "local_grounded_recovery", errors
+
     async def _generate_evidence_first_diaries(
         self,
         messages: list[dict[str, Any]],
@@ -3887,23 +3982,14 @@ class MemosMemoryPlugin(Star):
             len(candidates), len(messages), target, cap,
             ",".join(sorted({reason for item in candidates for reason in item.reasons})) or "none",
         )
-        extraction_prompt = build_episode_extraction_prompt(
-            self.character_name,
+        episodes, extraction_mode, extraction_errors = await self._extract_episode_blueprints_resilient(
+            messages,
             messages_text,
             target,
+            cap,
+            candidates,
             exact_count=exact_count,
-            timezone_name=self.rp_time_timezone,
-            message_time_context=recorded_time_context(messages, self.rp_time_timezone),
-            scene_candidates=as_prompt_payload(candidates),
-            diary_cap=cap,
         )
-        extraction_text = await self._call_memory_generation_llm(
-            extraction_prompt,
-            provider_id=self.episode_extraction_provider_id,
-            timeout=self.episode_extraction_timeout,
-            label="episode_extract",
-        )
-        episodes = self._parse_episode_blueprints(extraction_text, messages, cap)
         scene_report = (
             splitter.validate(episodes, messages, candidates)
             if scene_enabled else {"fixed": [], "overlaps": [], "uncovered": [], "invalid": []}
@@ -3914,26 +4000,43 @@ class MemosMemoryPlugin(Star):
             len(scene_report.get("overlaps") or []), len(scene_report.get("uncovered") or []),
             len(scene_report.get("invalid") or []),
         )
-        if exact_count and 0 < len(episodes) < target:
-            retry_text = await self._call_memory_generation_llm(
-                extraction_prompt
-                + "\n\n【覆盖修正】首轮只提取了 " + str(len(episodes))
-                + " 个情景，目标是 " + str(target)
-                + " 个。请重新检查候选范围、不同日期、地点、目标、关系阶段和情绪转折；"
-                  "补回有来源证据的独立情景，禁止重复、虚构或切碎同一情感弧。重新输出完整 JSON 数组。",
-                provider_id=self.episode_extraction_provider_id,
-                timeout=self.episode_extraction_timeout,
-                label="episode_extract_retry",
+        if exact_count and extraction_mode == "llm_primary" and 0 < len(episodes) < target:
+            extraction_prompt = build_episode_extraction_prompt(
+                self.character_name,
+                messages_text,
+                target,
+                exact_count=True,
+                timezone_name=self.rp_time_timezone,
+                message_time_context=recorded_time_context(messages, self.rp_time_timezone),
+                scene_candidates=as_prompt_payload(candidates),
+                diary_cap=cap,
             )
-            retry_episodes = self._parse_episode_blueprints(retry_text, messages, cap)
-            if len(retry_episodes) > len(episodes):
-                episodes = retry_episodes
-                scene_report = splitter.validate(episodes, messages, candidates)
-                logger.info(
-                    "[memory][scene] retry validated episodes=%d fixed=%d overlaps=%d uncovered=%d invalid=%d",
-                    len(episodes), len(scene_report.get("fixed") or []),
-                    len(scene_report.get("overlaps") or []), len(scene_report.get("uncovered") or []),
-                    len(scene_report.get("invalid") or []),
+            try:
+                retry_text = await self._call_memory_generation_llm(
+                    extraction_prompt
+                    + "\n\n【覆盖修正】首轮只提取了 " + str(len(episodes))
+                    + " 个情景，目标是 " + str(target)
+                    + " 个。请重新检查候选范围、不同日期、地点、目标、关系阶段和情绪转折；"
+                      "补回有来源证据的独立情景，禁止重复、虚构或切碎同一情感弧。重新输出完整 JSON 数组。",
+                    provider_id=self.episode_extraction_provider_id,
+                    timeout=self.episode_extraction_timeout,
+                    label="episode_extract_retry",
+                )
+                retry_episodes = self._parse_episode_blueprints(retry_text, messages, cap)
+                if len(retry_episodes) > len(episodes):
+                    episodes = retry_episodes
+                    scene_report = splitter.validate(episodes, messages, candidates)
+                    logger.info(
+                        "[memory][scene] retry validated episodes=%d fixed=%d overlaps=%d uncovered=%d invalid=%d",
+                        len(episodes), len(scene_report.get("fixed") or []),
+                        len(scene_report.get("overlaps") or []), len(scene_report.get("uncovered") or []),
+                        len(scene_report.get("invalid") or []),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[memos-memory][episode] 覆盖数量修正失败，保留首轮有效 Episode: %s", exc,
                 )
         if not episodes:
             raise ValueError("episode extraction returned no grounded episodes")
@@ -3943,15 +4046,29 @@ class MemosMemoryPlugin(Star):
             for item in episode.get("evidence") or []:
                 tier = str(item.get("tier") or "supporting")
                 tier_counts[tier] = tier_counts.get(tier, 0) + 1
-        logger.info("[memory][episode] episodes=%d tiers=%s", len(episodes), tier_counts)
+        logger.info(
+            "[memory][episode] episodes=%d tiers=%s extraction=%s recovery_errors=%d",
+            len(episodes), tier_counts, extraction_mode, len(extraction_errors),
+        )
 
         render_prompt = build_diary_render_prompt(self.character_name, messages_text, episodes)
-        render_text = await self._call_memory_generation_llm(
-            render_prompt,
-            provider_id=self.diary_render_provider_id,
-            timeout=self.diary_render_timeout,
-            label="diary_render",
-        )
+        render_text = ""
+        render_call_error = ""
+        try:
+            render_text = await self._call_memory_generation_llm(
+                render_prompt,
+                provider_id=self.diary_render_provider_id,
+                timeout=self.diary_render_timeout,
+                label="diary_render",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            render_call_error = (str(exc).strip() or type(exc).__name__)[:240]
+            logger.warning(
+                "[memos-memory][episode] 文学日记渲染调用失败，保留证据并使用本地第一人称保底: %s",
+                exc,
+            )
         rendered = {
             str(item.get("episode_key") or "").strip(): str(item.get("content") or "").strip()
             for item in self._parse_json_array(render_text)
@@ -3999,7 +4116,7 @@ class MemosMemoryPlugin(Star):
         ]
         for key in initial_missing_keys:
             retry_reasons[key] = "missing_episode_key"
-        if retry_reasons:
+        if retry_reasons and not render_call_error:
             retry_rendered: dict[str, str] = {}
             try:
                 retry_text = await self._call_memory_generation_llm(
@@ -4050,7 +4167,10 @@ class MemosMemoryPlugin(Star):
             if key in rendered and current_report is not None and not current_report["reasons"]:
                 continue
             if key not in rendered:
-                fallback_reasons[key] = "missing_key_fallback"
+                fallback_reasons[key] = (
+                    "render_call_failed:" + render_call_error
+                    if render_call_error else "missing_key_fallback"
+                )
             else:
                 fallback_reasons[key] = "grounded_fallback_after:" + ",".join(
                     current_report["reasons"]
@@ -4083,11 +4203,12 @@ class MemosMemoryPlugin(Star):
             diary["_direct_quote_ratio"] = round(report["direct_quote_ratio"], 4)
             diary["_compression_ratio"] = round(report["compression_ratio"], 4)
             diary["_render_retry_reason"] = fallback_reasons.get(key, retry_reasons.get(key, ""))
-            diary["_render_version"] = "4.6.2"
-            diary["_diary_render_version"] = "4.6.2"
+            diary["_render_version"] = "4.6.3"
+            diary["_diary_render_version"] = "4.6.3"
+            diary["_episode_extraction_mode"] = extraction_mode
             diary["_render_missing"] = list(report["missing"])[:8]
             diary["_render_fallback"] = key in fallback_keys
-            if key in missing_keys:
+            if key in missing_keys and not render_call_error:
                 diary["_render_retry_reason"] = "missing_key_fallback"
             logger.info(
                 "[memory][diary] %s chars=%d must=%.3f support=%.3f risk=%.3f retry=%s fallback=%s",
@@ -4808,8 +4929,8 @@ class MemosMemoryPlugin(Star):
             diary["_source_batch_id"] = source_batch_id
             diary["_evidence_quality"] = "source_grounded"
             diary["_original_memo_version"] = old_card_text[:60000]
-            diary["_render_version"] = "4.6.2-rewrite"
-            diary["_diary_render_version"] = "4.6.2-rewrite"
+            diary["_render_version"] = "4.6.3-rewrite"
+            diary["_diary_render_version"] = "4.6.3-rewrite"
             diary["_must_coverage"] = float(
                 diary.get("_must_coverage", diary.get("must_coverage", -1.0))
             )

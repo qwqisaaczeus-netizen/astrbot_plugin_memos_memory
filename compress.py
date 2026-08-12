@@ -294,6 +294,53 @@ def build_episode_extraction_prompt(
     )
 
 
+EPISODE_COMPACT_RECOVERY_PROMPT = """【紧凑恢复任务】上一轮情景抽取超时或结构无效。
+你是 {character_name} 的记忆证据整理器。不要写日记，只从带 [turn:N] 的原始对话提取最多 {max_episodes} 个可核验情景。
+
+规则：
+1. 每个情景必须是连续 turn 区间，不能跨越给出的本地候选边界；没有长期价值的寒暄可以忽略。
+2. 每项 evidence 必须指向真实 turn_indexes。quote 只能逐字摘录；actor 只能是 user、assistant 或双方。
+3. 承诺、边界、关系决定和关键事实用 must_write；因果与氛围用 supporting；重复寒暄用 archive_only。
+4. 不得虚构心理。state_change、long_effect、trigger_hint 无可靠依据时留空。
+5. 时间以逐轮记录为准；明确剧情日期用 explicit_dialogue，记录时间用 conversation_now，无法判断用 unknown。
+
+本地候选：
+{scene_candidates_json}
+
+输出严格 JSON 数组，不要 markdown。每项只使用这些字段：
+{{"episode_key":"e1","event_date":"YYYY-MM-DD或空","time_label":"时段或空","time_basis":"explicit_dialogue/conversation_now/unknown","scene_anchor":"辨识锚点","scene_start_turn":0,"scene_end_turn":1,"reasons":["边界理由"],"memory_type":"plot_fact/relationship_shift/emotional_anchor/behavior_bias/promise_or_rule/daily_texture","evidence":[{{"kind":"dialogue/action/fact/object/commitment/boundary/body/setting","actor":"user/assistant/双方","detail":"忠实事实","quote":"可为空的逐字原话","turn_indexes":[0],"tier":"must_write/supporting/archive_only","confidence":0.0}}],"state_change":"可为空","long_effect":"可为空","trigger_hint":"可为空","retrieval_key":"高密度检索句","entities":[],"unresolved":[],"tags":[],"importance":3}}
+
+{message_time_context}
+
+原始对话：
+{messages}
+
+只输出 JSON 数组。"""
+
+
+def build_episode_compact_recovery_prompt(
+    character_name: str,
+    messages_text: str,
+    max_episodes: int,
+    *,
+    message_time_context: str = "",
+    scene_candidates: list[dict] | None = None,
+) -> str:
+    import json
+
+    return EPISODE_COMPACT_RECOVERY_PROMPT.format(
+        character_name=character_name,
+        max_episodes=max(1, int(max_episodes or 1)),
+        scene_candidates_json=json.dumps(
+            [item for item in (scene_candidates or []) if isinstance(item, dict)],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        message_time_context=message_time_context or "【逐轮时间】以每个 [对话记录时间] 为准。",
+        messages=messages_text,
+    )
+
+
 def build_diary_render_prompt(
     character_name: str,
     messages_text: str,

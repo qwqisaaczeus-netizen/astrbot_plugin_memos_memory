@@ -380,7 +380,7 @@ class SceneCandidateTests(unittest.IsolatedAsyncioTestCase):
         candidates = p._detect_scene_candidates(messages)
         self.assertTrue(any("relation_turn" in c["reasons"] for c in candidates))
 
-    def test_range_clamped_into_candidate(self):
+    def test_range_can_span_soft_candidates(self):
         p = _plugin()
         messages = [_msg("user", f"消息{i}", _ts(10, i)) for i in range(10)]
         candidates = [{"start_turn": 0, "end_turn": 4, "reasons": []},
@@ -389,9 +389,9 @@ class SceneCandidateTests(unittest.IsolatedAsyncioTestCase):
             {"episode_key": "e1", "scene_start_turn": 0, "scene_end_turn": 6},  # 越界
         ]
         report = p._validate_episode_ranges(episodes, messages, candidates)
-        self.assertTrue(report["fixed"], "越界区间应被压入候选")
-        self.assertIn("e1", report["fixed"][0])
-        self.assertEqual(episodes[0]["scene_end_turn"], 4)
+        self.assertEqual(report["fixed"], [])
+        self.assertEqual(report["uncovered"], [7, 8, 9])
+        self.assertEqual(episodes[0]["scene_end_turn"], 6)
 
     def test_overlap_detected(self):
         p = _plugin()
@@ -439,9 +439,148 @@ class DynamicCountTests(unittest.TestCase):
         )
         self.assertEqual(result, 2)
 
+    def test_eod_weak_candidates_do_not_force_six_diaries(self):
+        from astrbot_plugin_memos_memory.scene_splitter import SceneCandidate, SceneSplitter
+
+        messages = [
+            _msg("user" if index % 2 == 0 else "assistant", f"连续叙事{index}", _ts(10) + index)
+            for index in range(16)
+        ]
+        candidates = [SceneCandidate(0, 1)] + [
+            SceneCandidate(index * 2, index * 2 + 1, ["relation_turn"], 0.7)
+            for index in range(1, 6)
+        ]
+        result = SceneSplitter(max_scenes=6).dynamic_diary_count(
+            base_count=2,
+            messages=messages,
+            candidates=candidates,
+            max_cap=6,
+            source_kind="eod",
+        )
+        self.assertEqual(result, 2)
+
+    def test_validation_allows_one_episode_to_span_soft_candidates(self):
+        from astrbot_plugin_memos_memory.scene_splitter import SceneCandidate, SceneSplitter
+
+        messages = [
+            _msg("user" if index % 2 == 0 else "assistant", f"连续叙事{index}", _ts(10) + index)
+            for index in range(12)
+        ]
+        candidates = [
+            SceneCandidate(0, 3),
+            SceneCandidate(4, 7, ["topic_shift", "relation_turn"], 1.1),
+            SceneCandidate(8, 11, ["arc_end"], 0.65),
+        ]
+        episode = {"scene_start_turn": 0, "scene_end_turn": 11}
+        report = SceneSplitter().validate([episode], messages, candidates)
+        self.assertEqual(episode["scene_start_turn"], 0)
+        self.assertEqual(episode["scene_end_turn"], 11)
+        self.assertEqual(report["uncovered"], [])
+
+    def test_validation_keeps_time_gap_as_hard_boundary(self):
+        from astrbot_plugin_memos_memory.scene_splitter import SceneCandidate, SceneSplitter
+
+        messages = [
+            _msg("user" if index % 2 == 0 else "assistant", f"片段{index}", _ts(10) + index)
+            for index in range(8)
+        ]
+        candidates = [
+            SceneCandidate(0, 3),
+            SceneCandidate(4, 7, ["time_gap"], 1.0),
+        ]
+        episode = {"scene_start_turn": 0, "scene_end_turn": 7}
+        report = SceneSplitter().validate([episode], messages, candidates)
+        self.assertEqual(episode["scene_start_turn"], 0)
+        self.assertEqual(episode["scene_end_turn"], 3)
+        self.assertEqual(report["uncovered"], [4, 5, 6, 7])
+
+    def test_eod_one_strong_semantic_break_can_add_one_diary(self):
+        from astrbot_plugin_memos_memory.scene_splitter import SceneCandidate, SceneSplitter
+
+        messages = [
+            _msg("user" if index % 2 == 0 else "assistant", f"连续叙事{index}", _ts(10) + index)
+            for index in range(16)
+        ]
+        candidates = [
+            SceneCandidate(0, 5),
+            SceneCandidate(6, 11, ["topic_shift", "relation_turn"], 1.08),
+            SceneCandidate(12, 15, ["topic_shift"], 0.45),
+        ]
+        result = SceneSplitter(max_scenes=6).dynamic_diary_count(
+            base_count=2,
+            messages=messages,
+            candidates=candidates,
+            max_cap=6,
+            source_kind="eod",
+        )
+        self.assertEqual(result, 3)
+
+    def test_regular_twenty_five_to_thirty_turns_use_four_diary_soft_capacity(self):
+        from astrbot_plugin_memos_memory.scene_splitter import SceneCandidate, SceneSplitter
+
+        candidates = [SceneCandidate(0, 9)] + [
+            SceneCandidate(index * 10, index * 10 + 9, ["topic_shift"], 0.55)
+            for index in range(1, 6)
+        ]
+        for message_count in (50, 60):
+            with self.subTest(message_count=message_count):
+                messages = [
+                    _msg(
+                        "user" if index % 2 == 0 else "assistant",
+                        f"同一段连续剧情{index}",
+                        _ts(10) + index,
+                    )
+                    for index in range(message_count)
+                ]
+                result = SceneSplitter(max_scenes=6).dynamic_diary_count(
+                    base_count=2,
+                    messages=messages,
+                    candidates=candidates,
+                    max_cap=6,
+                    source_kind="auto",
+                )
+                self.assertEqual(result, 4)
+
+    def test_regular_hard_time_boundaries_are_not_lost_to_soft_capacity(self):
+        from astrbot_plugin_memos_memory.scene_splitter import SceneCandidate, SceneSplitter
+
+        messages = [
+            _msg("user" if index % 2 == 0 else "assistant", f"片段{index}", _ts(10) + index)
+            for index in range(40)
+        ]
+        candidates = [SceneCandidate(0, 5)] + [
+            SceneCandidate(index * 6, index * 6 + 5, ["time_gap"], 1.0)
+            for index in range(1, 5)
+        ]
+        result = SceneSplitter(max_scenes=6).dynamic_diary_count(
+            base_count=2,
+            messages=messages,
+            candidates=candidates,
+            max_cap=6,
+            source_kind="auto",
+        )
+        self.assertEqual(result, 5)
+
     def test_no_candidates_still_requires_ranges(self):
         prompt = build_episode_extraction_prompt("林翩翩", "x", 2)
         self.assertIn("本地候选未启用", prompt)
+
+    def test_extraction_prompt_keeps_target_when_soft_cap_is_larger(self):
+        prompt = build_episode_extraction_prompt(
+            "林翩翩",
+            "x",
+            1,
+            diary_cap=3,
+            scene_candidates=[{
+                "start_turn": 0,
+                "end_turn": 3,
+                "reasons": ["topic_shift"],
+                "score": 0.5,
+            }],
+        )
+        self.assertIn("目标提取约 1 个", prompt)
+        self.assertIn("允许 1..3 个", prompt)
+        self.assertIn("只是召回型软提示", prompt)
 
 
 class FirstPersonCheckTests(unittest.TestCase):

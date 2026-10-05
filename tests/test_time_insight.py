@@ -250,6 +250,28 @@ class TimeInsightServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("memos_time_insight_v3", event.extra)
             self.assertIn("不是当前事件", request.extra_user_content_parts[-1].text)
 
+    async def test_provider_500_cools_down_without_losing_deterministic_insight(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = Path(temp) / "memories.db"
+            self.create_db(db)
+            host = FakeHost(db)
+            host.config["time_insight_llm_refine_enable"] = True
+            service = IntegratedTimeInsightService(host)
+            calls = []
+
+            async def fail(*_args, **_kwargs):
+                calls.append(1)
+                raise RuntimeError("upstream 500")
+
+            service._refine_candidates = fail
+            first = await service.update("first")
+            second = await service.update("second")
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(first["llm_status"], "invalid_fallback")
+            self.assertEqual(second["llm_status"], "provider_cooldown_fallback")
+            self.assertGreater(first["candidate_count"], 0)
+            self.assertGreater(second["static_selected"], 0)
+
     async def test_v4_uses_episode_traceability_and_one_request_time_snapshot(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

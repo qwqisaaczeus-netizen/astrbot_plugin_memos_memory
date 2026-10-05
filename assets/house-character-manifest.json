@@ -1,0 +1,178 @@
+{
+  "desk": {
+    "atlas": "a",
+    "source_box": [
+      650,
+      667,
+      1214,
+      1230
+    ],
+    "pixels": 159610,
+    "output": "house-character-desk.png"
+  },
+  "tea": {
+    "atlas": "a",
+    "source_box": [
+      49,
+      668,
+      595,
+      1232
+    ],
+    "pixels": 154324,
+    "output": "house-character-tea.png"
+  },
+  "fan": {
+    "atlas": "a",
+    "source_box": [
+      208,
+      11,
+      508,
+      667
+    ],
+    "pixels": 134494,
+    "output": "house-character-fan.png"
+  },
+  "letter": {
+    "atlas": "a",
+    "source_box": [
+      757,
+      10,
+      1028,
+      655
+    ],
+    "pixels": 116401,
+    "output": "house-character-letter.png"
+  },
+  "reading": {
+    "atlas": "b",
+    "source_box": [
+      621,
+      599,
+      1153,
+      1209
+    ],
+    "pixels": 167904,
+    "output": "house-character-reading.png"
+  },
+  "window": {
+    "atlas": "b",
+    "source_box": [
+      75,
+      17,
+      580,
+      555
+    ],
+    "pixels": 138617,
+    "output": "house-character-window.png"
+  },
+  "chest": {
+    "atlas": "b",
+    "source_box": [
+      697,
+      17,
+      1173,
+      562
+    ],
+    "pixels": 134654,
+    "output": "house-character-chest.png"
+  },
+  "playful": {
+    "atlas": "b",
+    "source_box": [
+      108,
+      568,
+      474,
+      1221
+    ],
+    "pixels": 115967,
+    "output": "house-character-playful.png"
+  },
+  "steps": {
+    "atlas": "c",
+    "source_box": [
+      658,
+      613,
+      1152,
+      1229
+    ],
+    "pixels": 161041,
+    "output": "house-character-steps.png"
+  },
+  "flowers": {
+    "atlas": "c",
+    "source_box": [
+      110,
+      631,
+      546,
+      1134
+    ],
+    "pixels": 112583,
+    "output": "house-character-flowers.png"
+  },
+  "lantern": {
+    "atlas": "c",
+    "source_box": [
+      208,
+      13,
+      515,
+      614
+    ],
+    "pixels": 109920,
+    "output": "house-character-lantern.png"
+  },
+  "wistful": {
+    "atlas": "c",
+    "source_box": [
+      795,
+      11,
+      1046,
+      611
+    ],
+    "pixels": 96170,
+    "output": "house-character-wistful.png"
+  },
+  "book": {
+    "atlas": "d",
+    "source_box": [
+      14,
+      598,
+      640,
+      1217
+    ],
+    "pixels": 175615,
+    "output": "house-character-book.png"
+  },
+  "cup": {
+    "atlas": "d",
+    "source_box": [
+      672,
+      608,
+      1261,
+      1223
+    ],
+    "pixels": 172669,
+    "output": "house-character-cup.png"
+  },
+  "yawn": {
+    "atlas": "d",
+    "source_box": [
+      17,
+      6,
+      631,
+      598
+    ],
+    "pixels": 167463,
+    "output": "house-character-yawn.png"
+  },
+  "lean": {
+    "atlas": "d",
+    "source_box": [
+      833,
+      6,
+      1153,
+      605
+    ],
+    "pixels": 119334,
+    "output": "house-character-lean.png"
+  }
+}

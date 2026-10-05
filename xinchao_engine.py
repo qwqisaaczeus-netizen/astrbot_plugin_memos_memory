@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 SATURATE_CEIL = 0.80
 SATURATE_FLOOR = 0.65
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 DIMENSIONS: dict[str, dict[str, Any]] = {
     "possess": {"label": "亲密、占有与靠近", "grow": 0.105, "satisfy": 0.30, "night": 0.4, "activation_half_life": 6.0},
@@ -111,6 +111,9 @@ def new_state(now: datetime | None = None) -> dict[str, Any]:
         "lastDaytimeMessage": None,
         "recentDaytimeMemories": [],
         "pendingAwareness": None,
+        "pendingOfflineAfterglow": None,
+        "lastOfflineSessionId": None,
+        "offlineEffectLedger": [],
         "recentEvents": [],
         "lastProactiveAt": None,
         "proactiveUsage": {},
@@ -169,6 +172,7 @@ def normalize_state(value: Any, now: datetime | None = None) -> dict[str, Any]:
         ("recentProactiveMessages", 8),
         ("recentBarkMessages", 8),
         ("recentDaytimeMemories", 32),
+        ("offlineEffectLedger", 40),
     ):
         state[key] = list(state.get(key) or [])[-limit:]
     for key in ("dreamUsage", "proactiveUsage", "barkUsage", "daytimeEmergenceUsage"):

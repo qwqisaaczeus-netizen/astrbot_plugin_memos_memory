@@ -52,7 +52,7 @@ def json_list(value: Any) -> list:
     return []
 
 
-def extract_terms(text: str) -> set[str]:
+def extract_terms(text: str, *, initialize_segmenter: bool = True) -> set[str]:
     source = " ".join(str(text or "").lower().split())
     if not source:
         return set()
@@ -60,9 +60,16 @@ def extract_terms(text: str) -> set[str]:
     try:
         import jieba  # type: ignore
 
+        initialized = bool(getattr(getattr(jieba, "dt", None), "initialized", False))
+        if not initialized and not initialize_segmenter:
+            raise RuntimeError("segmenter cold start is disabled on the online path")
         out.update(word.strip().lower() for word in jieba.lcut(source) if len(word.strip()) >= 2)
     except Exception:
-        out.update(source[index:index + 2] for index in range(max(0, len(source) - 1)))
+        # The regex above already preserves complete Latin words. Generating
+        # bigrams across the whole mixed-language string creates false cues
+        # such as "en" (happened/event) and "ow" (window/northwindow).
+        for chunk in re.findall(r"[\u4e00-\u9fff]{2,}", source):
+            out.update(chunk[index:index + 2] for index in range(len(chunk) - 1))
     return {item for item in out if item}
 
 

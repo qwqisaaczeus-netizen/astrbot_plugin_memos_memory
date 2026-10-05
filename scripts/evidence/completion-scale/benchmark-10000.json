@@ -1,0 +1,633 @@
+{
+  "scale": 10000,
+  "sqlite": "3.50.4",
+  "python": "3.12.13",
+  "timings_ms": {
+    "candidate_backfill_batch_200": {
+      "p50": 18.7558,
+      "p95": 34.3186,
+      "p99": 35.3242,
+      "samples": 51
+    },
+    "graph_backfill_batch_10": {
+      "p50": 336.444,
+      "p95": 481.5903,
+      "p99": 486.8541,
+      "samples": 31
+    },
+    "incremental_queue_build_1": {
+      "p50": 36.2889,
+      "p95": 40.8534,
+      "p99": 41.0839,
+      "samples": 30
+    },
+    "full_scope_projection": {
+      "p50": 112.9464,
+      "p95": 112.9464,
+      "p99": 112.9464,
+      "samples": 1
+    },
+    "full_scope_claim_rebuild": {
+      "p50": 1818.3817,
+      "p95": 1818.3817,
+      "p99": 1818.3817,
+      "samples": 1
+    },
+    "query": {
+      "p50": 1.2868,
+      "p95": 2.6044,
+      "p99": 4.9631,
+      "samples": 60
+    },
+    "list_threads": {
+      "p50": 1.2056,
+      "p95": 1.8957,
+      "p99": 1.9844,
+      "samples": 60
+    },
+    "candidate_lookup": {
+      "p50": 5.0607,
+      "p95": 6.3427,
+      "p99": 6.9653,
+      "samples": 60
+    }
+  },
+  "workload": "80% hot scope; 20 other scopes; frequent common terms/entities; rare pair per 1000; 365 event dates; source updates after build",
+  "seed_seconds": 0.5445057000033557,
+  "candidate_backfill_rows": 10000,
+  "candidate_backfill_seconds": 1.0826626000052784,
+  "enqueue_seconds": 1.7903036999923643,
+  "graph_backfill_seconds": 10.208476799991331,
+  "graph_backfill_processed": 310,
+  "graph_backfill_errors": 0,
+  "graph_backfill_complete": false,
+  "candidate_counts": {
+    "p50": 50,
+    "p95": 50,
+    "p99": 50,
+    "samples": 310
+  },
+  "projection": {
+    "threads_projected": 100,
+    "edges_considered": 100,
+    "version_conflicts": 0
+  },
+  "claim_rebuild": {
+    "episodes": 8000,
+    "extracted": 0,
+    "written": 0,
+    "slots": 0,
+    "transitions": 0,
+    "views": 100,
+    "elapsed_ms": 1799.52,
+    "extractor_version": "test6-claim-v3"
+  },
+  "candidate_metrics": [
+    {
+      "postings_read": 551,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 106,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 116,
+      "returned": 50
+    },
+    {
+      "postings_read": 551,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 106,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 116,
+      "returned": 50
+    },
+    {
+      "postings_read": 551,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 106,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 116,
+      "returned": 50
+    },
+    {
+      "postings_read": 551,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 106,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 116,
+      "returned": 50
+    },
+    {
+      "postings_read": 551,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 106,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 116,
+      "returned": 50
+    },
+    {
+      "postings_read": 551,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 106,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 115,
+      "returned": 50
+    },
+    {
+      "postings_read": 591,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 116,
+      "returned": 50
+    }
+  ],
+  "query_plans": {
+    "seed": [
+      [
+        8,
+        0,
+        56,
+        "SEARCH t USING COVERING INDEX idx_thread_episode_terms_term (term=?)"
+      ],
+      [
+        14,
+        0,
+        46,
+        "SEARCH e USING INDEX sqlite_autoindex_episodes_1 (episode_id=?)"
+      ],
+      [
+        21,
+        0,
+        45,
+        "SEARCH s USING COVERING INDEX sqlite_autoindex_thread_episode_scopes_1 (episode_id=? AND scope_id=?)"
+      ],
+      [
+        46,
+        0,
+        0,
+        "USE TEMP B-TREE FOR DISTINCT"
+      ],
+      [
+        47,
+        0,
+        0,
+        "USE TEMP B-TREE FOR ORDER BY"
+      ]
+    ],
+    "route": [
+      [
+        10,
+        0,
+        62,
+        "SEARCH m USING INDEX idx_thread_members_episode (episode_id=?)"
+      ],
+      [
+        17,
+        0,
+        46,
+        "SEARCH t USING INDEX sqlite_autoindex_memory_threads_1 (thread_id=?)"
+      ],
+      [
+        26,
+        0,
+        0,
+        "USE TEMP B-TREE FOR GROUP BY"
+      ],
+      [
+        61,
+        0,
+        0,
+        "CORRELATED SCALAR SUBQUERY 1"
+      ],
+      [
+        66,
+        61,
+        54,
+        "SEARCH m2 USING COVERING INDEX idx_thread_members_thread (thread_id=?)"
+      ]
+    ],
+    "posting": [
+      [
+        4,
+        0,
+        55,
+        "SEARCH thread_candidate_postings USING COVERING INDEX sqlite_autoindex_thread_candidate_postings_1 (scope_id=? AND kind=? AND term=?)"
+      ]
+    ],
+    "date": [
+      [
+        4,
+        0,
+        47,
+        "SEARCH thread_candidate_episodes USING COVERING INDEX idx_candidate_date (scope_id=? AND event_ts>? AND event_ts<?)"
+      ]
+    ],
+    "queue": [
+      [
+        4,
+        0,
+        46,
+        "SEARCH thread_build_queue USING COVERING INDEX idx_build_queue_status (status=? AND next_attempt_ts<?)"
+      ]
+    ],
+    "list": [
+      [
+        5,
+        0,
+        62,
+        "SEARCH t USING INDEX idx_threads_scope_recent (scope_id=?)"
+      ],
+      [
+        31,
+        0,
+        0,
+        "CORRELATED SCALAR SUBQUERY 1"
+      ],
+      [
+        36,
+        31,
+        54,
+        "SEARCH m USING COVERING INDEX idx_thread_members_thread (thread_id=?)"
+      ]
+    ]
+  },
+  "queue": {
+    "completed": 316,
+    "pending": 9684
+  },
+  "db_bytes": 25522176,
+  "wal_bytes": 7259472,
+  "rss_bytes": 57790464,
+  "table_counts": {
+    "episodes": 10000,
+    "thread_candidate_postings": 100080,
+    "memory_episode_edges": 100,
+    "memory_threads": 100,
+    "memory_claims": 0,
+    "thread_materialized_views": 100
+  },
+  "integrity_check": "ok"
+}

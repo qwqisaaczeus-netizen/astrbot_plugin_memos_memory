@@ -1,0 +1,26 @@
+name: 改进建议
+description: 说明希望改善的实际行为和适用场景
+title: "[Feature] "
+body:
+  - type: markdown
+    attributes:
+      value: 请描述行为与场景，不要提交用户原文、数据库、密钥或私有配置。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 当前遇到的问题
+      description: 附插件版本，说明现有行为为何影响使用
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 希望的行为
+      description: 描述结果与可观察的验收方式
+    validations:
+      required: true
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: 费用、数据与兼容边界
+      description: 可选。是否需要模型调用、写入/迁移数据或改变默认模式？

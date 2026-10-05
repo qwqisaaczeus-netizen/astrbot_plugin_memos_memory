@@ -24,6 +24,7 @@ ARC_END_WORDS = (
 )
 _WORD_RE = re.compile(r"[A-Za-z0-9_]+|[\u3400-\u9fff]+")
 _OFFSET_RE = re.compile(r"^([+-])(\d{1,2})(?::?(\d{2}))?$")
+HARD_BOUNDARY_REASONS = frozenset({"date_change", "time_gap"})
 
 
 @dataclass
@@ -211,11 +212,29 @@ class SceneSplitter:
         """就地规范模型场景范围，并返回覆盖、重叠及非法范围诊断。"""
         n = len(messages)
         scene_candidates = list(candidates) if candidates is not None else self.detect(messages)
-        usable = sorted(
+        raw_usable = sorted(
             (item for item in scene_candidates
              if n and item.start_turn <= item.end_turn and item.end_turn >= 0 and item.start_turn < n),
             key=lambda item: (item.start_turn, item.end_turn),
         )
+        # Lexical/topic candidates are intentionally recall-oriented. They help
+        # the model notice possible transitions, but only recorded date changes
+        # and long real-time gaps are hard constraints during range validation.
+        hard_starts = {
+            max(0, min(n - 1, int(item.start_turn))): list(item.reasons)
+            for item in raw_usable[1:]
+            if HARD_BOUNDARY_REASONS & set(item.reasons)
+        }
+        starts = [0] + sorted(start for start in hard_starts if start > 0)
+        usable: list[SceneCandidate] = []
+        for position, start in enumerate(starts):
+            end = starts[position + 1] - 1 if position + 1 < len(starts) else n - 1
+            usable.append(SceneCandidate(
+                start_turn=start,
+                end_turn=end,
+                reasons=hard_starts.get(start, []),
+                score=1.0 if start in hard_starts else 0.0,
+            ))
         fixed: list[dict[str, Any]] = []
         invalid: list[dict[str, Any]] = []
         valid_ranges: list[tuple[int, int, int]] = []
@@ -346,18 +365,49 @@ class SceneSplitter:
         max_cap: int,
         source_kind: str = "auto",
     ) -> int:
-        """按跨日数和场景密度扩容；eod 可使用全部候选容量。"""
+        """按跨日数和场景密度扩容；EOD 只让可靠边界突破软预算。"""
         cap = max(1, int(max_cap))
         base = max(1, int(base_count))
         dates = {date for message in messages if (date := self._local_date(message)) is not None}
         floor = max(base, len(dates) or 1)
         scene_count = max(1, len(candidates))
         if str(source_kind or "auto").lower() == "eod":
-            desired = max(floor, scene_count)
+            # Local topic/relation heuristics are recall-oriented and may emit
+            # several adjacent candidates inside one continuous narrative arc.
+            # They are useful extraction hints, but must not each force a diary.
+            boundary_candidates = list(candidates[1:])
+            hard_boundaries = sum(
+                1 for item in boundary_candidates
+                if {"date_change", "time_gap"} & set(item.reasons)
+            )
+            semantic_break = any(
+                item.score >= 0.95
+                and ({"relation_turn", "topic_shift", "arc_end"} & set(item.reasons))
+                for item in boundary_candidates
+            )
+            # About six user/assistant exchanges (roughly 12 messages) justify
+            # one additional literary entry.
+            density_capacity = max(1, math.ceil(len(messages) / 12))
+            soft_capacity = max(base, density_capacity) + (1 if semantic_break else 0)
+            hard_floor = max(len(dates) or 1, 1 + hard_boundaries)
+            desired = max(floor, hard_floor, min(scene_count, soft_capacity))
         else:
-            # 每约 6 轮允许增加一篇；跨日批次额外保留日期维度。
-            density_capacity = max(1, math.ceil(len(messages) / 6)) + max(0, len(dates) - 1)
-            desired = max(floor, min(scene_count, density_capacity))
+            # Ordinary compression usually receives paired user/assistant
+            # messages. Roughly eight exchanges justify one literary entry;
+            # weak lexical boundaries remain extraction hints instead of
+            # forcing 25-30 turns into six fragmented diaries.
+            density_capacity = max(1, math.ceil(len(messages) / 16))
+            boundary_candidates = list(candidates[1:])
+            hard_boundaries = sum(
+                1 for item in boundary_candidates
+                if {"date_change", "time_gap"} & set(item.reasons)
+            )
+            hard_floor = max(len(dates) or 1, 1 + hard_boundaries)
+            desired = max(
+                floor,
+                hard_floor,
+                min(scene_count, max(base, density_capacity)),
+            )
         return max(1, min(cap, desired))
 
 

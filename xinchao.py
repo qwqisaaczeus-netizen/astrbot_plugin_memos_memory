@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ast
 import copy
+import hashlib
 import json
 import os
 import random
@@ -20,6 +21,11 @@ from astrbot.core.agent.message import TextPart
 from astrbot.core.message.message_event_result import MessageChain
 
 from .body_rhythm import calculate_body_state, render_body_context
+from .direct_llm import (
+    DirectLLMEmptyFinalError, OpenAICompatibleTextClient, SecretValueStore,
+    validate_api_base_url,
+)
+from .llm_runtime import LLMCircuitOpenError
 from .xinchao_engine import (
     DIMENSIONS,
     DRIVE_KEYS,
@@ -63,6 +69,7 @@ _SETTLE_SLEEP_SLICE_SECONDS = 15.0
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
+    "settings_schema_version": 4,
     "enable": True,
     "shadow_mode": False,
     "scope": "character",
@@ -74,8 +81,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "perception_mode": "hybrid",
     "live_perception_provider_id": "",
     "perception_provider_id": "",
-    "live_perception_timeout_seconds": 10,
-    "post_perception_timeout_seconds": 60,
+    "live_perception_timeout_seconds": 30,
+    "post_perception_timeout_seconds": 90,
+    "perception_api_mode": "off",
+    "perception_api_base_url": "",
+    "perception_api_model": "",
+    "perception_api_max_retries": 1,
     # 4.5.3-beta: burst messages on one scope share a single background settlement
     # call instead of racing one LLM call (and one state write) per turn.
     "post_perception_coalesce_enable": True,
@@ -97,14 +108,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "dream_memory_items": 6,
     "dream_min_interval_hours": 6,
     "dream_max_per_day": 3,
-    "dream_timeout_seconds": 30,
+    "dream_timeout_seconds": 90,
     "proactive_enable": False,
     "proactive_provider_id": "",
     "proactive_min_idle_hours": 6,
     "proactive_cooldown_hours": 6,
     "proactive_max_per_day": 3,
     "proactive_min_drive": 0.58,
-    "proactive_timeout_seconds": 30,
+    "proactive_timeout_seconds": 45,
     "proactive_duplicate_threshold": 0.58,
     "proactive_duplicate_attempts": 2,
     "active_message_max_per_day": 6,
@@ -230,11 +241,35 @@ def _int(value: Any, low: int, high: int, fallback: int) -> int:
 
 def validate_settings(value: Any) -> dict[str, Any]:
     source = value if isinstance(value, dict) else {}
+    source_schema_version = _int(source.get("settings_schema_version"), 0, 999, 0)
     cfg = copy.deepcopy(DEFAULT_SETTINGS)
     cfg.update({key: source[key] for key in cfg if key in source})
+    # 4.6.4: 10 seconds was the old shipped default and is too tight for
+    # reasoning-oriented providers. Preserve every other explicit custom value.
+    if (
+        source_schema_version < 2
+        and "live_perception_timeout_seconds" in source
+        and _clamp(source.get("live_perception_timeout_seconds"), 3, 30, 10) == 10
+    ):
+        cfg["live_perception_timeout_seconds"] = 15
     if "post_perception_timeout_seconds" not in source and "perception_timeout_seconds" in source:
         legacy_timeout = _clamp(source.get("perception_timeout_seconds"), 3, 120, 20)
         cfg["post_perception_timeout_seconds"] = 60 if legacy_timeout == 20 else legacy_timeout
+    if source_schema_version < 4:
+        live_timeout = _clamp(source.get("live_perception_timeout_seconds"), 3, 30, 30)
+        if (
+            "live_perception_timeout_seconds" not in source
+            or live_timeout == 15
+            or (source_schema_version < 2 and live_timeout == 10)
+        ):
+            cfg["live_perception_timeout_seconds"] = 30
+        if _clamp(source.get("post_perception_timeout_seconds"), 10, 180, 60) == 60:
+            cfg["post_perception_timeout_seconds"] = 90
+        if _clamp(source.get("dream_timeout_seconds"), 5, 180, 30) == 30:
+            cfg["dream_timeout_seconds"] = 90
+        if _clamp(source.get("proactive_timeout_seconds"), 5, 180, 30) == 30:
+            cfg["proactive_timeout_seconds"] = 45
+    cfg["settings_schema_version"] = 4
     for key in (
         "enable", "shadow_mode", "perception_store_summary", "injection_enable",
         "injection_include_thought", "injection_include_fatigue", "dream_enable",
@@ -248,6 +283,8 @@ def validate_settings(value: Any) -> dict[str, Any]:
         cfg["scope"] = "character"
     if cfg["perception_mode"] not in {"rules", "hybrid", "llm"}:
         cfg["perception_mode"] = "hybrid"
+    if cfg["perception_api_mode"] not in {"off", "post", "all"}:
+        cfg["perception_api_mode"] = "off"
     if cfg["body_expression_mode"] not in {"significant", "balanced", "immersive"}:
         cfg["body_expression_mode"] = "balanced"
     cfg["settle_interval_minutes"] = _int(cfg["settle_interval_minutes"], 1, 1440, 15)
@@ -256,13 +293,16 @@ def validate_settings(value: Any) -> dict[str, Any]:
     cfg["dawn_freeze_end"] = _int(cfg["dawn_freeze_end"], 1, 24, 8)
     cfg["perception_timeout_seconds"] = _clamp(cfg["perception_timeout_seconds"], 3, 120, 20)
     cfg["live_perception_timeout_seconds"] = _clamp(
-        cfg["live_perception_timeout_seconds"], 3, 30, 10,
+        cfg["live_perception_timeout_seconds"], 3, 30, 30,
     )
     cfg["post_perception_timeout_seconds"] = _clamp(
-        cfg["post_perception_timeout_seconds"], 10, 180, 60,
+        cfg["post_perception_timeout_seconds"], 10, 180, 90,
     )
     cfg["post_perception_max_batch_turns"] = _int(
         cfg["post_perception_max_batch_turns"], 1, 8, 4,
+    )
+    cfg["perception_api_max_retries"] = _int(
+        cfg["perception_api_max_retries"], 0, 2, 1,
     )
     cfg["perception_min_confidence"] = _clamp(cfg["perception_min_confidence"], 0.4, 0.95, 0.68)
     cfg["injection_max_drives"] = _int(cfg["injection_max_drives"], 1, 5, 3)
@@ -271,12 +311,12 @@ def validate_settings(value: Any) -> dict[str, Any]:
     cfg["dream_min_interval_hours"] = _clamp(cfg["dream_min_interval_hours"], 1, 72, 6)
     cfg["dream_memory_items"] = _int(cfg["dream_memory_items"], 1, 20, 6)
     cfg["dream_max_per_day"] = _int(cfg["dream_max_per_day"], 1, 12, 3)
-    cfg["dream_timeout_seconds"] = _clamp(cfg["dream_timeout_seconds"], 5, 120, 30)
+    cfg["dream_timeout_seconds"] = _clamp(cfg["dream_timeout_seconds"], 5, 180, 90)
     cfg["proactive_min_idle_hours"] = _clamp(cfg["proactive_min_idle_hours"], 1, 168, 6)
     cfg["proactive_cooldown_hours"] = _clamp(cfg["proactive_cooldown_hours"], 1, 72, 6)
     cfg["proactive_max_per_day"] = _int(cfg["proactive_max_per_day"], 1, 12, 3)
     cfg["proactive_min_drive"] = _clamp(cfg["proactive_min_drive"], 0.2, 0.9, 0.58)
-    cfg["proactive_timeout_seconds"] = _clamp(cfg["proactive_timeout_seconds"], 5, 120, 30)
+    cfg["proactive_timeout_seconds"] = _clamp(cfg["proactive_timeout_seconds"], 5, 180, 45)
     cfg["proactive_duplicate_threshold"] = _clamp(cfg["proactive_duplicate_threshold"], 0.3, 0.95, 0.58)
     cfg["proactive_duplicate_attempts"] = _int(cfg["proactive_duplicate_attempts"], 1, 4, 2)
     cfg["active_message_max_per_day"] = _int(cfg["active_message_max_per_day"], 1, 24, 6)
@@ -292,14 +332,14 @@ def validate_settings(value: Any) -> dict[str, Any]:
         cfg["daytime_memory_cooldown_hours"], 1, 720, 72,
     )
     cfg["body_cycle_length"] = _int(cfg["body_cycle_length"], 21, 45, 28)
-    cfg["body_period_length"] = _int(
-        cfg["body_period_length"], 2, min(10, cfg["body_cycle_length"] - 6), 5,
-    )
+    # Kept in the settings file for rollback compatibility. Calendar mode uses
+    # the real distance between this month's and next month's anchor instead.
+    cfg["body_period_length"] = _int(cfg["body_period_length"], 2, 10, 5)
     cfg["body_ovulation_day"] = _int(
         cfg["body_ovulation_day"],
         cfg["body_period_length"] + 2,
-        cfg["body_cycle_length"] - 2,
-        min(14, cfg["body_cycle_length"] - 2),
+        26,
+        14,
     )
     cfg["body_ovulation_window"] = _int(cfg["body_ovulation_window"], 1, 7, 3)
     cfg["body_effect_strength"] = _clamp(cfg["body_effect_strength"], 0, 1, 0.72)
@@ -321,6 +361,8 @@ def validate_settings(value: Any) -> dict[str, Any]:
         "dream_provider_id", "proactive_provider_id",
     ):
         cfg[key] = str(cfg[key] or "").strip()[:160]
+    cfg["perception_api_base_url"] = str(cfg["perception_api_base_url"] or "").strip()[:1000]
+    cfg["perception_api_model"] = str(cfg["perception_api_model"] or "").strip()[:200]
     return cfg
 
 
@@ -330,6 +372,7 @@ class XinchaoController:
         return {
             "provider": "",
             "consecutive_failures": 0,
+            "consecutive_soft_failures": 0,
             "circuit_until": 0.0,
             "circuit_backoff_seconds": 0.0,
             "last_error": "",
@@ -342,6 +385,9 @@ class XinchaoController:
         self.plugin = plugin
         self.data_dir = data_dir
         self.settings_path = data_dir / "xinchao_settings.json"
+        self.secret_store = SecretValueStore(data_dir / "xinchao_secret.json")
+        self._perception_api_key = ""
+        self._direct_perception = OpenAICompatibleTextClient("xinchao-perception")
         self.store = StateStore(data_dir / "xinchao_state.json")
         self.settings = copy.deepcopy(DEFAULT_SETTINGS)
         self._settle_task: asyncio.Task | None = None
@@ -372,6 +418,8 @@ class XinchaoController:
         self._stopping = False
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.settings = self._load_settings()
+        self._perception_api_key = self.secret_store.load()
+        self._configure_direct_perception()
         await self.store.load()
         self._settle_task = asyncio.create_task(self._settle_loop(), name="memos-xinchao-settle")
         self._initialized = True
@@ -399,6 +447,7 @@ class XinchaoController:
         self._pending_turns.clear()
         self._generator_running.clear()
         self._active_send_locks.clear()
+        await self._direct_perception.close()
         self._initialized = False
 
     def _load_settings(self) -> dict[str, Any]:
@@ -408,14 +457,56 @@ class XinchaoController:
             raw = {}
         return validate_settings(raw)
 
+    def settings_payload(self) -> dict[str, Any]:
+        payload = copy.deepcopy(self.settings)
+        payload["has_perception_api_key"] = bool(self._perception_api_key)
+        payload["perception_api_key"] = ""
+        payload["perception_api_configured"] = self._direct_perception.configured
+        return payload
+
+    def _configure_direct_perception(self) -> None:
+        self._direct_perception.configure(
+            base_url=self.settings.get("perception_api_base_url"),
+            model=self.settings.get("perception_api_model"),
+            api_key=self._perception_api_key,
+            max_retries=self.settings.get("perception_api_max_retries", 1),
+        )
+
     def save_settings(self, value: dict[str, Any]) -> dict[str, Any]:
+        previous_direct = (
+            str(self.settings.get("perception_api_mode") or "off"),
+            str(self.settings.get("perception_api_base_url") or ""),
+            str(self.settings.get("perception_api_model") or ""),
+            self._perception_api_key,
+        )
         raw_anchor = str(value.get("body_anchor_date") or "").strip()
         if raw_anchor:
             try:
                 datetime.strptime(raw_anchor, "%Y-%m-%d")
             except ValueError as exc:
                 raise ValueError("身体周期锚点必须使用 YYYY-MM-DD 格式") from exc
-        updated = validate_settings(value)
+        incoming = value if isinstance(value, dict) else {}
+        allowed = set(DEFAULT_SETTINGS) | {
+            "perception_api_key", "clear_perception_api_key",
+            "has_perception_api_key", "perception_api_configured",
+        }
+        unknown = sorted(set(incoming) - allowed)
+        if unknown:
+            raise ValueError("未知心潮设置: " + ", ".join(unknown[:8]))
+        updated = validate_settings({**self.settings, **incoming})
+        if updated["perception_api_base_url"]:
+            updated["perception_api_base_url"] = validate_api_base_url(
+                updated["perception_api_base_url"]
+            )
+        next_key = self._perception_api_key
+        if incoming.get("clear_perception_api_key"):
+            next_key = ""
+        elif str(incoming.get("perception_api_key") or "").strip():
+            next_key = str(incoming["perception_api_key"]).strip()
+        if updated["perception_api_mode"] != "off" and not (
+            updated["perception_api_base_url"] and updated["perception_api_model"] and next_key
+        ):
+            raise ValueError("启用心潮独立 API 前必须填写 Base URL、模型和 API Key")
         temp = self.settings_path.with_suffix(".json.tmp")
         text = json.dumps(updated, ensure_ascii=False, indent=2)
         with temp.open("w", encoding="utf-8", newline="\n") as handle:
@@ -424,11 +515,43 @@ class XinchaoController:
             os.fsync(handle.fileno())
         os.replace(temp, self.settings_path)
         self.settings = updated
+        if next_key != self._perception_api_key:
+            self._perception_api_key = next_key
+            self.secret_store.save(next_key)
+        self._configure_direct_perception()
+        current_direct = (
+            str(self.settings.get("perception_api_mode") or "off"),
+            str(self.settings.get("perception_api_base_url") or ""),
+            str(self.settings.get("perception_api_model") or ""),
+            self._perception_api_key,
+        )
+        if current_direct != previous_direct:
+            self._perception_health["live"] = self._new_perception_health()
+            self._perception_health["post"] = self._new_perception_health()
         self._last_body_phase.clear()
         self._record("settings", "心潮设置已保存", {"keys": len(updated)})
-        return copy.deepcopy(updated)
+        return self.settings_payload()
+
+    async def test_perception_api(self) -> dict[str, Any]:
+        if not self._direct_perception.configured:
+            raise ValueError("请先保存完整的心潮独立 API 配置")
+        timeout_key = (
+            "post_perception_timeout_seconds"
+            if self.settings.get("perception_api_mode") == "post"
+            else "live_perception_timeout_seconds"
+        )
+        return await self._direct_perception.test(
+            timeout=min(45.0, float(self.settings.get(timeout_key) or 20))
+        )
 
     def provider_options(self) -> list[dict[str, str]]:
+        resolver = getattr(self.plugin, "_chat_provider_options", None)
+        if callable(resolver):
+            return [
+                {"id": str(item.get("value") or ""), "label": str(item.get("label") or "")}
+                for item in resolver("")
+                if str(item.get("value") or "")
+            ]
         try:
             providers = list(self.plugin.context.get_all_providers())
         except Exception:
@@ -604,6 +727,15 @@ class XinchaoController:
             return
         key = self._scope_key(event)
         state = await self._settle_one(key)
+        house = getattr(self.plugin, "_house", None)
+        if house is not None:
+            try:
+                await house.before_wake(key, state, event.unified_msg_origin)
+                state = await self.store.read(key)
+            except Exception as exc:
+                self._record("house", "小屋自然联动失败，已放行本轮聊天", {
+                    "scope": key, "error": str(exc)[:180],
+                })
         if state.get("consciousness") == "sleeping":
             def wake(current: dict[str, Any]) -> dict[str, Any]:
                 updated, _ = apply_conversation_event(
@@ -661,8 +793,15 @@ class XinchaoController:
             "body_chars": diagnostics.get("body_chars", 0),
             "chars": len(block),
         })
-        if state.get("pendingAwareness"):
-            await self.store.update(key, lambda current: {**current, "pendingAwareness": None})
+        if state.get("pendingAwareness") or state.get("pendingOfflineAfterglow"):
+            await self.store.update(
+                key,
+                lambda current: {
+                    **current,
+                    "pendingAwareness": None,
+                    "pendingOfflineAfterglow": None,
+                },
+            )
 
     async def on_response(self, event: AstrMessageEvent, response: LLMResponse) -> None:
         if not self.settings["enable"] or getattr(response, "is_chunk", False):
@@ -900,6 +1039,10 @@ class XinchaoController:
         fatigue = float(state.get("fatigue") or 0)
         awareness = state.get("pendingAwareness")
         has_awareness = isinstance(awareness, dict) and bool(awareness.get("residue"))
+        offline_afterglow = state.get("pendingOfflineAfterglow")
+        has_offline_afterglow = isinstance(offline_afterglow, dict) and bool(
+            offline_afterglow.get("afterglow")
+        )
         body_state = body_state if isinstance(body_state, dict) else {}
         body_lines = render_body_context(body_state)
         mind_body_bridge = self._mind_body_bridge(state, body_state)
@@ -909,6 +1052,7 @@ class XinchaoController:
             and not thoughts
             and fatigue < 0.10
             and not has_awareness
+            and not has_offline_afterglow
             and not body_lines
             and not mind_body_bridge
             and state.get("consciousness") != "sleeping"
@@ -973,6 +1117,13 @@ class XinchaoController:
             inner = " ".join(str(awareness.get("awareness") or "").split())
             if inner:
                 lines.append(f"梦中整理出的内心理解：{inner[:220]}。它可以影响感受，但不能覆盖现实证据。")
+        if has_offline_afterglow:
+            afterglow = " ".join(str(offline_afterglow.get("afterglow") or "").split())[:260]
+            if afterglow:
+                lines.append(
+                    f"分别期间的内心余韵：{afterglow}。这是独处时形成的短期心理前景，"
+                    "不是新增现实经历；只轻微影响本轮的语气、犹豫和靠近方式，不要主动复述全文。"
+                )
         lines.append("</DynamicMindState>")
         block = "\n".join(lines)
         limit = int(self.settings["injection_max_chars"])
@@ -1001,7 +1152,78 @@ class XinchaoController:
                 *([f"身心合成：{mind_body_bridge}"] if mind_body_bridge else []),
             ])),
             "mind_body_bridge": mind_body_bridge,
+            "offline_afterglow": bool(has_offline_afterglow),
+            "offline_session_id": (
+                offline_afterglow.get("session_id") if has_offline_afterglow else None
+            ),
         }
+
+    async def apply_offline_afterglow(
+        self, key: str, digest: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Apply one bounded house digest without granting it factual authority."""
+        session_id = str(digest.get("session_id") or "")
+        afterglow = " ".join(str(digest.get("afterglow") or "").split())[:360]
+        if not session_id or not afterglow:
+            return {"applied": False, "reason": "invalid_digest"}
+        result: dict[str, Any] = {"applied": False, "reason": "unknown"}
+
+        def mutate(current: dict[str, Any]) -> dict[str, Any]:
+            nonlocal result
+            ledger = list(current.get("offlineEffectLedger") or [])[-40:]
+            if any(str(item.get("session_id") or "") == session_id for item in ledger if isinstance(item, dict)):
+                result = {"applied": False, "reason": "already_applied"}
+                return current
+            applied: list[dict[str, Any]] = []
+            for effect in list(digest.get("drive_effects") or [])[:3]:
+                if not isinstance(effect, dict):
+                    continue
+                drive = str(effect.get("key") or "")
+                if drive not in DRIVE_KEYS:
+                    continue
+                delta = _clamp(effect.get("delta"), -0.12, 0.12, 0.0)
+                if abs(delta) < 0.01:
+                    continue
+                before = float(current["driveActivations"].get(drive) or 0)
+                current["driveActivations"][drive] = round(_clamp(before + delta, 0, 1, before), 4)
+                applied.append({"key": drive, "delta": round(delta, 3)})
+            cue = next((
+                " ".join(str(item or "").split())[:140]
+                for item in list(digest.get("thought_cues") or [])
+                if str(item or "").strip()
+            ), "")
+            if cue and applied:
+                add_flash_thought(
+                    current["thoughtPool"], applied[0]["key"], cue,
+                    min(0.58, 0.40 + abs(float(applied[0]["delta"]))),
+                )
+            current["pendingOfflineAfterglow"] = {
+                "session_id": session_id,
+                "digest_id": str(digest.get("id") or ""),
+                "afterglow": afterglow,
+                "awareness": " ".join(str(digest.get("awareness") or "").split())[:220],
+                "applied_drives": applied,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            current["lastOfflineSessionId"] = session_id
+            ledger.append({
+                "session_id": session_id,
+                "digest_id": str(digest.get("id") or ""),
+                "at": datetime.now(timezone.utc).isoformat(),
+                "applied_drives": applied,
+            })
+            current["offlineEffectLedger"] = ledger[-40:]
+            current["revision"] = int(current.get("revision") or 0) + 1
+            result = {"applied": True, "drives": applied, "session_id": session_id}
+            return current
+
+        await self.store.update(key, mutate)
+        if result.get("applied"):
+            self._record("house", "离线周期余韵已进入一次性心理前景", {
+                "scope": key, "session_id": session_id,
+                "drives": result.get("drives"), "chars": len(afterglow),
+            })
+        return result
 
     @staticmethod
     def move_injection_last(req: ProviderRequest) -> None:
@@ -1046,7 +1268,9 @@ class XinchaoController:
             )
         )
         if should_call:
-            provider = self._provider(self.settings["perception_provider_id"], umo)
+            provider = self._perception_provider(
+                "post", self.settings["perception_provider_id"], umo
+            )
             if provider is None:
                 source = "rules_no_provider"
                 diagnostics = {"reason": "provider_missing"}
@@ -1285,7 +1509,9 @@ class XinchaoController:
             )
         )
         if should_call:
-            if self._provider(self.settings["live_perception_provider_id"], umo) is None:
+            if self._perception_provider(
+                "live", self.settings["live_perception_provider_id"], umo
+            ) is None:
                 source = "rules_no_provider"
                 diagnostics = {"reason": "provider_missing"}
             else:
@@ -1298,7 +1524,7 @@ class XinchaoController:
                     )
                     diagnostics = dict(parsed.get("_llm_meta") or {}) if parsed else {}
                     if parsed and float(parsed.get("confidence") or 0) >= self.settings["perception_min_confidence"]:
-                        result = parsed
+                        result = self._merge_live_appraisal(fallback, parsed)
                         source = "llm"
                     else:
                         source = "rules_low_confidence"
@@ -1388,6 +1614,50 @@ class XinchaoController:
             "confidence": 0.58,
         }
 
+    def _merge_live_appraisal(
+        self,
+        fallback: dict[str, Any],
+        llm_value: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Keep explicit rule evidence while letting the LLM supply nuance."""
+        rule = self._sanitize_live_appraisal(fallback)
+        llm = self._sanitize_live_appraisal(llm_value)
+        levels = dict(llm["activationLevels"])
+        order = list(llm["activatedDrives"])
+        for key in rule["activatedDrives"]:
+            rule_level = float(rule["activationLevels"].get(key) or 0.0)
+            if not order or rule_level >= 0.60:
+                levels[key] = max(float(levels.get(key) or 0.0), rule_level)
+                if key not in order:
+                    order.append(key)
+        order = sorted(
+            order,
+            key=lambda key: (-float(levels.get(key) or 0.0), order.index(key)),
+        )[:4]
+        deltas = dict(rule["driveDeltas"])
+        for key, amount in llm["driveDeltas"].items():
+            if abs(float(amount)) >= abs(float(deltas.get(key) or 0.0)):
+                deltas[key] = amount
+        thoughts: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in [*llm["flashThoughts"], *rule["flashThoughts"]]:
+            marker = (str(item.get("key") or ""), str(item.get("text") or ""))
+            if marker in seen:
+                continue
+            seen.add(marker)
+            thoughts.append(item)
+            if len(thoughts) >= 2:
+                break
+        return {
+            "activatedDrives": order,
+            "activationLevels": {key: round(float(levels.get(key) or 0.5), 3) for key in order},
+            "driveDeltas": deltas,
+            "flashThoughts": thoughts,
+            "guidance": llm["guidance"] or rule["guidance"],
+            "confidence": llm["confidence"],
+            "_llm_meta": copy.deepcopy(llm_value.get("_llm_meta") or {}),
+        }
+
     def _rule_event(
         self, user_text: str, assistant_text: str,
         live_appraisal: dict[str, Any] | None = None,
@@ -1449,13 +1719,20 @@ class XinchaoController:
         now: datetime | None = None,
         body_state: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
-        provider = self._provider(self.settings["live_perception_provider_id"], umo)
+        provider = self._perception_provider(
+            "live", self.settings["live_perception_provider_id"], umo
+        )
         if provider is None:
             return None
-        labels = "\n".join(f"- {key}: {DIMENSIONS[key]['label']}" for key in DRIVE_KEYS)
+        labels = "；".join(f"{key}={DIMENSIONS[key]['label']}" for key in DRIVE_KEYS)
+        character_context = self._character_context(
+            state_chars=1100,
+            profile_chars=700,
+            facts_chars=300,
+        )
         prompt = f"""你是角色持续心理状态的即时评估器。只判断“这条用户输入会立刻触发角色怎样的内在反应”，不要续写剧情，也不要把用户的情绪直接冒充角色的情绪。
 角色背景：
-{self._character_context()}
+{character_context}
 
 本轮现实基准：
 {self._request_context(now, body_state)}
@@ -1486,11 +1763,14 @@ class XinchaoController:
             provider,
             prompt,
             stage="live",
-            allow_retry=False,
+            allow_retry=True,
+            retry_transport=False,
         )
 
     def _sanitize_live_appraisal(self, value: Any) -> dict[str, Any]:
         source = value if isinstance(value, dict) else {}
+        raw_levels = source.get("activationLevels")
+        levels = raw_levels if isinstance(raw_levels, dict) else {}
         activated = list(dict.fromkeys(
             str(key) for key in source.get("activatedDrives", [])
             if str(key) in DRIVE_KEYS
@@ -1505,11 +1785,11 @@ class XinchaoController:
             "activatedDrives": activated,
             "activationLevels": {
                 key: round(_clamp(raw, 0.0, 1.0, 0.50), 3)
-                for key, raw in dict(source.get("activationLevels") or {}).items()
+                for key, raw in levels.items()
                 if key in activated
             } | {
                 key: 0.50 for key in activated
-                if key not in dict(source.get("activationLevels") or {})
+                if key not in levels
             },
             "driveDeltas": common["driveDeltas"],
             "flashThoughts": common["flashThoughts"],
@@ -1525,7 +1805,9 @@ class XinchaoController:
         live_appraisal: dict[str, Any] | None = None,
         request_context: str = "",
     ) -> dict[str, Any] | None:
-        provider = self._provider(self.settings["perception_provider_id"], umo)
+        provider = self._perception_provider(
+            "post", self.settings["perception_provider_id"], umo
+        )
         if provider is None:
             return None
         user_turns = self._as_turn_list(user_text)
@@ -1602,6 +1884,7 @@ class XinchaoController:
         *,
         stage: str,
         allow_retry: bool,
+        retry_transport: bool = True,
     ) -> dict[str, Any]:
         if self._perception_circuit_open(provider, stage):
             remaining = self._perception_health_payload(stage)["circuit_remaining_seconds"]
@@ -1634,13 +1917,18 @@ class XinchaoController:
                 last_error = f"总超时 {timeout:.1f} 秒"
                 break
             try:
-                response = await asyncio.wait_for(
-                    provider.text_chat(
-                        prompt=prompt,
-                        contexts=[],
-                        system_prompt=system_prompt,
-                    ),
+                attempt_prompt = prompt
+                if attempt > 1:
+                    attempt_prompt += (
+                        "\n\n上一次输出未通过结构校验。重新独立判断，只输出完整 JSON；"
+                        "不要解释，不要省略 confidence。"
+                    )
+                response = await self._managed_text_chat(
+                    provider,
+                    prompt=attempt_prompt,
+                    system_prompt=system_prompt,
                     timeout=remaining,
+                    label=f"xinchao_{stage}",
                 )
             except asyncio.TimeoutError:
                 last_kind = "timeout"
@@ -1648,13 +1936,23 @@ class XinchaoController:
                 break
             except asyncio.CancelledError:
                 raise
+            except LLMCircuitOpenError as exc:
+                last_kind = "circuit_open"
+                last_error = str(exc)[:240]
+                break
+            except DirectLLMEmptyFinalError as exc:
+                # A reasoning-only completion already consumed its output
+                # allowance; an identical retry in the remaining time is wasteful.
+                last_kind = "empty_final"
+                last_error = str(exc)[:240]
+                break
             except Exception as exc:
                 last_kind = "provider_error"
                 last_error = str(exc)[:240] or exc.__class__.__name__
-                if attempt < max_attempts and deadline - time.monotonic() > 0.05:
+                if retry_transport and attempt < max_attempts and deadline - time.monotonic() > 0.05:
                     continue
                 break
-            raw_text = str(getattr(response, "completion_text", "") or "").strip()[:32000]
+            raw_text = self._perception_response_text(response)[:32000]
             parsed = self._parse_json(raw_text)
             if parsed is not None:
                 normalized = self._normalize_perception_payload(parsed)
@@ -1667,7 +1965,10 @@ class XinchaoController:
                     }
                 )
                 present = (required - {"confidence"}).intersection(normalized)
-                minimum_fields = 2 if stage == "live" else 3
+                # Immediate appraisal can still be useful when a model supplies
+                # one grounded signal plus confidence. Missing neutral containers
+                # are filled below; the background settlement remains stricter.
+                minimum_fields = 1 if stage == "live" else 3
                 if len(present) >= minimum_fields and "confidence" in normalized:
                     for key in required - {"confidence"}:
                         if key not in normalized:
@@ -1678,6 +1979,8 @@ class XinchaoController:
                         "provider": self._provider_name(provider),
                         "stage": stage,
                         "timeout": timeout,
+                        "recovered": attempt > 1,
+                        "recovered_from": last_kind if attempt > 1 else "",
                     }
                     return normalized
                 last_kind = "schema_error"
@@ -1690,12 +1993,34 @@ class XinchaoController:
         self._mark_perception_failure(provider, stage, last_kind, last_error)
         raise PerceptionCallError(last_kind, last_error, attempts=attempts_made)
 
+    @staticmethod
+    def _perception_response_text(response: Any) -> str:
+        if isinstance(response, str):
+            return response.strip()
+        if isinstance(response, dict):
+            for key in ("completion_text", "output_text", "text", "content"):
+                value = response.get(key)
+                if value:
+                    return str(value).strip()
+            return ""
+        for name in ("completion_text", "output_text", "text", "content"):
+            value = getattr(response, name, None)
+            if value:
+                return str(value).strip()
+        return ""
+
     def _sanitize_event(self, value: Any) -> dict[str, Any]:
         source = value if isinstance(value, dict) else {}
+        raw_satisfaction = source.get("satisfactionLevels")
+        satisfaction_source = raw_satisfaction if isinstance(raw_satisfaction, dict) else {}
+        raw_activation = source.get("activationLevels")
+        activation_source = raw_activation if isinstance(raw_activation, dict) else {}
+        raw_deltas = source.get("driveDeltas")
+        delta_source = raw_deltas if isinstance(raw_deltas, dict) else {}
         satisfied = sorted({str(key) for key in source.get("satisfiedDrives", []) if str(key) in DRIVE_KEYS})
         satisfaction = {
             str(key): round(_clamp(raw, 0.0, 1.0, 0.0), 3)
-            for key, raw in dict(source.get("satisfactionLevels") or {}).items()
+            for key, raw in satisfaction_source.items()
             if str(key) in DRIVE_KEYS and _clamp(raw, 0.0, 1.0, 0.0) >= 0.01
         }
         for key in satisfied:
@@ -1707,7 +2032,7 @@ class XinchaoController:
         ))[:4]
         activation = {
             str(key): round(_clamp(raw, 0.0, 1.0, 0.0), 3)
-            for key, raw in dict(source.get("activationLevels") or {}).items()
+            for key, raw in activation_source.items()
             if str(key) in DRIVE_KEYS and _clamp(raw, 0.0, 1.0, 0.0) >= 0.01
         }
         for key in activated:
@@ -1715,7 +2040,7 @@ class XinchaoController:
         activated = list(dict.fromkeys([*activated, *activation.keys()]))[:4]
         activation = {key: activation[key] for key in activated}
         deltas = {}
-        for key, raw in dict(source.get("driveDeltas") or {}).items():
+        for key, raw in delta_source.items():
             if key not in DRIVE_KEYS:
                 continue
             amount = _clamp(raw, -0.20, 0.20, 0.0)
@@ -1841,9 +2166,13 @@ class XinchaoController:
                 raw = re.split(r"[,，、\s]+", raw)
             source[name] = [drive_key(item) for item in list(raw or [])]
         for name in ("satisfactionLevels", "activationLevels", "driveDeltas"):
+            if name not in source:
+                continue
             raw = source.get(name)
             if isinstance(raw, dict):
                 source[name] = {drive_key(key): amount for key, amount in raw.items()}
+            else:
+                source[name] = {}
         thoughts = []
         for item in list(source.get("flashThoughts") or []):
             if isinstance(item, str):
@@ -1870,12 +2199,51 @@ class XinchaoController:
         return source
 
     def _provider(self, provider_id: str, umo: str):
+        resolver = getattr(self.plugin, "_resolve_chat_provider", None)
+        if callable(resolver):
+            return resolver(provider_id, umo)
         try:
             if provider_id:
                 return self.plugin.context.get_provider_by_id(provider_id)
             return self.plugin.context.get_using_provider(umo)
         except Exception:
             return None
+
+    def _perception_provider(self, stage: str, provider_id: str, umo: str):
+        external = getattr(self.plugin, "_external_models", None)
+        if external is not None and external.enabled:
+            return self._provider(provider_id, umo)
+        mode = str(self.settings.get("perception_api_mode") or "off")
+        direct = mode == "all" or (mode == "post" and stage == "post")
+        if direct:
+            return self._direct_perception if self._direct_perception.configured else None
+        return self._provider(provider_id, umo)
+
+    async def _managed_text_chat(
+        self,
+        provider: Any,
+        *,
+        prompt: str,
+        system_prompt: str = "",
+        timeout: float,
+        label: str,
+    ) -> Any:
+        caller = getattr(self.plugin, "_plugin_llm_text_chat", None)
+        if callable(caller):
+            return await caller(
+                provider,
+                prompt=prompt,
+                contexts=[],
+                system_prompt=system_prompt,
+                timeout=timeout,
+                label=label,
+                optional=True,
+            )
+        # Compatibility path for isolated controller tests and older hosts.
+        return await asyncio.wait_for(
+            provider.text_chat(prompt=prompt, contexts=[], system_prompt=system_prompt),
+            timeout=timeout,
+        )
 
     @staticmethod
     def _provider_name(provider: Any) -> str:
@@ -1892,7 +2260,10 @@ class XinchaoController:
         health["circuit_remaining_seconds"] = round(remaining, 1)
         if remaining > 0:
             health["state"] = "circuit_open"
-        elif int(health.get("consecutive_failures") or 0) > 0:
+        elif (
+            int(health.get("consecutive_failures") or 0) > 0
+            or int(health.get("consecutive_soft_failures") or 0) > 0
+        ):
             health["state"] = "degraded"
         elif float(health.get("last_success_at") or 0) > 0:
             health["state"] = "healthy"
@@ -1913,6 +2284,7 @@ class XinchaoController:
         health.update({
             "provider": self._provider_name(provider),
             "consecutive_failures": 0,
+            "consecutive_soft_failures": 0,
             "circuit_until": 0.0,
             "circuit_backoff_seconds": 0.0,
             "last_error": "",
@@ -1924,15 +2296,21 @@ class XinchaoController:
         self, provider: Any, stage: str, kind: str, error: str,
     ) -> None:
         health = self._perception_health["live" if stage == "live" else "post"]
-        failures = int(health.get("consecutive_failures") or 0) + 1
+        hard_failure = kind in {"timeout", "provider_error", "empty_response"}
+        failures = int(health.get("consecutive_failures") or 0) + (1 if hard_failure else 0)
+        soft_failures = (
+            0 if hard_failure
+            else int(health.get("consecutive_soft_failures") or 0) + 1
+        )
         health.update({
             "provider": self._provider_name(provider),
             "consecutive_failures": failures,
+            "consecutive_soft_failures": soft_failures,
             "last_error": str(error or kind)[:240],
             "last_error_kind": kind,
             "last_failure_at": time.time(),
         })
-        if failures >= _PERCEPTION_CIRCUIT_FAILURES:
+        if hard_failure and failures >= _PERCEPTION_CIRCUIT_FAILURES:
             # A provider that is still broken when the circuit reopens should not
             # cost another full timeout every three minutes, so each reopen-then-fail
             # doubles the cooldown up to the ceiling.
@@ -1950,6 +2328,7 @@ class XinchaoController:
             health.update({
                 "provider": provider_name,
                 "consecutive_failures": 0,
+                "consecutive_soft_failures": 0,
                 "circuit_until": 0.0,
                 "circuit_backoff_seconds": 0.0,
                 "last_error": "",
@@ -1958,7 +2337,13 @@ class XinchaoController:
             return False
         return float(health.get("circuit_until") or 0.0) > time.monotonic()
 
-    def _character_context(self) -> str:
+    def _character_context(
+        self,
+        *,
+        state_chars: int = 1400,
+        profile_chars: int = 1400,
+        facts_chars: int = 600,
+    ) -> str:
         name = str(getattr(self.plugin, "character_name", "") or "当前角色").strip()
         lines = [f"角色名：{name}"]
         state_reader = getattr(self.plugin, "_semantic_state_status", None)
@@ -1968,7 +2353,7 @@ class XinchaoController:
                 state = status.get("state") if isinstance(status, dict) else {}
                 rendered = " ".join(
                     str((state or {}).get("rendered_text") or "").split()
-                )[:1400]
+                )[:max(0, int(state_chars))]
                 if rendered:
                     lines.append(
                         "当前滚动人格状态（已融合的现在，不是本轮事件证据）：" + rendered
@@ -1980,8 +2365,8 @@ class XinchaoController:
             try:
                 status = reader()
                 if status.get("connected"):
-                    profile = " ".join(str(status.get("profile") or "").split())[:1400]
-                    facts = " ".join(str(status.get("profile_facts") or "").split())[:600]
+                    profile = " ".join(str(status.get("profile") or "").split())[:max(0, int(profile_chars))]
+                    facts = " ".join(str(status.get("profile_facts") or "").split())[:max(0, int(facts_chars))]
                     if profile:
                         lines.append("长期人格画像：" + profile)
                     if facts:
@@ -1991,6 +2376,7 @@ class XinchaoController:
         return "\n".join(lines)
 
     async def _create_dream(self, key: str, state: dict[str, Any]) -> dict[str, Any]:
+        sleep_token = (state.get("sleepStartedAt"), state.get("lastUmo"))
         provider = self._provider(self.settings["dream_provider_id"], state.get("lastUmo", ""))
         character_context = self._character_context()
         events = "\n".join(f"- {item.get('summary', '')}" for item in state.get("recentEvents", [])[-8:])
@@ -2019,6 +2405,20 @@ class XinchaoController:
         body_material = "\n".join(
             f"- {item}" for item in body_material_parts if item
         )
+        house_cues: list[dict[str, Any]] = []
+        house = getattr(self.plugin, "_house", None)
+        if house is not None:
+            try:
+                house_cues = await house.dream_cues(key, 2)
+            except Exception as exc:
+                self._record("house", "梦境读取小屋线索失败，已继续原梦境流程", {
+                    "scope": key, "error": str(exc)[:160],
+                })
+        house_material = "\n".join(
+            f"- [{item.get('type') or 'inner'}] {str(item.get('summary') or '')[:180]}"
+            for item in house_cues
+            if str(item.get("summary") or "").strip()
+        )
         dream_text = ""
         residue = ""
         awareness = ""
@@ -2032,6 +2432,8 @@ class XinchaoController:
 {memory_material or "没有读取长期记忆"}
 当前身体底色：
 {body_material or "当前没有需要进入梦境的显著身体体验"}
+同一离线周期里的清醒独处线索（最多两条，只可化为梦的意象，不要重复原文）：
+{house_material or "无"}
 主要驱动力：{drives}
 盘旋念头：{thoughts or "无"}
 
@@ -2040,9 +2442,12 @@ class XinchaoController:
 记忆中的内容是过去材料，身体底色只是当下感受，不是剧情事实。梦可以重组意象但不能把梦写成现实，也不能新增现实事实。不要写系统、周期阶段、数值或分析报告。
 """
             try:
-                response = await asyncio.wait_for(
-                    provider.text_chat(prompt=prompt, contexts=[], system_prompt=""),
+                response = await self._managed_text_chat(
+                    provider,
+                    prompt=prompt,
+                    system_prompt="",
                     timeout=float(self.settings["dream_timeout_seconds"]),
+                    label="xinchao_dream",
                 )
                 parsed = self._parse_json(getattr(response, "completion_text", "") or "") or {}
                 dream_text = " ".join(str(parsed.get("dream") or "").split())[:1200]
@@ -2054,23 +2459,50 @@ class XinchaoController:
         if not residue:
             primary = top_drives(state, 1)[0]
             residue = f"梦里留下了一点关于{primary['label']}的模糊余韵。"
-        updated = await self.store.update(
-            key,
-            lambda current: record_dream(
-                current,
+        accepted = False
+        def commit_dream(current: dict[str, Any]) -> dict[str, Any]:
+            nonlocal accepted
+            # A slow result belongs to its sleep episode, not the next conversation.
+            if (current.get("consciousness") != "sleeping"
+                    or (current.get("sleepStartedAt"), current.get("lastUmo")) != sleep_token
+                    or not dream_allowed(current, datetime.now(timezone.utc),
+                        self.settings["dream_min_interval_hours"], self.settings["dream_max_per_day"])):
+                return current
+            accepted = True
+            return record_dream(current,
                 residue=residue,
                 awareness=awareness,
                 dream_text=dream_text,
                 source=source,
                 used_memory=bool(memory_material),
-            ),
-        )
+            )
+        updated = await self.store.update(key, commit_dream)
+        if not accepted:
+            self._record("dream", "旧睡眠周期结果已忽略", {"scope": key, "reason": "stale_sleep_result"})
+            return updated
         self._record("dream", "生成一次梦境余韵", {
             "scope": key,
             "source": source,
             "used_memory": bool(memory_material),
             "residue": residue[:100],
+            "house_cues": len(house_cues),
         })
+        if house_cues and house is not None:
+            try:
+                dream_id = str((updated.get("recentDreams") or [{}])[-1].get("id") or "")
+                if dream_id:
+                    args = (
+                        [str(item.get("id") or "") for item in house_cues if item.get("id")],
+                        "dream", dream_id,
+                        hashlib.sha256(residue.encode("utf-8")).hexdigest(),
+                    )
+                    runner = getattr(self.plugin, "_run_background_work", None)
+                    if callable(runner):
+                        await runner(house.store.consume_many, *args)
+                    else:
+                        await asyncio.to_thread(house.store.consume_many, *args)
+            except Exception:
+                pass
         return updated
 
     def _memory_material(self, max_items: int | None = None, mode: str = "dream") -> str:
@@ -2272,9 +2704,12 @@ class XinchaoController:
 没有足够自然理由时输出：SKIP
 """
             try:
-                response = await asyncio.wait_for(
-                    provider.text_chat(prompt=prompt, contexts=[], system_prompt=""),
+                response = await self._managed_text_chat(
+                    provider,
+                    prompt=prompt,
+                    system_prompt="",
                     timeout=float(self.settings["proactive_timeout_seconds"]),
+                    label=f"xinchao_{kind}",
                 )
                 raw_message = str(getattr(response, "completion_text", "") or "").strip()
                 if kind == "daytime_emergence":
@@ -2359,7 +2794,7 @@ class XinchaoController:
     async def all_states(self) -> dict[str, Any]:
         states = await self.store.snapshot()
         return {
-            "settings": copy.deepcopy(self.settings),
+            "settings": self.settings_payload(),
             "states": [self._state_payload(key, state, compact=True) for key, state in states.items()],
             "selected": next(iter(states), self.scope_key_from_query()),
         }
@@ -2400,6 +2835,9 @@ class XinchaoController:
             "recentActiveMessages": recent_bark_history(state),
             "nextDaytimeEmergenceAt": state.get("nextDaytimeEmergenceAt"),
             "pendingAwareness": state.get("pendingAwareness"),
+            "pendingOfflineAfterglow": state.get("pendingOfflineAfterglow"),
+            "lastOfflineSessionId": state.get("lastOfflineSessionId"),
+            "offlineEffectLedger": list(state.get("offlineEffectLedger") or [])[-20:],
             "lastInjection": self._last_injection.get(key),
             "lastPerception": self._last_perception.get(key),
             "perceptionHealth": self._perception_health_payload(),

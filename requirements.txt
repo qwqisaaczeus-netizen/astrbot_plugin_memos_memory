@@ -7,3 +7,4 @@ aiohttp>=3.9.0
 # 向量检索(sqlite-vec 扩展)。装不上时插件会自动回退到纯 Python 余弦,不影响功能,只是慢些。
 sqlite-vec>=0.1.0
 jieba>=0.42
+tzdata>=2024.1; sys_platform == "win32"

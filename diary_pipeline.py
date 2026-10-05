@@ -30,6 +30,21 @@ PLATFORM_ROLE = re.compile(r"(用户|assistant|Assistant|user)\s*[:：]?\s*说")
 FLOW_WORDS = ("他说", "我说", "然后", "接着", "她又说", "我又说", "他说完", "我说完")
 
 
+class DiaryGenerationDeferred(RuntimeError):
+    """A grounded archive exists, but no publishable literary diary exists yet.
+
+    This is intentionally distinct from an ordinary parser/runtime error.  The
+    caller must keep the source buffer and retry later; it must never route the
+    batch into the legacy summarizer or publish a deterministic transcript-like
+    fallback as if generation had succeeded.
+    """
+
+    def __init__(self, reason: str, diagnostics: dict[str, Any] | None = None):
+        self.reason = str(reason or "diary_generation_deferred")[:500]
+        self.diagnostics = dict(diagnostics or {})
+        super().__init__(self.reason)
+
+
 @dataclass
 class RiskReport:
     """Quantified "is the diary a verbatim replay" verdict."""
@@ -38,6 +53,8 @@ class RiskReport:
     flow_density: float
     compression_ratio: float
     risk: float
+    source_copy_ratio: float = 0.0
+    stage_direction_ratio: float = 0.0
 
     @property
     def high(self) -> bool:
@@ -161,12 +178,36 @@ class DiaryPipeline:
         # which collapsed almost every normal compressed diary to 1.0.
         compression = len(c) / max(1, len(r))
         length_replay_risk = min(1.0, compression / 0.85) if len(c) > 200 else 0.0
+        # Count *all* copied spans, not just the single longest one. A diary
+        # stitched from many short source excerpts evaded the old LCS check.
+        compact_c = re.sub(r"\s+", "", c)
+        compact_r = re.sub(r"\s+", "", r)[:50000]
+        span = 18
+        copy_ratio = 0.0
+        if len(compact_c) >= span and len(compact_r) >= span:
+            source_spans = {compact_r[i:i + span] for i in range(len(compact_r) - span + 1)}
+            covered = bytearray(len(compact_c))
+            for i in range(len(compact_c) - span + 1):
+                if compact_c[i:i + span] in source_spans:
+                    covered[i:i + span] = b"\x01" * span
+            copy_ratio = sum(covered) / len(compact_c)
+        stage_chars = sum(len(match.group(0)) for match in re.finditer(
+            r"[（(][^（）()]{8,300}[）)]", c,
+        ))
+        stage_ratio = stage_chars / max(1, len(c))
         risk = max(overlap_ratio * 0.5,
                    quote_ratio * 0.45,
                    min(1.0, flow_density * 0.25),
                    length_replay_risk * 0.35)
+        if len(compact_c) > 400 and copy_ratio > 0.52 and (
+            stage_ratio > 0.10 or (copy_ratio > 0.70 and compression > 0.55)
+        ):
+            risk = max(risk, 0.55)
+        if len(compact_c) > 400 and stage_ratio > 0.20:
+            risk = max(risk, 0.55)
         return RiskReport(overlap_ratio, quote_ratio, flow_density, round(compression, 4),
-                          round(max(0.0, min(1.0, risk)), 3))
+                          round(max(0.0, min(1.0, risk)), 3),
+                          round(copy_ratio, 3), round(stage_ratio, 3))
 
     # ---- 3.4 first-person contract check ------------------------------
 
@@ -219,16 +260,45 @@ class DiaryPipeline:
         items = ([x for x in evidence if isinstance(x, dict)
                   and str(x.get("tier") or "") == "must_write"] if has_tier
                  else [x for x in evidence if isinstance(x, dict)])
+        def compact_fact(value: Any, limit: int = 220) -> str:
+            text = " ".join(str(value or "").split()).strip()
+            text = re.sub(
+                r"^(?:我当时说或表达|对方当时说或表达|对话中记录)[:：]\s*",
+                "",
+                text,
+            )
+            if len(text) <= limit:
+                return text
+            clauses = [
+                clause.strip()
+                for clause in re.split(r"(?<=[。！？!?；;])", text)
+                if clause.strip()
+            ]
+            important = [
+                clause for clause in clauses
+                if any(word in clause for word in RELATION_WORDS)
+            ]
+            ordered = important + [clause for clause in clauses if clause not in important]
+            selected: list[str] = []
+            used = 0
+            for clause in ordered:
+                remaining = limit - used
+                if remaining <= 0:
+                    break
+                piece = clause[:remaining]
+                if piece and piece not in selected:
+                    selected.append(piece)
+                    used += len(piece)
+            return "".join(selected)[:limit].rstrip("，,；;：:")
+
         facts: list[str] = []
-        for item in items[:16]:
+        for item in items[:8]:
             detail = " ".join(str(item.get("detail") or "").split()).strip()
             quote = " ".join(str(item.get("quote") or "").split()).strip()
             if detail:
-                fact = detail
-                if quote and quote not in detail:
-                    fact += f"（「{quote}」）"
+                fact = compact_fact(detail)
             else:
-                fact = f"「{quote}」" if quote else ""
+                fact = compact_fact(quote, 160)
             if fact and fact not in facts:
                 facts.append(fact)
         if facts:

@@ -181,7 +181,45 @@ class CompressionValidationTests(unittest.IsolatedAsyncioTestCase):
             "rp_time_timezone": "Asia/Shanghai",
         })
         plugin.character_name = "爱莉"
+        plugin.evidence_first_generation_enable = False
         return plugin
+
+    async def test_legacy_transcript_like_diary_is_not_published(self):
+        with tempfile.TemporaryDirectory() as temp:
+            plugin = self.make_plugin(temp)
+            action = "我把茶杯举到他面前。（低头看着杯沿，伸手轻轻碰他的手背。）"
+            transcript = action * 12
+            event_ts = ts("2026-08-02T14:30:00")
+            messages = [
+                {"role": role, "content": transcript, "event_ts": event_ts,
+                 "event_timezone": "Asia/Shanghai"}
+                for role in ("user", "assistant", "user", "assistant")
+            ]
+            stored = []
+            dropped = []
+
+            class BufferSpy:
+                async def buffer_drop(self, *args):
+                    dropped.append(args)
+
+            plugin._vec = BufferSpy()
+
+            async def call(_prompt):
+                return json.dumps([diary("2026-08-02", transcript)], ensure_ascii=False)
+
+            async def store(item, **_kwargs):
+                stored.append(item)
+                return True
+
+            plugin._call_llm_compress = call
+            plugin._store_one_diary = store
+            result = await plugin._compress_and_store(
+                "legacy-transcript", messages, diary_count=1, source_kind="auto",
+                buffer_up_to_seq=4,
+            )
+            self.assertEqual(result, 0)
+            self.assertFalse(stored)
+            self.assertFalse(dropped)
 
     async def test_eod_accepts_one_complete_turn_below_normal_message_floor(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -197,7 +235,7 @@ class CompressionValidationTests(unittest.IsolatedAsyncioTestCase):
 
             async def call(prompt):
                 calls.append(prompt)
-                return json.dumps([diary("2026-08-02", "今晚留下了值得保存的片段。")], ensure_ascii=False)
+                return json.dumps([diary("2026-08-02", "我记得夜间对话与夜间回答，那是今晚留下的片段。")], ensure_ascii=False)
 
             async def store(_item, **_kwargs):
                 return True
@@ -228,17 +266,63 @@ class CompressionValidationTests(unittest.IsolatedAsyncioTestCase):
             dense = plugin._plan_eod_checkpoint(messages)
             self.assertEqual(dense["turns"], 17)
             self.assertEqual(dense["scene_windows"], 1)
+            self.assertEqual(dense["diary_target"], 1)
             self.assertEqual(dense["diary_capacity"], 3)
 
             messages[-1]["event_ts"] += 3 * 3600
             with_gap = plugin._plan_eod_checkpoint(messages)
             self.assertEqual(with_gap["scene_windows"], 2)
+            self.assertEqual(with_gap["diary_target"], 2)
             self.assertEqual(with_gap["diary_capacity"], 3)
 
             messages[-1]["event_ts"] += 24 * 3600
             cross_day = plugin._plan_eod_checkpoint(messages)
             self.assertEqual(len(cross_day["dates"]), 2)
             self.assertGreaterEqual(cross_day["diary_capacity"], 2)
+
+    def test_eod_plan_sizes_eight_exchanges_to_two_diaries(self):
+        with tempfile.TemporaryDirectory() as temp:
+            plugin = self.make_plugin(temp)
+            start = ts("2026-08-02T20:00:00")
+            messages = []
+            for index in range(8):
+                event_ts = start + index * 120
+                messages.extend([
+                    {"role": "user", "content": f"连续对话{index}", "event_ts": event_ts,
+                     "event_timezone": "Asia/Shanghai"},
+                    {"role": "assistant", "content": f"连续回答{index}", "event_ts": event_ts,
+                     "event_timezone": "Asia/Shanghai"},
+                ])
+            plan = plugin._plan_eod_checkpoint(messages)
+            self.assertEqual(plan["turns"], 8)
+            self.assertEqual(plan["diary_target"], 1)
+            self.assertEqual(plan["diary_capacity"], 2)
+
+    def test_eod_long_multi_arc_evening_keeps_one_target_and_three_capacity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            plugin = self.make_plugin(temp)
+            start = ts("2026-09-23T10:11:00")
+            topics = (
+                "在院中看月色与茶杯，想继续说话。",
+                "谈身体、未来的私塾与家里的开销。",
+                "想起旧事和后悔，彼此安慰。",
+                "回屋休息，记住今晚的约定。",
+            )
+            messages = []
+            for index in range(15):
+                topic = topics[min(index // 4, 3)]
+                event_ts = start + index * 150
+                messages.extend([
+                    {"role": "user", "content": topic, "event_ts": event_ts,
+                     "event_timezone": "Asia/Shanghai"},
+                    {"role": "assistant", "content": topic * 30,
+                     "event_ts": event_ts + 25, "event_timezone": "Asia/Shanghai"},
+                ])
+            plan = plugin._plan_eod_checkpoint(messages)
+            self.assertGreaterEqual(plan["chars"], 6000)
+            self.assertEqual(plan["scene_windows"], 1)
+            self.assertEqual(plan["diary_target"], 1)
+            self.assertEqual(plan["diary_capacity"], 3)
 
     async def test_eod_failure_uses_five_minute_retry_backoff(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -364,6 +448,42 @@ class CompressionValidationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(scheduled, ["eod_checkpoint"])
             self.assertEqual(plugin._eod_flush_done["session"]["snapshot_seq"], 2)
 
+    async def test_eod_flush_passes_conservative_target_and_soft_cap_separately(self):
+        with tempfile.TemporaryDirectory() as temp:
+            plugin = self.make_plugin(temp)
+            plugin.enable_auto_compress = True
+            start = ts("2026-09-13T23:00:00")
+            messages = []
+            for index in range(13):
+                messages.extend([
+                    {"role": "user", "content": f"连续对话{index}",
+                     "event_ts": start + index * 120, "event_timezone": "Asia/Shanghai"},
+                    {"role": "assistant", "content": f"连续回答{index}",
+                     "event_ts": start + index * 120 + 30, "event_timezone": "Asia/Shanghai"},
+                ])
+
+            class Buffer:
+                async def buffer_snapshot(self, _session, _limit):
+                    return list(messages), 26
+
+            captured = []
+
+            async def succeed(*_args, **kwargs):
+                captured.append(kwargs)
+                messages.clear()
+                return 1
+
+            plugin._buffer = {"session": list(messages)}
+            plugin._vec = Buffer()
+            plugin._compress_with_lock = succeed
+            result = await plugin._run_eod_flush_once(
+                datetime(2026, 9, 13, 23, 45, tzinfo=timezone.utc)
+            )
+            self.assertEqual(result["written"], 1)
+            self.assertEqual(result["planned"], 1)
+            self.assertEqual(captured[0]["diary_count"], 1)
+            self.assertEqual(captured[0]["diary_cap_override"], 3)
+
     async def test_single_day_conversation_now_is_corrected_deterministically(self):
         with tempfile.TemporaryDirectory() as temp:
             plugin = self.make_plugin(temp)
@@ -379,7 +499,7 @@ class CompressionValidationTests(unittest.IsolatedAsyncioTestCase):
 
             async def call(prompt):
                 calls.append(prompt)
-                return json.dumps([diary("2026-07-19", "这其实发生在十八日上午。")], ensure_ascii=False)
+                return json.dumps([diary("2026-07-19", "我记得上午对话与上午回答，这其实发生在十八日上午。")], ensure_ascii=False)
 
             async def store(item, **kwargs):
                 stored.append(item)
@@ -428,8 +548,8 @@ class CompressionValidationTests(unittest.IsolatedAsyncioTestCase):
                     {"role": "assistant", "content": f"十九日回应{i}", "event_ts": day_two, "event_timezone": "Asia/Shanghai"},
                 ])
             responses = [
-                [diary("2026-07-19", "只覆盖了十九日。"), diary("2026-07-19", "仍然只是十九日。")],
-                [diary("2026-07-18", "十八日夜里发生的事。"), diary("2026-07-19", "十九日凌晨发生的事。")],
+                [diary("2026-07-19", "我只记得十九日。"), diary("2026-07-19", "我仍然只记得十九日。")],
+                [diary("2026-07-18", "我记得十八日夜里发生的事。"), diary("2026-07-19", "我记得十九日凌晨发生的事。")],
             ]
             prompts = []
             stored = []

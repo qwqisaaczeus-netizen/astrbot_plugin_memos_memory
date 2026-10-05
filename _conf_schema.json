@@ -1,4 +1,40 @@
 {
+  "generation_v2_mind_enable": {
+    "type": "bool",
+    "description": "心潮使用 6.1 统一调度器",
+    "hint": "不启用原本关闭的心潮功能。保留模型分工，单任务最多三次请求；不嵌套旧重试。",
+    "default": true
+  },
+  "generation_v2_enable": {
+    "type": "bool",
+    "description": "6.1 新生产链：接管普通、手动和夜间压缩",
+    "hint": "先保留原文，再抽取证据、写作和审阅；整批合格并核验发布后才清理缓冲。关闭不会把已接管的未完成批次交回旧流程。",
+    "default": false
+  },
+  "generation_v2_memos_capabilities_confirmed": {
+    "type": "bool",
+    "description": "确认 Memos 支持自定义 memoId 和事件 createTime",
+    "hint": "新生产链发布前置条件，未确认只保留待处理原文；不通过测试写入探测服务。",
+    "default": false
+  },
+  "generation_v2_claim_audit": {
+    "type": "bool",
+    "description": "新生产：抽取后核验人物归属、意图与事实解释",
+    "hint": "新增一轮有预算上限的模型核验。无法确认的事实保留原文但不进入日记；不改写已冻结的旧任务。",
+    "default": true
+  },
+  "generation_v2_call_profile": {
+    "type": "string",
+    "description": "新生产默认调用策略",
+    "options": ["balanced-v1", "legacy"],
+    "hint": "balanced-v1 对未单独配置的生产任务关闭思考并设置分工预算；调度中心已明确配置的任务优先。旧任务保持冻结策略。",
+    "default": "balanced-v1"
+  },
+  "generation_v2_job_cap": {
+    "type": "int",
+    "description": "6.1 每批模型物理调用上限（含重试和跟接）",
+    "default": 12
+  },
   "enable": {
     "type": "bool",
     "description": "启用插件总开关",
@@ -76,6 +112,16 @@
     "hint": "填你在 AstrBot 配好的 embedding provider 的 ID(在 AstrBot 服务提供商管理页能看到)。留空则自动用第一个可用的。换了模型后请运行 /memos-reindex 重灌。注意:AstrBot 的 provider 下拉只列聊天 LLM,不列 embedding 模型,所以这里只能手填 ID。",
     "default": ""
   },
+  "narrative_plan_provider_id": {
+    "type": "string", "default": "", "description": "6.1 叙事规划模型",
+    "hint": "新生产作业的多片叙事规划。留空继承压缩模型，已创建作业保持固定路线。",
+    "_special": "select_provider"
+  },
+  "diary_review_provider_id": {
+    "type": "string", "default": "", "description": "6.1 日记审稿模型",
+    "hint": "新生产作业的独立审稿。留空继承压缩模型，已创建作业保持固定路线。",
+    "_special": "select_provider"
+  },
   "compress_provider_id": {
     "type": "string",
     "description": "压缩日记用的 LLM 模型(下拉选已配的 Provider)",
@@ -86,8 +132,46 @@
   "compress_llm_timeout": {
     "type": "float",
     "description": "日记压缩 LLM 调用超时秒数",
-    "hint": "默认 120 秒。保底压缩可能要求模型重写两篇，慢模型可调到 180；超时只保留缓冲，不会删除未压缩对话。",
-    "default": 120
+    "hint": "默认 150 秒。保底压缩和证据优先生产需要给推理模型完整输出时间；超时只保留缓冲，不会删除未压缩对话。",
+    "default": 150
+  },
+  "llm_runtime_provider_concurrency": {
+    "type": "int",
+    "description": "插件 LLM 单 Provider 并发上限",
+    "hint": "只约束插件内部 Astr Provider 调用，不限制 AstrBot 主回复。旧配置中的 1 升级后按 2 运行；最高 6，请按上游实际容量调整。",
+    "min": 2,
+    "max": 6,
+    "default": 2
+  },
+  "llm_runtime_external_concurrency": {
+    "type": "int",
+    "description": "插件独立 API 总并发上限",
+    "hint": "外置模型池和心潮独立 API 共用此上限。默认 3、最高 10；多个外置模型也计入同一总量。",
+    "min": 1,
+    "max": 10,
+    "default": 3
+  },
+  "llm_runtime_interactive_queue_timeout": {
+    "type": "float",
+    "description": "即时可选任务排队预算（秒）",
+    "hint": "心潮即时感知和查询消歧等待空闲通道的最长时间，包含在任务总超时内。旧版低于 0.5 的值升级后按 0.5 运行；超出后快速降级，不会打开 Provider 熔断。",
+    "min": 0.5,
+    "max": 3.0,
+    "default": 0.75
+  },
+  "llm_runtime_foreground_lease_seconds": {
+    "type": "float",
+    "description": "AstrBot 主回复前台租约上限（秒）",
+    "hint": "主模型回复期间，画像、回答后心理结算和创作任务会避让；回复钩子会立即释放，只有异常缺失钩子时才等待此上限。推荐 240。",
+    "min": 30,
+    "max": 900,
+    "default": 240
+  },
+  "llm_runtime_defer_background": {
+    "type": "bool",
+    "description": "主回复期间延后后台 LLM 任务",
+    "hint": "建议开启。只延后画像、状态结算、梦境和主动消息等后台任务，不阻塞心潮即时感知或关键记忆持久化。",
+    "default": true
   },
   "vec_db_path": {
     "type": "string",
@@ -206,10 +290,10 @@
   "diary_count_max_cap": {
     "type": "int",
     "description": "单批场景与日记数量硬上限",
-    "hint": "默认 6。SceneSplitter 最多保留该数量的候选场景；真实篇数仍由证据决定，不会硬凑。",
+    "hint": "默认 3。SceneSplitter 最多保留该数量的候选场景；真实篇数仍由证据决定，不会硬凑。篇数过多会让后续检索被同批碎片挤占。",
     "min": 1,
     "max": 12,
-    "default": 6
+    "default": 3
   },
   "query_plan_enable": {
     "type": "bool",
@@ -295,7 +379,7 @@
     "description": "情景证据提取超时秒数",
     "min": 10,
     "max": 600,
-    "default": 120
+    "default": 150
   },
   "diary_render_provider_id": {
     "type": "string",
@@ -309,7 +393,7 @@
     "description": "文学日记渲染超时秒数",
     "min": 10,
     "max": 600,
-    "default": 150
+    "default": 180
   },
   "episodic_auto_migrate": {
     "type": "bool",
@@ -391,38 +475,66 @@
     "description": "滚动状态融合超时秒数",
     "min": 20,
     "max": 600,
-    "default": 120
+    "default": 150
   },
   "semantic_state_target_chars": {
     "type": "int",
     "description": "滚动状态目标字数",
-    "hint": "默认 1800，是融合目标而不是简单截断。超长会要求模型合并同义项；重要承诺、边界和未解决事项不能被截掉。",
+    "hint": "默认 1200，是融合目标而不是简单截断。滚动状态只保留近期关系、情绪和未决事项；稳定人格由长期人格内核负责。",
     "min": 600,
     "max": 6000,
-    "default": 1800
+    "default": 1200
   },
   "semantic_state_update_policy": {
     "type": "string",
     "description": "滚动状态更新节奏",
     "hint": "推荐 adaptive：重大关系变化立即融合，普通日常累计多个压缩批次后合并，最长等待时间到达时兜底；日记和 Episode 仍会立即保存并可召回。every_batch 仅用于兼容旧行为。",
-    "options": ["adaptive", "every_batch"],
+    "options": [
+      "adaptive",
+      "every_batch"
+    ],
     "default": "adaptive"
   },
   "semantic_state_batch_threshold": {
     "type": "int",
-    "description": "普通批次累计多少次后融合状态",
-    "hint": "默认 3。只影响没有重大承诺、边界、身份或关系转折的普通批次；达到数量后会合并为一次状态 LLM 调用。",
+    "description": "有效变化簇达到多少类后融合状态",
+    "hint": "默认 4。重复日常会按关系、承诺、行为、情绪和未决事项折叠，不再按压缩批次数频繁调用。硬性承诺、边界和关系转折仍可立即更新。",
     "min": 1,
-    "max": 12,
-    "default": 3
+    "max": 5,
+    "default": 4
   },
   "semantic_state_max_wait_hours": {
     "type": "float",
     "description": "普通状态更新最长等待小时",
-    "hint": "默认 72 小时。即使未累计到批次数，也会在最长等待后融合，避免低频聊天的状态长期滞后。",
+    "hint": "默认 168 小时。只有确有有效变化时才兜底融合；纯日常重复到期后只清理状态队列，Episode 和原文仍完整保留。",
     "min": 1,
     "max": 720,
+    "default": 168
+  },
+  "semantic_state_min_interval_hours": {
+    "type": "float",
+    "description": "普通滚动状态最短更新间隔",
+    "hint": "默认 72 小时。普通变化不能在此间隔内反复重写；明确承诺、边界和关系转折可绕过。",
+    "min": 0,
+    "max": 720,
     "default": 72
+  },
+  "semantic_state_suppress_after_hours": {
+    "type": "float",
+    "description": "无有效变化队列清理时间",
+    "hint": "默认 168 小时。只清理滚动状态待融合队列，不删除 Episode、日记或原文证据。",
+    "min": 24,
+    "max": 2160,
+    "default": 168
+  },
+  "semantic_state_noop_similarity": {
+    "type": "float",
+    "description": "滚动状态无实质变化拦截阈值",
+    "hint": "默认 0.94。LLM 只是换措辞时不创建新版本；承诺边界或未决事项真实变化仍会保存。",
+    "min": 0.8,
+    "max": 0.995,
+    "step": 0.005,
+    "default": 0.94
   },
   "semantic_state_significance_threshold": {
     "type": "float",
@@ -436,10 +548,10 @@
   "semantic_state_merge_max_batches": {
     "type": "int",
     "description": "单次状态融合最多合并批次数",
-    "hint": "默认 6。限制一次状态 Prompt 的体积；运行时不会低于普通批次阈值，更多待处理批次保留到下一轮。",
+    "hint": "默认 12。待处理批次先合并成有效变化簇，再进行一次状态融合；更多批次保留到下一轮。",
     "min": 1,
     "max": 20,
-    "default": 6
+    "default": 12
   },
   "semantic_state_auto_bootstrap": {
     "type": "bool",
@@ -457,7 +569,7 @@
   "semantic_state_replace_profile": {
     "type": "bool",
     "description": "状态就绪后接管旧画像注入",
-    "hint": "建议开启。旧画像和历史仍保留并作为首次融合种子，但不再与当前状态重复注入，也不再自动周期更新旧画像。",
+    "hint": "兼容开关。开启后不注入旧版完整画像；rc8 会另外注入紧凑的长期人格内核，与滚动状态分工而不重复。",
     "default": true
   },
   "lean_recall_enable": {
@@ -671,10 +783,10 @@
   "eod_checkpoint_max_diaries": {
     "type": "int",
     "description": "夜间单批最多情景容量",
-    "hint": "默认 6。它是提取容量而不是必须凑满的篇数；真实跨日数量可以突破该值以保证日期覆盖。",
+    "hint": "默认 3。它是提取容量而不是必须凑满的篇数；夜间连续情景默认只目标 1 篇，跨日期或真实长间隔才增加。",
     "min": 1,
     "max": 12,
-    "default": 6
+    "default": 3
   },
   "enable_auto_recall": {
     "type": "bool",
@@ -828,7 +940,7 @@
   },
   "time_insight_llm_timeout": {
     "type": "float",
-    "default": 45,
+    "default": 60,
     "description": "时间洞察审校超时（秒）",
     "hint": "后台超时不影响聊天和确定性洞察。"
   },
@@ -1092,8 +1204,8 @@
   },
   "enable_affiliate_profile": {
     "type": "bool",
-    "description": "启用内置长期人格画像",
-    "hint": "开启后，主插件会在本地 sqlite 中维护当前长期人格画像，并在普通分层记忆前注入。1.10.1 起不再需要单独安装 affiliate 插件。",
+    "description": "启用长期人格内核",
+    "hint": "开启后维护跨月稳定的人格、关系定位、承诺与边界。rc8 起与近期滚动状态同时参与，但职责分离。",
     "default": true
   },
   "affiliate_profile_max_age_days": {
@@ -1111,9 +1223,25 @@
   },
   "profile_auto_update_days": {
     "type": "int",
-    "description": "长期人格画像自动更新间隔天数",
-    "hint": "默认 14 天。设 0 关闭自动更新，只用 /memos-profile-update 手动更新。",
-    "default": 14
+    "description": "长期人格内核自动检查间隔天数",
+    "hint": "默认 30 天，并且必须积累足够的新人格证据才会调用 LLM。设 0 关闭自动更新，只用 /memos-profile-update 手动更新。",
+    "default": 30
+  },
+  "profile_min_new_evidence": {
+    "type": "int",
+    "description": "人格内核自动更新所需新增证据数",
+    "hint": "默认 8。仅统计人格、关系、重要记忆和手动钉记忆；日常重复不会推动内核更新。",
+    "min": 1,
+    "max": 100,
+    "default": 8
+  },
+  "identity_core_inject_chars": {
+    "type": "int",
+    "description": "每轮长期人格内核注入上限",
+    "hint": "默认 1000。会优先保留完整句与稳定事实，不注入旧画像的全部长文本。设为 0 可回退旧版完整画像兼容行为。",
+    "min": 0,
+    "max": 2400,
+    "default": 1000
   },
   "profile_recent_persona_limit": {
     "type": "int",
@@ -1138,19 +1266,19 @@
   "profile_llm_timeout": {
     "type": "float",
     "description": "画像 LLM 调用超时秒数",
-    "hint": "默认 90 秒。画像融合会读取旧画像、人格类记忆、高重要度记忆、手动钉记忆和高反馈记忆，比普通召回更慢；慢模型或大画像可调到 120-180。设太低会出现 profile_llm timeout。",
-    "default": 90
+    "hint": "默认 120 秒。画像融合会读取旧画像、人格类记忆、高重要度记忆、手动钉记忆和高反馈记忆，比普通召回更慢；慢模型或大画像可调到 150-180。设太低会出现 profile_llm timeout。",
+    "default": 120
   },
   "profile_target_chars": {
     "type": "int",
-    "description": "长期人格画像目标字数，不是硬截断",
-    "hint": "默认 2600。效果优先，LLM 会尽量凝练但不强行丢关键内容。",
-    "default": 2600
+    "description": "长期人格内核目标字数，不是硬截断",
+    "hint": "默认 1000。只收敛跨月稳定内容；近期情绪、未决事项和短期关系张力交给滚动状态。",
+    "default": 1000
   },
   "profile_facts_target_count": {
     "type": "int",
-    "description": "稳定事实目标条数",
-    "default": 40
+    "description": "人格内核稳定事实目标条数",
+    "default": 20
   },
   "context_governance_enable": {
     "type": "bool",
@@ -1453,13 +1581,13 @@
     "type": "bool",
     "default": true,
     "description": "5.0 非破坏式记忆遗忘总开关",
-    "hint": "只管理记忆的自然可达性，不删除 Memos 日记、原文档案或情景卡。test0 默认只做 Shadow 对照。"
+    "hint": "只管理记忆的自然可达性，不删除 Memos 日记、原文档案或情景卡。默认保持 Shadow 对照。"
   },
   "memory_forgetting_shadow_mode": {
     "type": "bool",
     "default": true,
     "description": "记忆可达性 Shadow 模式",
-    "hint": "5.0.0-test0 固定为 Shadow 观察模式：完整计算和记录建议，但绝不改变 4.6.2 的真实召回与注入名单。此值为后续版本预留。"
+    "hint": "可达性评分保持 Shadow；只有另行开启接管且人工确认的真实召回评测八门全绿时，才会在原名单末尾追加 A/B 级精确命中。"
   },
   "memory_access_decay_enable": {
     "type": "bool",
@@ -1472,6 +1600,18 @@
     "default": true,
     "description": "启用深层记忆线索救回",
     "hint": "精确日期、人物、原话、场景词命中时允许深层记忆重新进入建议名单。"
+  },
+  "memory_access_independent_cue_rescue": {
+    "type": "bool",
+    "default": true,
+    "description": "启用候选池外精确线索救援（Shadow）",
+    "hint": "当 4.6 主召回漏掉目标时，独立线索索引仍可用明确日期、原话或稀有人物+事件词找到它。默认 Shadow 只记录建议；只有显式开启接管且安全门全绿时才可追加精确命中。"
+  },
+  "memory_access_rescue_candidate_limit": {
+    "type": "int",
+    "default": 12,
+    "description": "独立精确线索候选上限",
+    "hint": "仅限制 Shadow 诊断池，不占原召回条数。真实数据规模下推荐 12。"
   },
   "memory_interference_enable": {
     "type": "bool",
@@ -1538,5 +1678,471 @@
     "default": 4000,
     "description": "可达性事件保留条数",
     "hint": "用于 Shadow 对照、响应使用和再巩固诊断；超出后只删除最旧派生事件，不动记忆。"
+  },
+  "memory_access_observation_keep": {
+    "type": "int",
+    "default": 5000,
+    "description": "ACCESS 请求级评测保留数",
+    "hint": "每次真实召回自动保存一条基线/Shadow 对照，并在回复后回填利用率。人工反馈过的记录不会被自动淘汰。"
+  },
+  "memory_access_observation_query_max_chars": {
+    "type": "int",
+    "default": 2000,
+    "description": "评测查询最大留档字符",
+    "hint": "只影响本地 ACCESS 评测数据，不影响真实 query、召回或注入。"
+  },
+  "memory_access_export_keep": {
+    "type": "int",
+    "default": 10,
+    "description": "ACCESS 分析包保留数",
+    "hint": "WebUI 一键导出的 ZIP 超出数量后删除最旧导出包，不删除数据库评测记录。"
+  },
+  "memory_access_export_dir": {
+    "type": "string",
+    "default": "",
+    "description": "ACCESS 分析包目录",
+    "hint": "留空时使用 episodic_memory.db 同目录下的 access_exports。预设不会改动路径。"
+  },
+  "memory_access_cue_grade_b_rarity_min": {
+    "type": "float",
+    "default": 0.3,
+    "description": "B 级线索稀有度门槛",
+    "hint": "日期 + 稀有实体/物件命中 B 级时，实体/物件的最低稀有度。调高可减少同日误救援；推荐 0.25-0.45。"
+  },
+  "memory_access_same_day_gap_threshold": {
+    "type": "float",
+    "default": 0.15,
+    "description": "同日多篇消歧分差阈值",
+    "hint": "同一天有多篇候选时，第一名与第二名的分差低于此值则标记为 ambiguous_same_day，避免武断声明唯一答案。"
+  },
+  "memory_access_state_confirmation_runs": {
+    "type": "int",
+    "default": 2,
+    "description": "状态跨层确认次数",
+    "hint": "记忆从鲜明→潜伏或潜伏→深层，需要连续满足条件的维护次数。设为 1 表示不做跨层确认，推荐 2。"
+  },
+  "memory_access_source_proxy_weight": {
+    "type": "float",
+    "default": 0.45,
+    "description": "来源更新时间代理置信度",
+    "hint": "source_updated_ts 对衰减年龄的贡献系数（0-1）。低于 1.0 表示它不如事实事件时间可靠；不建议调高。"
+  },
+  "memory_access_route_mode": {
+    "type": "string",
+    "default": "supplement",
+    "description": "ACCESS 在线路由阶段",
+    "hint": "shadow=只观察不注入；supplement=完整保留旧主召回，并用独立 T 时间槽和 A 救援槽额外补充 0-2 条。5.1 推荐 supplement。",
+    "options": [
+      "shadow",
+      "supplement"
+    ]
+  },
+  "memory_access_supplement_max": {
+    "type": "int",
+    "default": 2,
+    "description": "ACCESS 单轮补充总上限",
+    "hint": "独立于原召回条数，硬上限 2；候选不合格时可为 0，不会强行填满。",
+    "min": 0,
+    "max": 2
+  },
+  "memory_access_supplement_temporal_max": {
+    "type": "int",
+    "default": 1,
+    "description": "T 时间证据槽上限",
+    "hint": "明确日期、年月、季节或第一次/上次等时间意图时最多补 1 条；普通聊天不会强制触发。",
+    "min": 0,
+    "max": 1
+  },
+  "memory_access_supplement_rescue_max": {
+    "type": "int",
+    "default": 1,
+    "description": "A 精确线索救援槽上限",
+    "hint": "用于专名、原话、场景锚或深层记忆强匹配，最多补 1 条；仅可访问性高不能占槽。",
+    "min": 0,
+    "max": 1
+  },
+  "memory_access_supplement_temporal_threshold": {
+    "type": "float",
+    "default": 0.56,
+    "description": "T 时间槽最低综合分",
+    "hint": "日期匹配权重最高，但仍检查语义、证据等级与时间可信度。降低会提高时间召回率，也会增加误补风险。",
+    "min": 0.35,
+    "max": 0.95
+  },
+  "memory_access_supplement_rescue_threshold": {
+    "type": "float",
+    "default": 0.62,
+    "description": "A 救援槽最低综合分",
+    "hint": "推荐 0.58-0.68。必须同时具有精确线索、独立索引或深层再激活信号，不会只按新旧程度补充。",
+    "min": 0.35,
+    "max": 0.95
+  },
+  "memory_access_supplement_source_bonus": {
+    "type": "float",
+    "default": 0.08,
+    "description": "可回原文证据加分上限",
+    "hint": "一手原文提高置信度，但不会改变事件日期，也不会让无原文旧日记失去参选资格。推荐 0.05-0.10。",
+    "min": 0,
+    "max": 0.15
+  },
+  "memory_access_supplement_allow_diary_derived": {
+    "type": "bool",
+    "default": true,
+    "description": "允许无原文旧日记进入补充支路",
+    "hint": "建议开启。旧日记会明确标记为 diary_derived 并降低证据分，不会伪装成一手原文。"
+  },
+  "memory_access_supplement_holdout_percent": {
+    "type": "int",
+    "default": 0,
+    "description": "会话级 Shadow 对照比例（%）",
+    "hint": "按会话稳定哈希选取，只记录而不补充，用于长期对照。默认 0 追求效果；评测期可设 5-10。",
+    "min": 0,
+    "max": 50
+  },
+  "memory_access_supplement_breaker_threshold": {
+    "type": "int",
+    "default": 3,
+    "description": "补充记忆连续未利用断路阈值",
+    "hint": "连续多少次补充项未被回答利用后自动退回 Shadow。断路只停 ACCESS 补充，不影响旧主召回。推荐 3-5。",
+    "min": 1,
+    "max": 20
+  },
+  "memory_access_takeover_enable": {
+    "type": "bool",
+    "default": false,
+    "description": "旧版来源金丝雀开关（兼容项）",
+    "hint": "5.1 不再读取此键决定在线路由，请使用 memory_access_route_mode。旧数据和日志仍保留。"
+  },
+  "memory_access_takeover_max_appends": {
+    "type": "int",
+    "default": 1,
+    "description": "单轮最多追加条数",
+    "hint": "每轮回复最多追加多少条精确命中记忆。推荐1。",
+    "min": 1,
+    "max": 1
+  },
+  "memory_access_takeover_min_grade": {
+    "type": "string",
+    "default": "A",
+    "description": "接管最低线索等级",
+    "hint": "A=只接受原话；B=接受日期+稀有实体；C以下不接受。",
+    "options": [
+      "A"
+    ]
+  },
+  "memory_access_takeover_source_lexical_min": {
+    "type": "float",
+    "default": 0.34,
+    "description": "接管原文词面证据下限",
+    "hint": "5.0 只允许精确 turn 归属的原文 canary 追加；除独立完整原话救援外，原文词面支持还必须达到此值。推荐保持 0.34。",
+    "min": 0.2,
+    "max": 0.9
+  },
+  "memory_access_takeover_breaker_threshold": {
+    "type": "int",
+    "default": 3,
+    "description": "连续未使用熔断阈值",
+    "hint": "连续多少次追加记忆都没被回复使用后自动熔断回落Shadow。",
+    "min": 1,
+    "max": 20
+  },
+  "memory_access_takeover_min_eval_cases": {
+    "type": "int",
+    "default": 30,
+    "description": "接管最少评测案例数",
+    "hint": "评测案例少于此数不允许接管。",
+    "min": 5,
+    "max": 500
+  },
+  "memory_access_takeover_source_min_eval_cases": {
+    "type": "int",
+    "default": 5,
+    "description": "来源证据金丝雀最少严格案例数",
+    "hint": "5.0 在线追加只由可回原文的严格来源案例解锁。推荐 5；完整 ACCESS 八门评测数量仍独立保留。",
+    "min": 3,
+    "max": 100
+  },
+  "memory_access_eval_max_age_days": {
+    "type": "int",
+    "default": 7,
+    "description": "评测结果有效期（天）",
+    "hint": "超过此天数的评测结果不再用于接管资格判定。",
+    "min": 1,
+    "max": 90
+  },
+  "memory_access_auto_eval_case_limit": {
+    "type": "int",
+    "default": 80,
+    "description": "单次自动评测案例上限",
+    "hint": "自动校准按原文监督、案例类型、难负样本和不同记忆分层轮换抽样。推荐80；多次运行会逐步覆盖全库。",
+    "min": 20,
+    "max": 500
+  },
+  "consistency_mode": {
+    "type": "string",
+    "default": "shadow",
+    "options": [
+      "off",
+      "shadow"
+    ],
+    "description": "回答一致性守卫模式",
+    "hint": "shadow 只在回答后记录观测；off 完全停用。不会修改回答或阻塞发送。"
+  },
+  "consistency_queue_capacity": {
+    "type": "int",
+    "default": 64,
+    "min": 1,
+    "max": 4096,
+    "description": "一致性后台队列容量",
+    "hint": "队列满时丢弃观测并保持聊天 fail-open。"
+  },
+  "consistency_timeout": {
+    "type": "float",
+    "default": 0.25,
+    "min": 0.01,
+    "max": 30.0,
+    "description": "一致性本地检查超时（秒）",
+    "hint": "超时只跳过深层检查，不影响回答发送。"
+  },
+  "consistency_ttl": {
+    "type": "float",
+    "default": 900.0,
+    "min": 1.0,
+    "max": 86400.0,
+    "description": "一致性未配对观测保留时间（秒）"
+  },
+  "consistency_llm_enable": {
+    "type": "bool",
+    "default": false,
+    "description": "启用回答一致性后台 LLM 仲裁",
+    "hint": "默认关闭；开启后只处理本地规则无法裁决的候选，不等待回答发送。"
+  },
+  "consistency_llm_provider_id": {
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "description": "回答一致性后台仲裁模型",
+    "hint": "留空使用插件可用模型；仅在后台仲裁开启时使用。"
+  },
+  "thread_memory_enable": {
+    "type": "bool",
+    "default": true,
+    "description": "6.0 记忆脉络系统总开关",
+    "hint": "RC 默认开启本地 Shadow 派生与观测，但不改变正式请求；只有同时把运行模式改为 Canary 才会小流量注入。已有配置中的显式关闭值会保留。"
+  },
+  "thread_subgraph_nodes": {
+    "type": "int",
+    "default": 5,
+    "min": 3,
+    "max": 7,
+    "description": "普通脉络最小子图节点上限",
+    "hint": "保守/低成本为3，均衡/效果优先为5；立即生效。"
+  },
+  "thread_evolution_nodes": {
+    "type": "int",
+    "default": 7,
+    "min": 3,
+    "max": 7,
+    "description": "关系演变子图节点上限",
+    "hint": "均衡为5，效果优先为7；立即生效。"
+  },
+  "thread_mode": {
+    "type": "string",
+    "default": "shadow",
+    "description": "脉络系统运行模式",
+    "hint": "shadow：只观察和记录；canary：按稳定会话比例注入紧凑脉络。任何异常只回退6.0块，不重跑也不改变5.1召回。",
+    "options": [
+      "shadow",
+      "canary"
+    ]
+  },
+  "thread_canary_percent": {
+    "type": "int",
+    "default": 10,
+    "min": 0,
+    "max": 100,
+    "description": "Canary 稳定会话比例（%）",
+    "hint": "仅在 thread_mode=canary 时生效。同一会话跨轮次和重启保持同一选择结果；test11 均衡预设建议先用 10%。"
+  },
+  "thread_canary_seed": {
+    "type": "string",
+    "default": "memos-memory-6",
+    "description": "Canary 稳定分流种子",
+    "hint": "改变后会重新分配进入 Canary 的会话。普通升级请保持不变。"
+  },
+  "thread_canary_allowlist": {
+    "type": "string",
+    "default": "",
+    "description": "Canary 会话白名单",
+    "hint": "可填 session_id、scope_id 或 scope_id:session_id；多个值用逗号、分号或换行分隔。白名单仍要求模式为canary。"
+  },
+  "thread_canary_denylist": {
+    "type": "string",
+    "default": "",
+    "description": "Canary 会话黑名单",
+    "hint": "格式同白名单，优先级最高；命中后永不注入6.0脉络块。"
+  },
+  "thread_canary_max_chars": {
+    "type": "int",
+    "default": 1200,
+    "min": 320,
+    "max": 6000,
+    "description": "单轮脉络块字符硬上限",
+    "hint": "只限制6.0附加脉络，不削减已入选日记、passage或原文证据。"
+  },
+  "thread_canary_growth_percent": {
+    "type": "float",
+    "default": 10,
+    "min": 1,
+    "max": 30,
+    "description": "脉络块相对现有输入增长上限（%）",
+    "hint": "超过时先压缩和裁掉 supporting 节点；当前事实、反证、状态变化与前瞻事项不会静默截断。"
+  },
+  "thread_canary_timeout_ms": {
+    "type": "int",
+    "default": 300,
+    "min": 50,
+    "max": 3000,
+    "description": "在线脉络路线超时门（毫秒）",
+    "hint": "超时立即按原5.1请求继续，不重复embedding、rerank或LLM。"
+  },
+  "thread_canary_require_current_time": {
+    "type": "bool",
+    "default": true,
+    "description": "注入前要求有效当前时间块",
+    "hint": "推荐开启。CurrentTimeContext缺失时不注入历史脉络，防止日记时间被误当成当前时间。"
+  },
+  "thread_prospective_cooldown_seconds": {
+    "type": "float",
+    "default": 86400,
+    "min": 0,
+    "max": 604800,
+    "description": "前瞻事项真实注入后的冷却秒数",
+    "hint": "仅真实 Canary 追加成功后写入；Shadow 预览、失败或空块不会修改前瞻状态。"
+  },
+  "thread_worker_enable": {
+    "type": "bool",
+    "default": true,
+    "description": "启用脉络后台工作线程",
+    "hint": "关闭后不运行后台 Episode 分析任务；脉络表仍然建立，手动触发时仍可工作。"
+  },
+  "thread_observation_retention_days": {
+    "type": "int",
+    "default": 180,
+    "min": 7,
+    "max": 3650,
+    "description": "脉络 Shadow 观测保留天数",
+    "hint": "只影响本地派生观测。人工反馈和审计记录不会被自动清理；不上传日记、原文、Token 或密钥。"
+  },
+  "thread_worker_batch_size": {
+    "type": "int",
+    "default": 10,
+    "description": "脉络工作线程单批处理数量",
+    "hint": "每次后台任务处理的 Episode 数量上限。推荐 5-20。",
+    "min": 1,
+    "max": 100
+  },
+  "thread_worker_interval_seconds": {
+    "type": "int",
+    "default": 300,
+    "description": "脉络工作线程调度间隔（秒）",
+    "hint": "后台任务两次运行之间的等待秒数。最小 60，推荐 300。",
+    "min": 60,
+    "max": 86400
+  },
+  "thread_worker_max_retries": {
+    "type": "int",
+    "default": 3,
+    "description": "单条 Episode 最大重试次数",
+    "hint": "超过后进入 quarantined 状态，不再自动重试，不影响其他任务。",
+    "min": 0,
+    "max": 20
+  },
+  "thread_migration_read_only": {
+    "type": "bool",
+    "default": true,
+    "description": "旧数据盘点只读模式",
+    "hint": "开启时不写逐条来源等级；scope 映射和可重建 Shadow 队列仍会建立，旧 Episode 才能参与脉络分析。"
+  },
+  "thread_llm_arbitration_enable": {
+    "type": "bool",
+    "default": true,
+    "description": "启用歧义关系 LLM 审校",
+    "hint": "只处理本地规则无法确定的候选，不在聊天请求路径调用；总开关关闭时不会运行。"
+  },
+  "thread_llm_provider_id": {
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "description": "脉络关系审校模型",
+    "hint": "留空继承压缩模型或当前会话模型。建议选择结构化 JSON 稳定、成本适中的模型。"
+  },
+  "thread_llm_timeout": {
+    "type": "float",
+    "default": 60,
+    "min": 10,
+    "max": 180,
+    "description": "单批关系审校超时秒数"
+  },
+  "thread_llm_batch_size": {
+    "type": "int",
+    "default": 4,
+    "min": 1,
+    "max": 12,
+    "description": "单次关系审校候选数",
+    "hint": "推荐 4。还会受总字符上限约束。"
+  },
+  "thread_llm_max_input_chars": {
+    "type": "int",
+    "default": 12000,
+    "min": 2000,
+    "max": 50000,
+    "description": "单批关系审校最大输入字符"
+  },
+  "thread_llm_daily_budget": {
+    "type": "int",
+    "default": 40,
+    "min": 0,
+    "max": 1000,
+    "description": "每日关系审校调用预算",
+    "hint": "按批次计数。设为 0 会暂停 LLM 审校，但保留待处理队列。"
+  },
+  "thread_llm_max_retries": {
+    "type": "int",
+    "default": 2,
+    "min": 0,
+    "max": 5,
+    "description": "关系审校单批最大重试次数"
+  },
+  "thread_projection_enable": {
+    "type": "bool",
+    "default": true,
+    "description": "将可靠关系投影为可浏览线程",
+    "hint": "仅写 Shadow 派生表，不改变正式检索和注入。"
+  },
+  "thread_projection_min_confidence": {
+    "type": "float",
+    "default": 0.84,
+    "min": 0.5,
+    "max": 0.99,
+    "description": "线程投影最低关系置信度"
+  },
+  "thread_claim_enable": {
+    "type": "bool",
+    "default": true,
+    "description": "启用当前事实账本",
+    "hint": "从 Episode 派生关系、承诺、边界、偏好、计划和未决事项；只写可重建 Shadow 表，不替换滚动状态。"
+  },
+  "thread_prospective_enable": {
+    "type": "bool",
+    "default": true,
+    "description": "启用前瞻记忆候选",
+    "hint": "建立承诺、计划和未决事项的五路触发候选。test5 仍只在实验室预览，不注入正常聊天。"
+  },
+  "thread_retrieval_lab_enable": {
+    "type": "bool",
+    "default": true,
+    "description": "启用6.0脉络检索实验室",
+    "hint": "并行比较5.x主检索与线程、当前事实、时间演变、前瞻事项；不会写入会话或触发正式回答。"
   }
 }

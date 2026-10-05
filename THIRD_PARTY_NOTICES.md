@@ -28,6 +28,23 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+## PixiJS
+
+The courtyard Live2D view includes PixiJS. Its full MIT license is shipped as
+`assets/vendor/LICENSE-pixi.txt`.
+
+## pixi-live2d-display
+
+The courtyard Live2D adapter includes pixi-live2d-display. Its full MIT license
+is shipped as `assets/vendor/LICENSE-pixi-live2d-display.txt`.
+
+## Live2D Cubism Core
+
+The proprietary Cubism Core runtime is not redistributed in this package. The
+courtyard loads the official Live2D-hosted Web SDK core at runtime. When that
+resource is unavailable, the existing static/mesh character renderer remains
+available and the memory plugin continues to operate normally.
+
 ## AstrBot Plugin Period
 
 The body-rhythm calculation and low-intrusion body-state integration in

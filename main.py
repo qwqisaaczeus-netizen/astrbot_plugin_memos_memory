@@ -1,5 +1,5 @@
 """
-AstrBot Memos 长期记忆插件 v5.0.0-test0。
+AstrBot Memos 长期记忆插件 v6.1.0。
 
 时间模型严格区分事件发生时间、Memos 来源时间、本地索引时间和本轮当前时间。
 
@@ -15,8 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
+import difflib
 import hashlib
 import json
+import math
 import os
 import re
 import socket
@@ -36,6 +39,7 @@ from .compress import (
     build_compress_prompt,
     build_diary_literary_rewrite_prompt,
     build_diary_render_prompt,
+    build_episode_compact_recovery_prompt,
     build_episode_extraction_prompt,
     build_query_plan_disambiguation_prompt,
     build_semantic_state_update_prompt,
@@ -51,9 +55,18 @@ from .archive_guard import (
     record_episode_db_location,
     resolve_plugin_data_db,
 )
-from .diary_pipeline import DiaryPipeline
+from .diary_pipeline import DiaryGenerationDeferred, DiaryPipeline
 from .data_backup import DataBackupManager
+from .access_export import AccessAnalysisExporter
 from .episodic_store import EpisodicStore
+from .llm_runtime import (
+    LLMCircuitOpenError,
+    LLMEmptyFinalError,
+    LLMRouteExhaustedError,
+    PluginLLMRuntime,
+)
+from .external_models import ExternalModelRegistry, migrate_external_model_state
+from .llm_compensation import LLMCompensationStore
 from .query_planner import QueryPlanner
 from .retrieval_optimizer import (
     classify_memory_intent,
@@ -62,6 +75,10 @@ from .retrieval_optimizer import (
     parse_temporal_constraint,
 )
 from .scene_splitter import SceneSplitter, as_prompt_payload
+from .episode_recovery import (
+    build_local_grounded_episodes,
+    project_grounded_evidence_for_render,
+)
 from .memos_client import MemosClient
 from .temporal import (
     memo_source_times,
@@ -72,7 +89,11 @@ from .temporal import (
 )
 from .vector_store import VectorStore
 from .xinchao import XinchaoController
+from .house_service import HouseService
 from .time_insight_service import IntegratedTimeInsightService
+from .access_integration import MemoryAccessIntegrationMixin
+from .thread_integration import ThreadIntegrationMixin
+from .consistency_guard import validate_arbitration
 
 try:
     from .repetition_guard import analyze_repetition, format_mirror_alert, format_repetition_guide
@@ -88,11 +109,33 @@ try:
 except Exception:  # aiohttp 缺失等极端情况不阻塞主插件
     WebUIServer = None
 
-_PLUGIN_VERSION = "5.0.0-test0"
+_PLUGIN_VERSION = "6.1.0"
+_ACTIVE_SOURCE_BATCH = contextvars.ContextVar("memos_active_source_batch", default="")
+_ACTIVE_COMPENSATION_REPLAY = contextvars.ContextVar(
+    "memos_active_compensation_replay", default=False,
+)
+_ACTIVE_PRELIMINARY_LLM_ROUTE = contextvars.ContextVar(
+    "memos_active_preliminary_llm_route", default=False,
+)
 _PASSAGE_VECTOR_STRATEGY = "local_passage_v2"
 _DEFAULT_CHUNK_CHARS = 120
 _DEFAULT_OVERLAP_CHARS = 30
 _MIN_MSGS_TO_COMPRESS = 8
+
+
+def _memo_requires_sync(
+    memo_name: str, updated_ts: float, body_hash: str,
+    existing: dict[str, tuple[float, str]],
+) -> bool:
+    previous = existing.get(memo_name)
+    if previous is None:
+        return True
+    previous_ts, previous_hash = previous
+    return previous_hash != body_hash or bool(
+        updated_ts and updated_ts > previous_ts + 1
+    ) or not (updated_ts or previous_ts)
+
+
 _LEGACY_IMP_TIER5 = "初遇,定情,告白,承诺,誓言,约定,求婚,结婚,婚礼,戒指,家人,我家的,永远,永远在一起,不会离开,不要离开,分别,离别,失去,重逢,和好,原谅,背叛,牺牲,死亡,濒死,复活,怀孕,孩子,出生,第一次见,第一次吻,第一次抱,身份揭露,真相揭露,命运改变"
 _LEGACY_IMP_TIER4 = "信任,依赖,靠近,心软,吃醋,占有欲,害怕失去,害怕分离,安心,被接住,被记住,保护,救下,受伤,哭,崩溃,道歉,认错,秘密,真相,选择,决定,觉醒,变身,解锁,失控,封印,诅咒,契约,边界,禁忌,称呼,专属称呼"
 _LEGACY_IMP_TIER3 = "喜欢,在意,担心,想念,陪伴,拥抱,牵手,亲吻,脸红,沉默,犹豫,试探,确认,撒娇,嘴硬,吃醋,害羞,承认,约会,礼物,纪念,习惯,下意识,靠近一点,不安,委屈,嫉妒,温柔,照顾,生病,疼,梦,房间,住处,名字,物件,信物"
@@ -360,6 +403,12 @@ def _machine_meta64(data: dict[str, Any]) -> str:
         "source_batch_id": _safe_meta_text(data.get("source_batch_id"), 80),
         "evidence_quality": _safe_meta_text(data.get("evidence_quality"), 40),
     }
+    for key in ("source_turn_start", "source_turn_end"):
+        try:
+            if data.get(key) is not None:
+                clean[key] = max(0, int(data[key]))
+        except (TypeError, ValueError):
+            pass
     if not any(clean.values()):
         return ""
     raw = json.dumps(clean, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -696,12 +745,14 @@ class ManagedMemosSidecar:
     _PLUGIN_VERSION,
     "",
 )
-class MemosMemoryPlugin(Star):
+class MemosMemoryPlugin(MemoryAccessIntegrationMixin, ThreadIntegrationMixin, Star):
     def __init__(self, context: Context, config: dict[str, Any]):
         super().__init__(context)
         self.context = context
         self.config = config
         self._PLUGIN_VERSION = _PLUGIN_VERSION
+        from .background_work import BackgroundWork
+        self._background_work = BackgroundWork(capacity=4)
 
         # 角色名(可分享:别人用填自己的角色)
         self.character_name: str = str(config.get("character_name", "")).strip()
@@ -732,10 +783,47 @@ class MemosMemoryPlugin(Star):
         # 向量库
         self.vec_db_path: str = str(config.get("vec_db_path", "./data/astrbot_plugin_memos_memory/memories.db"))
         self.emb_provider_id: str = str(config.get("emb_provider_id", "")).strip()
+        legacy_runtime_dir = Path(self.vec_db_path).expanduser().resolve().parent
+        self.runtime_state_dir = Path(
+            resolve_plugin_data_db("external_models.json")
+        ).expanduser().resolve().parent
+        runtime_migration = migrate_external_model_state(
+            legacy_runtime_dir, self.runtime_state_dir,
+        )
+        if runtime_migration.get("copied"):
+            logger.info(
+                "[memos-memory][models] migrated runtime state to stable plugin_data: %s",
+                ",".join(runtime_migration["copied"]),
+            )
+        self._external_models = ExternalModelRegistry(
+            self.runtime_state_dir,
+            telemetry_callback=self._record_llm_call,
+        )
+        self._llm_compensation = LLMCompensationStore(
+            self.runtime_state_dir / "llm_compensation.db"
+        )
+        self._llm_compensation_tasks: dict[str, asyncio.Task] = {}
 
         # 压缩用的 LLM provider (留空 = 用当前对话的 LLM)
         self.compress_provider_id: str = str(config.get("compress_provider_id", "")).strip()
-        self.compress_llm_timeout: float = float(config.get("compress_llm_timeout", 120))
+        self.narrative_plan_provider_id = str(config.get('narrative_plan_provider_id','')).strip()
+        self.diary_review_provider_id = str(config.get('diary_review_provider_id','')).strip()
+        self.compress_llm_timeout: float = float(config.get("compress_llm_timeout", 150))
+        self.llm_runtime_provider_concurrency: int = max(
+            2, min(6, int(config.get("llm_runtime_provider_concurrency", 2)))
+        )
+        self.llm_runtime_external_concurrency: int = max(
+            1, min(10, int(config.get("llm_runtime_external_concurrency", 3)))
+        )
+        self.llm_runtime_interactive_queue_timeout: float = max(
+            0.5, min(3.0, float(config.get("llm_runtime_interactive_queue_timeout", 0.75)))
+        )
+        self.llm_runtime_foreground_lease_seconds: float = max(
+            30.0, min(900.0, float(config.get("llm_runtime_foreground_lease_seconds", 240.0)))
+        )
+        self.llm_runtime_defer_background: bool = bool(
+            config.get("llm_runtime_defer_background", True)
+        )
 
         # v4.0: evidence-first episodic memory. Memos remains the readable source
         # of active diary truth; this isolated database owns source turns and
@@ -755,7 +843,13 @@ class MemosMemoryPlugin(Star):
         self.raw_archive_prompt_view_max_chars: int = max(0, min(12000, int(config.get("raw_archive_prompt_view_max_chars", 1200))))
         self.scene_split_enable: bool = bool(config.get("scene_split_enable", True))
         self.scene_split_gap_seconds: float = max(60.0, min(172800.0, float(config.get("scene_split_gap_seconds", 10800))))
-        self.diary_count_max_cap: int = max(1, min(12, int(config.get("diary_count_max_cap", 6))))
+        self.diary_count_max_cap: int = max(1, min(12, int(config.get("diary_count_max_cap", 3))))
+        self.generation_v2_enable = bool(config.get("generation_v2_enable", False))
+        self.generation_v2_mind_enable = bool(config.get("generation_v2_mind_enable", True))
+        self.generation_v2_memos_capabilities_confirmed = bool(config.get("generation_v2_memos_capabilities_confirmed", False))
+        self.generation_v2_job_cap = max(8, min(30, int(config.get("generation_v2_job_cap", 12))))
+        self.generation_v2_claim_audit = bool(config.get("generation_v2_claim_audit", True))
+        self.generation_v2_call_profile = str(config.get("generation_v2_call_profile", "balanced-v1"))
         self.evidence_tier_enable: bool = bool(config.get("evidence_tier_enable", True))
         self.diary_literary_mode: bool = bool(config.get("diary_literary_mode", True))
         self.diary_transcript_check_enable: bool = bool(config.get("diary_transcript_check_enable", True))
@@ -782,9 +876,15 @@ class MemosMemoryPlugin(Star):
         self.query_plan_llm_provider_id: str = str(config.get("query_plan_llm_provider_id", "")).strip()
         self.query_plan_llm_confidence_threshold: float = max(0.1, min(0.95, float(config.get("query_plan_llm_confidence_threshold", 0.5))))
         self.episode_extraction_provider_id: str = str(config.get("episode_extraction_provider_id", "")).strip()
-        self.episode_extraction_timeout: float = max(20.0, float(config.get("episode_extraction_timeout", 120)))
+        # The integrated time-insight service reads this setting from the raw
+        # plugin config. Keep an explicit runtime field as well because the
+        # compensation lane reuses its faster structured provider.
+        self.time_insight_llm_provider_id: str = str(
+            config.get("time_insight_llm_provider_id", "") or ""
+        ).strip()
+        self.episode_extraction_timeout: float = max(20.0, float(config.get("episode_extraction_timeout", 150)))
         self.diary_render_provider_id: str = str(config.get("diary_render_provider_id", "")).strip()
-        self.diary_render_timeout: float = max(20.0, float(config.get("diary_render_timeout", 150)))
+        self.diary_render_timeout: float = max(20.0, float(config.get("diary_render_timeout", 180)))
         self.episodic_auto_migrate: bool = bool(config.get("episodic_auto_migrate", True))
         # v4.5.0: a first turn arriving while the legacy episode bridge is still
         # running waits briefly (shielded) instead of silently falling back to
@@ -806,18 +906,18 @@ class MemosMemoryPlugin(Star):
         # bootstrap/fallback until the first semantic state is ready.
         self.semantic_state_enable: bool = bool(config.get("semantic_state_enable", True))
         self.semantic_state_provider_id: str = str(config.get("semantic_state_provider_id", "")).strip()
-        self.semantic_state_timeout: float = max(20.0, float(config.get("semantic_state_timeout", 120)))
-        self.semantic_state_target_chars: int = max(600, min(6000, int(config.get("semantic_state_target_chars", 1800))))
+        self.semantic_state_timeout: float = max(20.0, float(config.get("semantic_state_timeout", 150)))
+        self.semantic_state_target_chars: int = max(600, min(6000, int(config.get("semantic_state_target_chars", 1200))))
         self.semantic_state_update_policy: str = str(
             config.get("semantic_state_update_policy", "adaptive")
         ).strip().lower() or "adaptive"
         if self.semantic_state_update_policy not in {"adaptive", "every_batch"}:
             self.semantic_state_update_policy = "adaptive"
         self.semantic_state_batch_threshold: int = max(
-            1, min(12, int(config.get("semantic_state_batch_threshold", 3)))
+            1, min(5, int(config.get("semantic_state_batch_threshold", 4)))
         )
         self.semantic_state_max_wait_hours: float = max(
-            1.0, min(720.0, float(config.get("semantic_state_max_wait_hours", 72)))
+            1.0, min(720.0, float(config.get("semantic_state_max_wait_hours", 168)))
         )
         self.semantic_state_significance_threshold: float = max(
             0.35,
@@ -825,13 +925,29 @@ class MemosMemoryPlugin(Star):
         )
         self.semantic_state_merge_max_batches: int = max(
             self.semantic_state_batch_threshold,
-            min(20, int(config.get("semantic_state_merge_max_batches", 6))),
+            min(20, int(config.get("semantic_state_merge_max_batches", 12))),
+        )
+        self.semantic_state_min_interval_hours: float = max(
+            0.0, min(720.0, float(config.get("semantic_state_min_interval_hours", 72)))
+        )
+        self.semantic_state_suppress_after_hours: float = max(
+            24.0, min(2160.0, float(config.get("semantic_state_suppress_after_hours", 168)))
+        )
+        self.semantic_state_noop_similarity: float = max(
+            0.80, min(0.995, float(config.get("semantic_state_noop_similarity", 0.94)))
         )
         self.semantic_state_auto_bootstrap: bool = bool(config.get("semantic_state_auto_bootstrap", True))
         self.semantic_state_bootstrap_episode_limit: int = max(
             20, min(500, int(config.get("semantic_state_bootstrap_episode_limit", 120)))
         )
         self.semantic_state_replace_profile: bool = bool(config.get("semantic_state_replace_profile", True))
+        identity_core_chars = int(config.get("identity_core_inject_chars", 1000))
+        self.identity_core_inject_chars: int = (
+            0 if identity_core_chars <= 0 else max(400, min(2400, identity_core_chars))
+        )
+        self.profile_min_new_evidence: int = max(
+            1, min(100, int(config.get("profile_min_new_evidence", 8)))
+        )
 
         # v4.4: one query vector searches event cards, diary passages and raw
         # source turns. The state document remains a convergent injection layer.
@@ -912,7 +1028,7 @@ class MemosMemoryPlugin(Star):
             1, min(8, int(config.get("eod_checkpoint_min_turns", 1)))
         )
         self.eod_checkpoint_max_diaries: int = max(
-            1, min(12, int(config.get("eod_checkpoint_max_diaries", 6)))
+            1, min(12, int(config.get("eod_checkpoint_max_diaries", 3)))
         )
 
         # 检索
@@ -927,14 +1043,14 @@ class MemosMemoryPlugin(Star):
         self.enable_affiliate_profile: bool = bool(config.get("enable_affiliate_profile", True))
         self.affiliate_profile_max_age_days: int = int(config.get("affiliate_profile_max_age_days", 45))
         self.profile_provider_id: str = str(config.get("profile_provider_id", "")).strip()
-        self.profile_auto_update_days: int = int(config.get("profile_auto_update_days", 14))
+        self.profile_auto_update_days: int = int(config.get("profile_auto_update_days", 30))
         self.profile_recent_persona_limit: int = int(config.get("profile_recent_persona_limit", 120))
         self.profile_anchor_limit: int = int(config.get("profile_anchor_limit", 40))
         self.profile_manual_limit: int = int(config.get("profile_manual_limit", 30))
         self.profile_feedback_limit: int = int(config.get("profile_feedback_limit", 30))
-        self.profile_llm_timeout: float = float(config.get("profile_llm_timeout", 90))
-        self.profile_target_chars: int = int(config.get("profile_target_chars", 2600))
-        self.profile_facts_target_count: int = int(config.get("profile_facts_target_count", 40))
+        self.profile_llm_timeout: float = float(config.get("profile_llm_timeout", 120))
+        self.profile_target_chars: int = int(config.get("profile_target_chars", 1000))
+        self.profile_facts_target_count: int = int(config.get("profile_facts_target_count", 20))
         # v1.7 re-rank
         self.rerank_provider_id: str = str(config.get("rerank_provider_id", "")).strip()
         self.bm25_tokenizer: str = str(config.get("bm25_tokenizer", "jieba")).strip()
@@ -1082,16 +1198,26 @@ class MemosMemoryPlugin(Star):
         self.cache_friendly_system_guard_enable: bool = bool(config.get("cache_friendly_system_guard_enable", True))
         self.cache_prefix_drift_enable: bool = bool(config.get("cache_prefix_drift_enable", True))
 
-        # v5.0 test0: non-destructive forgetting observes the complete 4.6
-        # candidate pool. Shadow mode is intentionally the default: it records
-        # access-state decisions without changing the proven injection path.
+        # v5.1: ACCESS preserves the proven baseline and may append a bounded
+        # temporal/rescue supplement. The 6.0 context layer remains Shadow.
         self.memory_forgetting_enable: bool = bool(config.get("memory_forgetting_enable", True))
-        # 5.0.0-test0 is deliberately observation-only. The setting is kept in
-        # persisted config so a later release can activate the proven policy
-        # without changing the configuration contract.
-        self.memory_forgetting_shadow_mode: bool = True
+        configured_route_mode = str(
+            config.get("memory_access_route_mode", "supplement")
+        ).strip().lower()
+        self.memory_access_route_mode: str = (
+            configured_route_mode
+            if configured_route_mode in {"shadow", "supplement"}
+            else "supplement"
+        )
+        self.memory_forgetting_shadow_mode: bool = self.memory_access_route_mode == "shadow"
         self.memory_access_decay_enable: bool = bool(config.get("memory_access_decay_enable", True))
         self.memory_access_deep_rescue_enable: bool = bool(config.get("memory_access_deep_rescue_enable", True))
+        self.memory_access_independent_cue_rescue: bool = bool(
+            config.get("memory_access_independent_cue_rescue", True)
+        )
+        self.memory_access_rescue_candidate_limit: int = max(
+            2, min(50, int(config.get("memory_access_rescue_candidate_limit", 12)))
+        )
         self.memory_interference_enable: bool = bool(config.get("memory_interference_enable", True))
         self.memory_reconsolidation_enable: bool = bool(config.get("memory_reconsolidation_enable", True))
         self.memory_psychological_bias_enable: bool = bool(config.get("memory_psychological_bias_enable", True))
@@ -1120,6 +1246,134 @@ class MemosMemoryPlugin(Star):
         self.memory_access_event_keep: int = max(
             200, min(50000, int(config.get("memory_access_event_keep", 4000)))
         )
+        self.memory_access_observation_keep: int = max(
+            200, min(50000, int(config.get("memory_access_observation_keep", 5000)))
+        )
+        self.memory_access_observation_query_max_chars: int = max(
+            200, min(8000, int(config.get("memory_access_observation_query_max_chars", 2000)))
+        )
+        self.memory_access_export_keep: int = max(
+            1, min(100, int(config.get("memory_access_export_keep", 10)))
+        )
+        default_access_export_dir = str(
+            Path(self.episodic_db_path).expanduser().parent / "access_exports"
+        )
+        self.memory_access_export_dir: str = str(
+            config.get("memory_access_export_dir", default_access_export_dir)
+        ).strip() or default_access_export_dir
+        self._access_export = AccessAnalysisExporter(
+            self.memory_access_export_dir, keep=self.memory_access_export_keep,
+        )
+        self.memory_access_cue_grade_b_rarity_min: float = max(
+            0.05, min(0.95, float(config.get("memory_access_cue_grade_b_rarity_min", 0.30)))
+        )
+        self.memory_access_same_day_gap_threshold: float = max(
+            0.0, min(1.0, float(config.get("memory_access_same_day_gap_threshold", 0.15)))
+        )
+        self.memory_access_state_confirmation_runs: int = max(
+            1, min(10, int(config.get("memory_access_state_confirmation_runs", 2)))
+        )
+        self.memory_access_source_proxy_weight: float = max(
+            0.0, min(1.0, float(config.get("memory_access_source_proxy_weight", 0.45)))
+        )
+        self.memory_access_supplement_max: int = max(
+            0, min(2, int(config.get("memory_access_supplement_max", 2)))
+        )
+        self.memory_access_supplement_temporal_max: int = max(
+            0, min(1, int(config.get("memory_access_supplement_temporal_max", 1)))
+        )
+        self.memory_access_supplement_rescue_max: int = max(
+            0, min(1, int(config.get("memory_access_supplement_rescue_max", 1)))
+        )
+        self.memory_access_supplement_temporal_threshold: float = max(
+            0.35, min(0.95, float(config.get("memory_access_supplement_temporal_threshold", 0.56)))
+        )
+        self.memory_access_supplement_rescue_threshold: float = max(
+            0.35, min(0.95, float(config.get("memory_access_supplement_rescue_threshold", 0.62)))
+        )
+        self.memory_access_supplement_source_bonus: float = max(
+            0.0, min(0.15, float(config.get("memory_access_supplement_source_bonus", 0.08)))
+        )
+        self.memory_access_supplement_allow_diary_derived: bool = bool(
+            config.get("memory_access_supplement_allow_diary_derived", True)
+        )
+        self.memory_access_supplement_holdout_percent: int = max(
+            0, min(50, int(config.get("memory_access_supplement_holdout_percent", 0)))
+        )
+        # Compatibility aliases describe the supplement route. They no longer
+        # allow replacement or reordering of the mature baseline.
+        self.memory_access_takeover_enable: bool = self.memory_access_route_mode == "supplement"
+        self.memory_access_takeover_max_appends: int = self.memory_access_supplement_max
+        self.memory_access_takeover_min_grade: str = "C"
+        self.memory_access_takeover_source_lexical_min: float = max(
+            0.20, min(0.90, float(config.get("memory_access_takeover_source_lexical_min", 0.34)))
+        )
+        self.memory_access_takeover_breaker_threshold: int = max(1, min(20, int(
+            config.get(
+                "memory_access_supplement_breaker_threshold",
+                config.get("memory_access_takeover_breaker_threshold", 3),
+            )
+        )))
+        self.memory_access_takeover_min_eval_cases: int = max(5, min(500, int(config.get("memory_access_takeover_min_eval_cases", 30))))
+        self.memory_access_takeover_source_min_eval_cases: int = max(
+            3, min(100, int(config.get("memory_access_takeover_source_min_eval_cases", 5)))
+        )
+        self.memory_access_eval_max_age_days: int = max(1, min(90, int(config.get("memory_access_eval_max_age_days", 7))))
+        self.memory_access_auto_eval_case_limit: int = max(
+            20, min(500, int(config.get("memory_access_auto_eval_case_limit", 80)))
+        )
+        # ── 6.0 thread-memory config ────────────────────────────────────────
+        self.thread_subgraph_nodes: int = max(3, min(7, int(config.get("thread_subgraph_nodes", 5))))
+        self.thread_evolution_nodes: int = max(3, min(7, int(config.get("thread_evolution_nodes", 7))))
+        self.thread_memory_enable: bool = bool(config.get("thread_memory_enable", True))
+        self.thread_mode: str = str(config.get("thread_mode", "shadow")).strip().lower()
+        if self.thread_mode not in {"shadow", "canary"}:
+            self.thread_mode = "shadow"
+        self.thread_canary_percent: int = max(0, min(100, int(config.get("thread_canary_percent", 10))))
+        self.thread_canary_seed: str = str(config.get("thread_canary_seed", "memos-memory-6")).strip() or "memos-memory-6"
+        self.thread_canary_allowlist: str = str(config.get("thread_canary_allowlist", "")).strip()
+        self.thread_canary_denylist: str = str(config.get("thread_canary_denylist", "")).strip()
+        self.thread_canary_max_chars: int = max(320, min(6000, int(config.get("thread_canary_max_chars", 1200))))
+        self.thread_canary_growth_percent: float = max(
+            1.0, min(30.0, float(config.get("thread_canary_growth_percent", 10.0)))
+        )
+        self.thread_canary_timeout_ms: int = max(50, min(3000, int(config.get("thread_canary_timeout_ms", 300))))
+        self.thread_canary_require_current_time: bool = bool(config.get("thread_canary_require_current_time", True))
+        self.thread_prospective_cooldown_seconds: float = max(
+            0.0, min(604800.0, float(config.get("thread_prospective_cooldown_seconds", 86400.0)))
+        )
+        self.thread_worker_enable: bool = bool(config.get("thread_worker_enable", True))
+        self.thread_observation_retention_days: int = max(
+            7, min(3650, int(config.get("thread_observation_retention_days", 180)))
+        )
+        self.thread_worker_batch_size: int = max(1, min(100, int(config.get("thread_worker_batch_size", 10))))
+        self.thread_worker_interval_seconds: int = max(60, min(86400, int(config.get("thread_worker_interval_seconds", 300))))
+        self.thread_worker_max_retries: int = max(0, min(20, int(config.get("thread_worker_max_retries", 3))))
+        self.thread_migration_read_only: bool = bool(config.get("thread_migration_read_only", True))
+        self.thread_llm_arbitration_enable: bool = bool(config.get("thread_llm_arbitration_enable", True))
+        self.thread_llm_provider_id: str = str(config.get("thread_llm_provider_id", "")).strip()
+        self.thread_llm_timeout: float = max(10.0, min(180.0, float(config.get("thread_llm_timeout", 60))))
+        self.thread_llm_batch_size: int = max(1, min(12, int(config.get("thread_llm_batch_size", 4))))
+        self.thread_llm_max_input_chars: int = max(2000, min(50000, int(config.get("thread_llm_max_input_chars", 12000))))
+        self.thread_llm_daily_budget: int = max(0, min(1000, int(config.get("thread_llm_daily_budget", 40))))
+        self.thread_llm_max_retries: int = max(0, min(5, int(config.get("thread_llm_max_retries", 2))))
+        self.thread_projection_enable: bool = bool(config.get("thread_projection_enable", True))
+        self.thread_projection_min_confidence: float = max(
+            0.5, min(0.99, float(config.get("thread_projection_min_confidence", 0.84)))
+        )
+        self.thread_claim_enable: bool = bool(config.get("thread_claim_enable", True))
+        self.thread_prospective_enable: bool = bool(config.get("thread_prospective_enable", True))
+        self.thread_retrieval_lab_enable: bool = bool(config.get("thread_retrieval_lab_enable", True))
+        # test8 consistency guard is observational and fail-open by default.
+        self.consistency_mode: str = str(config.get("consistency_mode", "shadow") or "shadow").strip().lower()
+        if self.consistency_mode not in {"off", "shadow"}:
+            self.consistency_mode = "shadow"
+        self.consistency_queue_capacity: int = max(1, min(4096, int(config.get("consistency_queue_capacity", 64) or 64)))
+        self.consistency_timeout: float = max(0.01, min(30.0, float(config.get("consistency_timeout", 0.25) or 0.25)))
+        self.consistency_ttl: float = max(1.0, min(86400.0, float(config.get("consistency_ttl", 900.0) or 900.0)))
+        self.consistency_llm_enable: bool = bool(config.get("consistency_llm_enable", False))
+        self.consistency_llm_provider_id: str = str(config.get("consistency_llm_provider_id", "") or "").strip()
+        self._thread_build_task: "asyncio.Task[None] | None" = None
 
         # 内部状态
         self._memos: MemosClient | None = None
@@ -1138,6 +1392,7 @@ class MemosMemoryPlugin(Star):
         self._emb_model_id: str | None = None
         self._buffer: dict[str, list[dict[str, Any]]] = {}
         self._buffer_last_turn: dict[str, int] = {}
+        self._consistency_response_buffers: dict[str, dict[str, Any]] = {}
         self._initialized: bool = False
         self._init_error: str | None = None
         # v4.5.0: serialize lazy init so a burst of first-turn requests cannot
@@ -1159,6 +1414,7 @@ class MemosMemoryPlugin(Star):
         # v1.4.4: 环形事件日志(WebUI /console 用)
         self._deque_factory = deque
         self._last_injection_stats: list[dict[str, Any]] = []
+        self._llm_call_events: list[dict[str, Any]] = []
         self._telemetry_lock = threading.RLock()
         self._telemetry_dirty = False
         self._telemetry_last_save = 0.0
@@ -1185,10 +1441,16 @@ class MemosMemoryPlugin(Star):
         self._source_turn_vector_migration_state: dict[str, Any] = {"status": "pending"}
         self._semantic_state_task = None
         self._memory_access_task = None
+        self._memory_access_dirty_event: asyncio.Event | None = None
         self._memory_access_state: dict[str, Any] = {"status": "pending"}
+        self._memory_access_fail_open: dict[str, Any] = {
+            "count": 0, "last_reason": "", "last_stage": "", "last_ts": 0.0,
+        }
         self._semantic_state_lock = asyncio.Lock()
         self._semantic_state_pending_tasks: set[asyncio.Task] = set()
         self._semantic_state_last_defer_key = ""
+        self._semantic_state_reschedule_needed = False
+        self._terminating = False
         self._episode_migration_ready: bool = False
         self._episode_migration_state: dict[str, Any] = {"status": "pending"}
         self._last_reconcile_ts: float = 0.0
@@ -1205,9 +1467,21 @@ class MemosMemoryPlugin(Star):
         self._prefix_cache_stats: dict[str, Any] = {}
         self._prefix_last_snapshot: dict[str, Any] = {}
         self._last_request_ts: dict[str, float] = {}
+        self._llm_runtime = PluginLLMRuntime(
+            provider_concurrency=self.llm_runtime_provider_concurrency,
+            external_concurrency=self.llm_runtime_external_concurrency,
+            interactive_queue_timeout=self.llm_runtime_interactive_queue_timeout,
+            foreground_lease_seconds=self.llm_runtime_foreground_lease_seconds,
+            defer_background_during_foreground=self.llm_runtime_defer_background,
+            telemetry_callback=self._record_llm_call,
+        )
         self._managed_memos = ManagedMemosSidecar(self)
         self.time_enhancer = TimeEnhancer(self.rp_time_timezone) if TimeEnhancer is not None else None
         self._xinchao = XinchaoController(
+            self,
+            Path(self.vec_db_path).expanduser().resolve().parent,
+        )
+        self._house = HouseService(
             self,
             Path(self.vec_db_path).expanduser().resolve().parent,
         )
@@ -1216,9 +1490,19 @@ class MemosMemoryPlugin(Star):
             vec_db_path=self.vec_db_path,
             episodic_db_path=self.episodic_db_path,
             plugin_version=_PLUGIN_VERSION,
+            house_db_path=str(self._house.store.path),
+            runtime_state_dir=str(self.runtime_state_dir),
             interval_days=self.data_backup_interval_days,
             keep=self.data_backup_keep,
             enabled=self.data_backup_enable,
+            metadata={
+                "schema_version": _PLUGIN_VERSION,
+                "builder_version": "rc1-v1",
+                "policy_version": "rc1-policy-v1",
+                "thread_memory_enable": self.thread_memory_enable,
+                "thread_mode": self.thread_mode,
+                "thread_canary_percent": self.thread_canary_percent,
+            },
         )
         self._time_insight = IntegratedTimeInsightService(self)
         # v1.3 WebUI
@@ -1315,6 +1599,13 @@ class MemosMemoryPlugin(Star):
                     self.episodic_db_path,
                     self._emb_dim,
                     self._emb_model_id,
+                    consistency_mode=self.consistency_mode,
+                    consistency_queue_capacity=self.consistency_queue_capacity,
+                    consistency_timeout=self.consistency_timeout,
+                    consistency_ttl=self.consistency_ttl,
+                    consistency_llm_enable=self.consistency_llm_enable,
+                    consistency_llm=self._consistency_llm_review,
+                    consistency_loop=asyncio.get_running_loop(),
                 )
                 self._episodes._snapshot_keep = self.db_snapshot_keep
                 self._episodes._preview_keep = 20
@@ -1407,7 +1698,10 @@ class MemosMemoryPlugin(Star):
             if self._episodes is not None and self.semantic_state_enable:
                 self._semantic_state_task = asyncio.create_task(self._semantic_state_maintenance_loop())
             if self._episodes is not None and self.memory_forgetting_enable:
+                self._memory_access_dirty_event = asyncio.Event()
                 self._memory_access_task = asyncio.create_task(self._memory_access_maintenance_loop())
+            if self.thread_memory_enable and self.thread_worker_enable and self._episodes is not None:
+                self._thread_build_task = asyncio.create_task(self._thread_build_loop())
 
             # 启动后台对账任务(v1.3)
             if self.enable_auto_reconcile and self.reconcile_interval > 0:
@@ -1418,10 +1712,12 @@ class MemosMemoryPlugin(Star):
                 self.enable_affiliate_profile
                 and self.profile_auto_update_days > 0
                 and self._profile_task is None
-                and not (self.semantic_state_enable and self.semantic_state_replace_profile)
             ):
                 self._profile_task = asyncio.create_task(self._profile_auto_loop())
-                logger.info("[memos-memory] 内置画像自动更新已启动,间隔 %d 天", self.profile_auto_update_days)
+                logger.info(
+                    "[memos-memory] 长期人格内核维护已启动,最短间隔 %d 天,新增证据门槛 %d 条",
+                    max(30, self.profile_auto_update_days), self.profile_min_new_evidence,
+                )
 
             # 启动 WebUI(v1.3):独立端口,失败不阻塞插件初始化
             try:
@@ -1437,186 +1733,6 @@ class MemosMemoryPlugin(Star):
 
     # ---------- 5.0 non-destructive memory accessibility ----------
 
-    def _memory_access_config(self) -> dict[str, Any]:
-        return {
-            "enable": self.memory_forgetting_enable,
-            "shadow_mode": self.memory_forgetting_shadow_mode,
-            "decay_enable": self.memory_access_decay_enable,
-            "deep_rescue_enable": self.memory_access_deep_rescue_enable,
-            "interference_enable": self.memory_interference_enable,
-            "reconsolidation_enable": self.memory_reconsolidation_enable,
-            "psychological_bias_enable": self.memory_psychological_bias_enable,
-            "psychological_bias_strength": self.memory_psychological_bias_strength,
-            "vivid_threshold": self.memory_access_vivid_threshold,
-            "deep_threshold": self.memory_access_deep_threshold,
-            "decay_days": self.memory_access_decay_days,
-            "exact_cue_relief": self.memory_access_exact_cue_relief,
-            "max_neighbors": self.memory_access_max_neighbors,
-            "event_keep": self.memory_access_event_keep,
-        }
-
-    def _all_episode_records(self) -> list[dict[str, Any]]:
-        if self._episodes is None:
-            return []
-        output: list[dict[str, Any]] = []
-        offset = 0
-        while True:
-            rows = self._episodes.list_episodes(limit=500, offset=offset)
-            output.extend(rows)
-            if len(rows) < 500:
-                break
-            offset += len(rows)
-        return output
-
-    async def _memory_access_rebuild(self, reason: str = "manual") -> dict[str, Any]:
-        if self._episodes is None:
-            return {"updated": 0, "reason": "episode_store_unavailable"}
-        episodes = self._all_episode_records()
-        result = await asyncio.to_thread(
-            self._episodes.rebuild_memory_access,
-            episodes,
-            config=self._memory_access_config(),
-            reason=reason,
-        )
-        self._memory_access_state = {
-            "status": "ready", "updated_ts": time.time(), "reason": reason, **result,
-        }
-        self._log_event(
-            "access",
-            f"可达性派生层已重建: {result.get('updated', 0)} 条 / {result.get('edges', 0)} 条干扰边",
-            self._memory_access_state,
-        )
-        return result
-
-    async def _memory_access_maintenance_loop(self) -> None:
-        try:
-            migration = self._episode_migration_task
-            if migration is not None:
-                try:
-                    await asyncio.shield(migration)
-                except Exception as exc:
-                    logger.warning("[memos-memory][access] episode bridge incomplete; rebuilding current rows: %s", exc)
-            await self._memory_access_rebuild("startup_backfill")
-            while True:
-                await asyncio.sleep(max(3600, self.memory_access_maintenance_hours * 3600))
-                if self._episodes is None:
-                    continue
-                try:
-                    result = await asyncio.to_thread(
-                        self._episodes.maintain_memory_access,
-                        config=self._memory_access_config(),
-                        reason="scheduled",
-                    )
-                    self._memory_access_state = {
-                        "status": "ready", "updated_ts": time.time(),
-                        "reason": "scheduled", **result,
-                    }
-                except Exception as exc:
-                    self._memory_access_state = {
-                        "status": "failed_open", "updated_ts": time.time(), "error": str(exc)[:300],
-                    }
-                    logger.warning("[memos-memory][access] maintenance failed open: %s", exc)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            self._memory_access_state = {
-                "status": "failed_open", "updated_ts": time.time(), "error": str(exc)[:300],
-            }
-            logger.warning("[memos-memory][access] bootstrap failed open; 4.6 recall remains active: %s", exc)
-
-    @staticmethod
-    def _memory_access_psychological_bias(event: AstrMessageEvent) -> float:
-        try:
-            appraisal = event.get_extra("xinchao_live_appraisal", {}) or {}
-        except Exception:
-            appraisal = {}
-        if not isinstance(appraisal, dict):
-            return 0.0
-        levels = appraisal.get("activationLevels") or {}
-        if not isinstance(levels, dict):
-            return 0.0
-        values = []
-        for value in levels.values():
-            try:
-                values.append(float(value))
-            except (TypeError, ValueError):
-                continue
-        # This is only a bounded salience hint in test0. It cannot veto or
-        # rescue a memory by itself and remains observational in Shadow mode.
-        return max(0.0, min(1.0, max(values or [0.0]))) * 0.05
-
-    def _evaluate_memory_access_shadow(
-        self,
-        event: AstrMessageEvent,
-        query: str,
-        candidates: list[dict[str, Any]],
-        selected_hits: list[dict[str, Any]],
-        request_stat: dict[str, Any],
-    ) -> dict[str, Any]:
-        if not self.memory_forgetting_enable or self._episodes is None:
-            return {"enabled": False, "shadow": True, "reason": "disabled_or_unavailable"}
-        try:
-            selected_names = [
-                str(item.get("memo_name") or "") for item in selected_hits
-                if str(item.get("memo_name") or "")
-            ]
-            result = self._episodes.evaluate_memory_access(
-                query=query,
-                candidates=candidates,
-                selected_names=selected_names,
-                request_id=str(request_stat.get("request_id") or ""),
-                config=self._memory_access_config(),
-                psychological_bias=(
-                    self._memory_access_psychological_bias(event)
-                    if self.memory_psychological_bias_enable else 0.0
-                ),
-                record=True,
-            )
-            self._log_event(
-                "access",
-                (
-                    f"Shadow 对照: candidates={result.get('candidate_count', 0)} "
-                    f"selected={result.get('selected_count', 0)} deep_rescue={result.get('deep_rescue_count', 0)} "
-                    f"would_change={bool(result.get('would_change'))}"
-                ),
-                {key: value for key, value in result.items() if key != "items"},
-            )
-            return result
-        except Exception as exc:
-            logger.warning("[memos-memory][access] request evaluation failed open: %s", exc)
-            return {"enabled": True, "shadow": True, "failed_open": True, "error": str(exc)[:300]}
-
-    def _record_memory_access_response(self, event: AstrMessageEvent, response_text: str) -> None:
-        if not self.memory_forgetting_enable or self._episodes is None or not response_text:
-            return
-        try:
-            request_id = str(event.get_extra("memos_memory_request_id", "") or "")
-        except Exception:
-            request_id = ""
-        if not request_id:
-            return
-        stat = next((
-            item for item in reversed(self._last_injection_stats)
-            if str(item.get("request_id") or "") == request_id
-        ), None)
-        if not stat:
-            return
-        memo_names = [str(item) for item in stat.get("memos") or [] if str(item)]
-        if not memo_names:
-            return
-        try:
-            result = self._episodes.record_memory_response_use(
-                request_id=request_id,
-                response_text=response_text,
-                memo_names=memo_names,
-                shadow=self.memory_forgetting_shadow_mode,
-                reconsolidate=self.memory_reconsolidation_enable,
-                event_keep=self.memory_access_event_keep,
-            )
-            stat["memory_access_response"] = result
-            self._remember_injection_stats(stat)
-        except Exception as exc:
-            logger.debug("[memos-memory][access] response observation failed open: %s", exc)
 
     # ---------- 工具 ----------
     @staticmethod
@@ -1706,6 +1822,7 @@ class MemosMemoryPlugin(Star):
             payload = json.loads(path.read_text(encoding="utf-8"))
             events = payload.get("events", []) if isinstance(payload, dict) else []
             stats = payload.get("injection_stats", []) if isinstance(payload, dict) else []
+            calls = payload.get("llm_calls", []) if isinstance(payload, dict) else []
             if isinstance(events, list):
                 self._log_events = [x for x in events if isinstance(x, dict)][-self._log_max:]
             if isinstance(stats, list):
@@ -1714,6 +1831,8 @@ class MemosMemoryPlugin(Star):
                     session = str(stat.get("session") or "").strip()
                     if session:
                         self._seen_context_sessions.add(session)
+            if isinstance(calls, list):
+                self._llm_call_events = [x for x in calls if isinstance(x, dict)][-2000:]
         except Exception as exc:
             logger.debug("[memos-memory] runtime telemetry restore failed: %s", exc)
 
@@ -1731,6 +1850,7 @@ class MemosMemoryPlugin(Star):
                     "saved_ts": now,
                     "events": self._log_events[-self._log_max:],
                     "injection_stats": self._last_injection_stats[-120:],
+                    "llm_calls": self._llm_call_events[-2000:],
                 }
                 temp_path = path.with_suffix(path.suffix + ".tmp")
                 temp_path.write_text(
@@ -1742,6 +1862,15 @@ class MemosMemoryPlugin(Star):
                 self._telemetry_last_save = now
         except Exception as exc:
             logger.debug("[memos-memory] runtime telemetry persist failed: %s", exc)
+
+    def _record_llm_call(self, sample: dict[str, Any]) -> None:
+        # Only metadata and bounded error categories are stored, never prompts
+        # or provider credentials. This also survives plugin reloads.
+        self._llm_call_events.append(dict(sample))
+        if len(self._llm_call_events) > 2000:
+            self._llm_call_events = self._llm_call_events[-2000:]
+        self._telemetry_dirty = True
+        self._save_runtime_telemetry()
 
     def _log_event(self, category: str, message: str, detail: dict | None = None) -> None:
         """记录一条行为日志。环形缓存,最多 _log_max 条。category: enhancer/compress/recall/inject/sync/system。"""
@@ -2338,9 +2467,118 @@ class MemosMemoryPlugin(Star):
             "preview": "",
         }
 
+    def _record_request_observation(self, request_id: str, **fields: Any) -> None:
+        """Persist request-local evidence without ever affecting the request path."""
+        try:
+            service = (
+                getattr(self._episodes, "consistency_service", None)
+                if self._episodes is not None else None
+            )
+            if service is not None and request_id:
+                service.submit_observation({"request_id": request_id, **fields})
+        except Exception as exc:
+            logger.debug("[memos-memory] request observation failed open: %s", exc)
+
+    def _submit_consistency_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Queue a frozen request snapshot without delaying or changing the request."""
+        try:
+            service = getattr(self._episodes, "consistency_service", None) if self._episodes is not None else None
+            if service is not None:
+                service.submit_snapshot(snapshot)
+        except Exception as exc:
+            logger.debug("[memos-memory] consistency snapshot failed open: %s", exc)
+
+    def _consistency_response_text(
+        self,
+        request_id: str,
+        text: str,
+        *,
+        is_chunk: bool,
+    ) -> str:
+        """Assemble bounded cumulative or delta chunks for the final guard pass."""
+        now = time.monotonic()
+        buffers = self._consistency_response_buffers
+        for key, item in list(buffers.items()):
+            if now - float(item.get("ts") or now) > 900.0:
+                buffers.pop(key, None)
+        while len(buffers) >= 128 and request_id not in buffers:
+            oldest = min(
+                buffers,
+                key=lambda key: float(buffers[key].get("ts") or now),
+            )
+            buffers.pop(oldest, None)
+        clean = str(text or "")
+        if is_chunk:
+            previous = str((buffers.get(request_id) or {}).get("text") or "")
+            if clean:
+                if clean.startswith(previous):
+                    assembled = clean
+                elif previous.endswith(clean):
+                    assembled = previous
+                else:
+                    assembled = previous + clean
+                assembled = assembled[:12000]
+                buffers[request_id] = {
+                    "text": assembled,
+                    "ts": now,
+                }
+                return assembled
+            return previous
+        buffered = str((buffers.pop(request_id, None) or {}).get("text") or "")
+        return clean or buffered
+
+    async def _consistency_llm_review(self, payload: dict[str, Any], candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Optional review on AstrBot's active event loop; never invent evidence."""
+        provider = None
+        try:
+            if self.consistency_llm_provider_id:
+                provider = self._resolve_chat_provider(self.consistency_llm_provider_id)
+            if provider is None:
+                provider = self._resolve_thread_llm_provider()
+            if provider is None:
+                return []
+            prompt = json.dumps({"candidates": candidates}, ensure_ascii=False)
+            response = await self._plugin_llm_text_chat(
+                provider, prompt=prompt, contexts=[], system_prompt=(
+                    '审核回答片段是否与已注入证据直接冲突。仅输出JSON：'
+                    '{"decisions":[{"candidate":0,"verdict":"conflict或uncertain或compatible",'
+                    '"response_quote":"回答中的原句","confidence":0.8}]}。'
+                    '历史引用、假设、梦境、不确定事实不能判错；证据不足输出uncertain。'
+                ), timeout=self.consistency_timeout, label="thread_consistency", optional=True,
+                lane="background_state", task_family="thread_consistency",
+            )
+            return validate_arbitration(
+                str(getattr(response, "completion_text", "") or ""), candidates,
+                str(payload.get("answer") or payload.get("response_text") or ""),
+            )
+        except Exception:
+            return []
+
     def _finish_request_injection_stat(self, stat: dict[str, Any], outcome: str) -> None:
         stat["outcome"] = outcome
         stat["duration_ms"] = round(max(0.0, time.time() - float(stat.get("ts") or time.time())) * 1000, 1)
+        request_id = str(stat.get("request_id") or "")
+        if request_id:
+            self._record_request_observation(
+                request_id,
+                scope_id=str(self.character_name or "default"),
+                query_text=str(stat.get("query_text") or "")[:1000],
+                evidence_json="[]",
+                append_status=str(outcome),
+                snapshot_complete=1,
+                thread_used=0,
+                response_status="pending",
+            )
+            self._submit_consistency_snapshot({
+                "request_id": request_id,
+                "scope_id": str(self.character_name or "default"),
+                "query": str(stat.get("query_text") or "")[:1000],
+                "query_text": str(stat.get("query_text") or "")[:1000],
+                "references": [],
+                "thread_text": "",
+                "snapshot_complete": True,
+                "thread_used": False,
+            })
         self._remember_injection_stats(stat)
 
     def _extract_cache_token_usage(self, response: LLMResponse) -> dict[str, int]:
@@ -2613,7 +2851,7 @@ class MemosMemoryPlugin(Star):
                 # Provider adapters are inconsistent: some methods are async, others
                 # perform blocking HTTP before returning. Invoke the factory off-loop
                 # when requested, then await any returned coroutine on AstrBot's task.
-                result = await asyncio.to_thread(coro_factory) if offload_thread else coro_factory()
+                result = await self._run_background_work(coro_factory) if offload_thread else coro_factory()
                 if hasattr(result, "__await__"):
                     aw = result
                 else:
@@ -2624,6 +2862,10 @@ class MemosMemoryPlugin(Star):
             except asyncio.TimeoutError as e:
                 last_exc = e
                 logger.warning("[memos-memory] %s timeout after %.1fs", what, timeout or 0)
+                break
+            except LLMCircuitOpenError as e:
+                last_exc = e
+                logger.info("[memos-memory] %s skipped: %s", what, e)
                 break
             except Exception as e:
                 last_exc = e
@@ -2636,6 +2878,1281 @@ class MemosMemoryPlugin(Star):
                     logger.warning("[memos-memory] %s 重试 %d 次仍失败: %s", what, self.retry_max, e)
         if last_exc:
             raise last_exc
+
+    async def _plugin_llm_text_chat(
+        self,
+        provider: Any,
+        *,
+        prompt: str,
+        contexts: list[Any] | None = None,
+        system_prompt: str = "",
+        timeout: float | None = None,
+        label: str = "plugin_llm",
+        optional: bool = False,
+        lane: str = "",
+        task_family: str = "",
+        queue_timeout: float | None = None,
+        allow_followup: bool = True,
+        enqueue_compensation: bool = True,
+    ) -> Any:
+        """Run one visible Astr retry for transport errors, then optional API follow-up."""
+        if label.startswith('xinchao_') and getattr(self,'generation_v2_mind_enable',False):
+            from .generation_v2.mind_gateway import call as scheduled_mind_call
+            return await scheduled_mind_call(self,provider,prompt=prompt,contexts=contexts,
+                system_prompt=system_prompt,timeout=timeout,label=label,
+                allow_followup=allow_followup and not _ACTIVE_PRELIMINARY_LLM_ROUTE.get())
+        if _ACTIVE_COMPENSATION_REPLAY.get():
+            enqueue_compensation = False
+        if _ACTIVE_PRELIMINARY_LLM_ROUTE.get():
+            allow_followup = False
+            enqueue_compensation = False
+        from .call_policy import resolve as resolve_call_policy
+        call_policy = resolve_call_policy(getattr(getattr(self, '_external_models', None),
+            'task_call_policies', {}), label)
+        kwargs = dict(
+            prompt=prompt, contexts=contexts, system_prompt=system_prompt,
+            timeout=timeout, label=label, optional=optional, lane=lane,
+            task_family=task_family, queue_timeout=queue_timeout,
+            request_max_retries=0,
+            call_policy=call_policy,
+        )
+        primary_errors: list[BaseException] = []
+        try:
+            return await self._llm_runtime.call(provider, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception as primary_error:
+            primary_errors.append(primary_error)
+            primary_kind = self._llm_runtime._error_kind(primary_error)
+            provider_key = self._llm_runtime.provider_key(provider) if provider is not None else ""
+            if primary_kind == "transport" and provider is not None and not provider_key.startswith(
+                ("external:", "direct:")
+            ):
+                retry_ceiling = (
+                    30.0 if _ACTIVE_PRELIMINARY_LLM_ROUTE.get() else 60.0
+                )
+                retry_timeout = min(
+                    retry_ceiling, max(10.0, float(timeout or 120.0))
+                )
+                logger.warning(
+                    "[memos-memory][llm] task=%s Astr transport failed; retry once timeout=%.1fs",
+                    label, retry_timeout,
+                )
+                await asyncio.sleep(0.35)
+                try:
+                    retry_kwargs = {
+                        **kwargs,
+                        "timeout": retry_timeout,
+                        "label": label + "_transport_retry",
+                    }
+                    return await self._llm_runtime.call(provider, **retry_kwargs)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as retry_error:
+                    primary_errors.append(retry_error)
+                    primary_error = retry_error
+
+            registry = getattr(self, "_external_models", None)
+            from .model_tasks import task_key
+            route_key = task_key(label)
+            family = str(task_family or self._llm_runtime._task_family(label))
+            kind = self._llm_runtime._error_kind(primary_error)
+            eligible_failure = kind in {"timeout", "queue_timeout", "transport", "rate_limit"}
+            if not eligible_failure:
+                raise
+            followup = None
+            if (
+                allow_followup
+                and
+                registry is not None and not registry.enabled and provider is not None
+                and not self._llm_runtime.provider_key(provider).startswith(("external:", "direct:"))
+            ):
+                followup = registry.followup_provider(route_key if route_key in getattr(registry,'astr_followup_models',{}) else family)
+            fallback_error: BaseException | None = None
+            if followup is not None:
+                followup_timeout = registry.astr_followup_timeout
+                try:
+                    response = await self._llm_runtime.call(
+                        followup, **{**kwargs, "timeout": followup_timeout,
+                                     "label": label + "_astr_followup", "queue_timeout": None}
+                    )
+                    self._log_event("system", "Astr 模型故障后 API 跟接成功", {
+                        "task": label, "family": family, "model": followup.provider_id,
+                        "primary_failure": kind,
+                        "astr_attempts": len(primary_errors),
+                    })
+                    return response
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    fallback_error = exc
+
+            configured_for_followup = bool(
+                registry is not None and (
+                    bool(getattr(registry, 'astr_followup_models', {}).get(
+                        route_key, getattr(registry, 'astr_followup_models', {}).get(
+                            family, family in registry.astr_followup_tasks
+                        )
+                    ))
+                )
+            )
+            should_compensate = family == "memory_generation" or configured_for_followup
+            record_id = ""
+            if (
+                enqueue_compensation and should_compensate
+                and getattr(self, "_llm_compensation", None) is not None
+            ):
+                request = {
+                    "prompt": prompt, "contexts": contexts or [],
+                    "system_prompt": system_prompt,
+                    "timeout": float(timeout or 0), "optional": optional,
+                    "lane": lane, "task_family": family,
+                    "source_batch_id": _ACTIVE_SOURCE_BATCH.get(),
+                }
+                record_id = self._llm_compensation.enqueue(
+                    task=family, label=label,
+                    source_batch_id=_ACTIVE_SOURCE_BATCH.get(),
+                    primary_error=" | ".join(
+                        f"{type(exc).__name__}: {exc}" for exc in primary_errors
+                    ),
+                    fallback_error=(
+                        f"{type(fallback_error).__name__}: {fallback_error}"
+                        if fallback_error is not None else "followup_disabled_or_unavailable"
+                    ),
+                    request=request,
+                )
+                self._log_event("system", "模型路线失败，已保留补偿请求", {
+                    "request_id": record_id, "task": label,
+                    "source_batch_id": _ACTIVE_SOURCE_BATCH.get(),
+                    "astr_attempts": len(primary_errors),
+                    "followup_attempted": fallback_error is not None,
+                })
+            if not should_compensate or not enqueue_compensation:
+                raise primary_error
+            route_text = "Astr/API 两路调用失败" if followup is not None else "Astr 调用失败且未启用可用跟接"
+            raise LLMRouteExhaustedError(
+                route_text + (f"，补偿单 {record_id}" if record_id else ""),
+                failure_kind=kind,
+                record_id=record_id,
+            ) from (fallback_error or primary_error)
+
+    def _compensation_progress(
+        self,
+        record_id: str,
+        stage: str,
+        *,
+        current: int = 0,
+        total: int = 0,
+        percent: float | None = None,
+        message: str = "",
+    ) -> None:
+        store = getattr(self, "_llm_compensation", None)
+        if store is not None:
+            store.progress(
+                record_id,
+                stage=stage,
+                current=current,
+                total=total,
+                percent=percent,
+                message=message,
+            )
+
+    async def _start_llm_compensation(self, record_id: str) -> dict[str, Any]:
+        """Schedule recovery on Astr's loop and return without blocking WebUI."""
+        clean_id = str(record_id or "").strip()
+        row = self._llm_compensation.get(clean_id)
+        if row is None:
+            raise ValueError("补偿请求不存在")
+        if row["status"] in {"restored", "dismissed"}:
+            return {"id": clean_id, "status": row["status"], "skipped": True}
+        batch_id = str(row.get("source_batch_id") or "")
+        task_key = "batch:" + batch_id if batch_id else "request:" + clean_id
+        tasks = getattr(self, "_llm_compensation_tasks", None)
+        if tasks is None:
+            tasks = {}
+            self._llm_compensation_tasks = tasks
+        active = tasks.get(task_key)
+        if active is not None and not active.done():
+            return {"id": clean_id, "status": "running", "deduplicated": True}
+        if not self._llm_compensation.start(clean_id):
+            refreshed = self._llm_compensation.get(clean_id) or row
+            return {
+                "id": clean_id,
+                "status": str(refreshed.get("status") or "pending"),
+                "deduplicated": True,
+            }
+        task = asyncio.create_task(
+            self._run_llm_compensation_job(clean_id),
+            name="memos-compensation-" + clean_id[-10:],
+        )
+        tasks[task_key] = task
+
+        def cleanup(done: asyncio.Task) -> None:
+            if tasks.get(task_key) is done:
+                tasks.pop(task_key, None)
+
+        task.add_done_callback(cleanup)
+        return {"id": clean_id, "status": "running", "background": True}
+
+    async def _run_llm_compensation_job(self, record_id: str) -> dict[str, Any]:
+        try:
+            result = await self._restore_llm_compensation(record_id)
+        except asyncio.CancelledError:
+            self._llm_compensation.finish(
+                record_id,
+                "failed",
+                error="插件停止，中断的补偿可在重载后重新提交",
+            )
+            raise
+        except Exception as exc:
+            self._llm_compensation.finish(
+                record_id,
+                "failed",
+                error=str(exc),
+                message="补偿失败，原日记和原文均未丢失",
+            )
+            logger.warning(
+                "[memos-memory][compensation] background recovery failed id=%s: %s",
+                record_id, exc,
+            )
+            return {"id": record_id, "status": "failed", "error": str(exc)}
+        status = str(result.get("status") or "model_recovered")
+        if status == "model_recovered":
+            self._llm_compensation.finish(
+                record_id,
+                "model_recovered",
+                result_text=str(result.get("output") or ""),
+                message="模型输出已恢复，未自动写入业务状态",
+            )
+        elif status != "restored":
+            self._llm_compensation.finish(
+                record_id,
+                "failed",
+                error=str(result.get("error") or "补偿未完成"),
+            )
+        return result
+
+    @staticmethod
+    def _match_compensation_diaries(
+        episodes: list[dict[str, Any]],
+        diaries: list[dict[str, Any]],
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        """Match regenerated scenes to stable Memos identities deterministically."""
+        if len(episodes) != len(diaries):
+            raise DiaryGenerationDeferred(
+                "补偿分篇数与现有日记不一致，旧日记保持原状",
+                {"stage": "compensation_count", "old": len(episodes), "new": len(diaries)},
+            )
+
+        def start(item: dict[str, Any]) -> int:
+            try:
+                return int(item.get("scene_start_turn") or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        def end(item: dict[str, Any]) -> int:
+            try:
+                return int(item.get("scene_end_turn") or start(item))
+            except (TypeError, ValueError):
+                return start(item)
+
+        def date(item: dict[str, Any]) -> str:
+            return str(item.get("event_date") or item.get("occurred_at") or "")[:10]
+
+        old_rows = sorted((dict(item) for item in episodes), key=start)
+        remaining = [dict(item) for item in diaries]
+        pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for old_index, old in enumerate(old_rows):
+            old_start, old_end, old_date = start(old), end(old), date(old)
+            same_date_exists = bool(old_date and any(date(item) == old_date for item in remaining))
+
+            def score(item: dict[str, Any]) -> tuple[float, float, float]:
+                new_start, new_end = start(item), end(item)
+                overlap = max(0, min(old_end, new_end) - max(old_start, new_start) + 1)
+                union = max(old_end, new_end) - min(old_start, new_start) + 1
+                date_score = 1.0 if old_date and date(item) == old_date else 0.0
+                if same_date_exists and not date_score:
+                    return (-1.0, -1.0, -1.0)
+                return (date_score, overlap / max(1, union), -abs(old_start - new_start))
+
+            chosen = max(remaining, key=score)
+            chosen_score = score(chosen)
+            if chosen_score[0] < 0 or (
+                chosen_score[0] == 0 and chosen_score[1] <= 0
+                and len(old_rows) > 1
+            ):
+                raise DiaryGenerationDeferred(
+                    "补偿日记无法与原有日期/情景可靠对应，旧日记保持原状",
+                    {"stage": "compensation_mapping", "index": old_index},
+                )
+            remaining.remove(chosen)
+            pairs.append((old, chosen))
+        return pairs
+
+    def _compensation_event_date(self, message: dict[str, Any]) -> str:
+        try:
+            stamp = float(message.get("event_ts") or 0)
+        except (TypeError, ValueError):
+            stamp = 0.0
+        if stamp <= 0:
+            return ""
+        zone = timezone_or_default(
+            str(message.get("event_timezone") or self.rp_time_timezone)
+        )
+        return datetime.fromtimestamp(stamp, tz=timezone.utc).astimezone(
+            zone
+        ).strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _compensation_shards(
+        messages: list[dict[str, Any]],
+        *,
+        max_messages: int = 6,
+        max_chars: int = 2400,
+    ) -> list[list[int]]:
+        """Split on complete user/assistant exchanges for bounded LLM prompts."""
+        units: list[list[int]] = []
+        index = 0
+        while index < len(messages):
+            unit = [index]
+            if (
+                str(messages[index].get("role") or "").lower() == "user"
+                and index + 1 < len(messages)
+                and str(messages[index + 1].get("role") or "").lower()
+                == "assistant"
+            ):
+                unit.append(index + 1)
+            units.append(unit)
+            index = unit[-1] + 1
+
+        shards: list[list[int]] = []
+        current: list[int] = []
+        current_chars = 0
+        for unit in units:
+            unit_chars = sum(
+                len(str(messages[item].get("content") or "")) for item in unit
+            )
+            if current and (
+                len(current) + len(unit) > max(2, int(max_messages))
+                or current_chars + unit_chars > max(800, int(max_chars))
+            ):
+                shards.append(current)
+                current = []
+                current_chars = 0
+            current.extend(unit)
+            current_chars += unit_chars
+        if current:
+            shards.append(current)
+        return shards
+
+    @staticmethod
+    def _budget_compensation_evidence(
+        evidence: list[dict[str, Any]], source_chars: int,
+    ) -> list[dict[str, Any]]:
+        """Rank cross-shard evidence without deleting its source trace.
+
+        A shard can only judge importance inside its own small window.  Treating
+        every local ``must_write`` as globally mandatory made long recovery
+        batches impossible to render: dozens of local facts were forced into a
+        single diary.  This reducer keeps every grounded item for Episode/raw
+        evidence, while selecting a bounded, timeline-balanced literary view.
+        """
+        if source_chars < 1000:
+            must_budget, support_budget = 4, 2
+        elif source_chars < 3000:
+            must_budget, support_budget = 6, 3
+        elif source_chars < 7000:
+            must_budget, support_budget = 8, 4
+        else:
+            must_budget, support_budget = 10, 4
+
+        protected_kinds = {
+            "commitment", "promise", "boundary", "relationship_decision",
+            "relationship-decision", "relationship decision",
+        }
+
+        def normalized_detail(item: dict[str, Any]) -> str:
+            value = str(item.get("detail") or item.get("quote") or "")
+            value = re.sub(
+                r"^(?:我当时说或表达|对方当时说或表达|对话中记录)[:：]\s*",
+                "",
+                value.strip(),
+            )
+            return re.sub(r"[\W_]+", "", value, flags=re.UNICODE).lower()
+
+        def evidence_score(item: dict[str, Any]) -> tuple[Any, ...]:
+            detail = normalized_detail(item)
+            kind = str(item.get("kind") or "").strip().lower()
+            relation_signal = any(word in detail for word in (
+                "答应", "承诺", "约定", "不许", "边界", "底线", "在一起",
+                "分开", "离开", "原谅", "以后", "记住",
+            ))
+            return (
+                kind in protected_kinds,
+                relation_signal,
+                bool(item.get("grounded")),
+                float(item.get("confidence") or 0),
+                min(len(detail), 180),
+            )
+
+        # Exact duplicates from overlapping/adaptive shards remain archived for
+        # traceability, but they must not consume the literary evidence budget.
+        representatives: list[dict[str, Any]] = []
+        duplicate_ids: set[int] = set()
+        seen_fingerprints: dict[tuple[tuple[int, ...], str], dict[str, Any]] = {}
+        for item in evidence:
+            indexes = tuple(sorted({
+                int(value) for value in (item.get("turn_indexes") or [])
+                if isinstance(value, int)
+            }))
+            fingerprint = (indexes, normalized_detail(item))
+            existing = seen_fingerprints.get(fingerprint)
+            if existing is None or not fingerprint[1]:
+                representatives.append(item)
+                seen_fingerprints[fingerprint] = item
+                continue
+            duplicate_ids.add(id(item))
+            if evidence_score(item) > evidence_score(existing):
+                duplicate_ids.add(id(existing))
+                duplicate_ids.discard(id(item))
+                representatives.remove(existing)
+                representatives.append(item)
+                seen_fingerprints[fingerprint] = item
+
+        def select_across_timeline(
+            rows: list[dict[str, Any]], limit: int,
+        ) -> set[int]:
+            if len(rows) <= limit:
+                return {id(item) for item in rows}
+            rows = sorted(
+                rows,
+                key=lambda item: min(item.get("turn_indexes") or [10**9]),
+            )
+            selected: set[int] = set()
+            for bucket in range(limit):
+                start = int(bucket * len(rows) / limit)
+                end = max(start + 1, int((bucket + 1) * len(rows) / limit))
+                segment = rows[start:end]
+                best = max(segment, key=evidence_score)
+                selected.add(id(best))
+            return selected
+
+        must_candidates = [
+            item for item in representatives
+            if str(item.get("tier") or "supporting") == "must_write"
+        ]
+        selected_must = select_across_timeline(must_candidates, must_budget)
+        support_candidates = [
+            item for item in representatives
+            if id(item) not in selected_must
+            and str(item.get("tier") or "supporting") != "archive_only"
+        ]
+        selected_support = select_across_timeline(
+            support_candidates, support_budget,
+        )
+        for item in evidence:
+            if id(item) in selected_must:
+                item["tier"] = "must_write"
+            elif id(item) in selected_support:
+                item["tier"] = "supporting"
+            else:
+                item["tier"] = "archive_only"
+            item["tier_locked"] = True
+            if id(item) in duplicate_ids:
+                item["compensation_selection"] = "duplicate_archive"
+            elif id(item) in selected_must:
+                item["compensation_selection"] = "global_must_write"
+            elif id(item) in selected_support:
+                item["compensation_selection"] = "global_supporting"
+            else:
+                item["compensation_selection"] = "source_archive_only"
+        return evidence
+
+    @staticmethod
+    def _compensation_render_evidence(
+        evidence: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return a compact literary view; persisted evidence stays lossless."""
+        projected = project_grounded_evidence_for_render(
+            evidence, minimum_budget=4,
+        )
+        out: list[dict[str, Any]] = []
+        for item in projected:
+            compact = dict(item)
+            detail = " ".join(str(compact.get("detail") or "").split())
+            quote = " ".join(str(compact.get("quote") or "").split())
+            compact["detail"] = detail[:180]
+            # A short literal phrase can help preserve voice; the full quote is
+            # already recoverable from source turns and does not belong here.
+            compact["quote"] = quote[:72]
+            compact.pop("compensation_selection", None)
+            compact.pop("tier_locked", None)
+            out.append(compact)
+        return out
+
+    async def _generate_compensation_diaries_sharded(
+        self,
+        record_id: str,
+        old_rows: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+        original_indexes: list[int],
+        *,
+        source_kind: str,
+    ) -> list[dict[str, Any]]:
+        """Map-reduce long source batches without sacrificing source grounding."""
+        ordered_old = sorted(
+            (dict(item) for item in old_rows),
+            key=lambda item: (
+                str(item.get("occurred_at") or item.get("event_date") or "")[:10],
+                int(item.get("scene_start_turn") or -1),
+            ),
+        )
+        unassigned = set(range(len(messages)))
+        groups: list[tuple[dict[str, Any], list[int]]] = []
+        for old_index, old in enumerate(ordered_old):
+            event_date = str(
+                old.get("occurred_at") or old.get("event_date") or ""
+            )[:10]
+            try:
+                start = int(old.get("scene_start_turn"))
+                end = int(old.get("scene_end_turn"))
+            except (TypeError, ValueError):
+                start = end = -1
+            positions = []
+            if 0 <= start <= end:
+                positions = [
+                    index for index in sorted(unassigned)
+                    if start <= original_indexes[index] <= end
+                ]
+            if not positions and event_date:
+                positions = [
+                    index for index in sorted(unassigned)
+                    if self._compensation_event_date(messages[index]) == event_date
+                ]
+            if not positions and old_index == len(ordered_old) - 1:
+                positions = sorted(unassigned)
+            if not positions:
+                raise DiaryGenerationDeferred(
+                    "补偿无法为原日记定位对应原文范围，旧日记保持原状",
+                    {"stage": "compensation_source_mapping", "date": event_date},
+                )
+            unassigned.difference_update(positions)
+            groups.append((old, positions))
+
+        if unassigned:
+            for position in sorted(unassigned):
+                turn_date = self._compensation_event_date(messages[position])
+                matching = [
+                    group for group in groups
+                    if str(group[0].get("occurred_at") or "")[:10] == turn_date
+                ]
+                target_group = matching[-1] if matching else groups[-1]
+                target_group[1].append(position)
+            for _old, positions in groups:
+                positions.sort()
+
+        shard_specs: list[tuple[int, int, dict[str, Any], list[int], list[int]]] = []
+        for group_index, (old, positions) in enumerate(groups):
+            group_messages = [messages[position] for position in positions]
+            for shard_index, local_positions in enumerate(
+                self._compensation_shards(group_messages)
+            ):
+                shard_specs.append(
+                    (group_index, shard_index, old, positions, local_positions)
+                )
+        if not shard_specs:
+            raise DiaryGenerationDeferred(
+                "补偿没有可处理的原文分片，旧日记保持原状",
+                {"stage": "compensation_shards"},
+            )
+
+        checkpoint_key = hashlib.sha256(json.dumps({
+            "messages": [{
+                "role": str(item.get("role") or ""),
+                "content": str(item.get("content") or ""),
+                "event_ts": float(item.get("event_ts") or 0),
+                "event_timezone": str(item.get("event_timezone") or ""),
+            } for item in messages],
+            "original_indexes": original_indexes,
+            "groups": [positions for _old, positions in groups],
+            "shards": [[group_index, shard_index, local_positions]
+                       for group_index, shard_index, _old, _positions,
+                       local_positions in shard_specs],
+        }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        saved_checkpoint = self._llm_compensation.load_checkpoint(record_id)
+        cached_shards: dict[str, Any] = {}
+        if (
+            int(saved_checkpoint.get("version") or 0) == 1
+            and str(saved_checkpoint.get("cache_key") or "") == checkpoint_key
+            and isinstance(saved_checkpoint.get("shards"), dict)
+        ):
+            cached_shards = dict(saved_checkpoint["shards"])
+        valid_spec_keys = {
+            f"{group_index}:{shard_index}"
+            for group_index, shard_index, _old, _positions, _local in shard_specs
+        }
+        cached_shards = {
+            key: value for key, value in cached_shards.items()
+            if key in valid_spec_keys and isinstance(value, dict)
+            and isinstance(value.get("episodes"), list)
+            and bool(value.get("episodes"))
+        }
+
+        splitter = getattr(self, "_scene_splitter", None) or SceneSplitter(
+            gap_seconds=float(
+                getattr(self, "scene_split_gap_seconds", 10800) or 10800
+            ),
+            max_scenes=2,
+        )
+        completed = len(cached_shards)
+        completion_lock = asyncio.Lock()
+        if completed:
+            self._compensation_progress(
+                record_id,
+                "extracting_shards",
+                current=completed,
+                total=len(shard_specs),
+                percent=12 + 34 * completed / max(1, len(shard_specs)),
+                message=f"复用 {completed}/{len(shard_specs)} 个已验证证据分片",
+            )
+        # Compensation is background work, but the same provider can become
+        # slower than its deadline when six long structured calls arrive at
+        # once. Keep ordinary runtime concurrency unchanged and serialize this
+        # recovery lane just enough to preserve completion quality.
+        extraction_slots = asyncio.Semaphore(min(2, len(shard_specs)))
+
+        async def extract_one(
+            spec: tuple[int, int, dict[str, Any], list[int], list[int]],
+        ) -> tuple[int, int, list[dict[str, Any]], str, list[str]]:
+            nonlocal completed
+            group_index, shard_index, _old, group_positions, local_positions = spec
+            cache_id = f"{group_index}:{shard_index}"
+            cached = cached_shards.get(cache_id)
+            if isinstance(cached, dict):
+                return (
+                    group_index,
+                    shard_index,
+                    [dict(item) for item in cached.get("episodes") or []],
+                    str(cached.get("mode") or "llm_primary"),
+                    [str(item) for item in cached.get("errors") or []],
+                )
+            group_messages = [messages[position] for position in group_positions]
+
+            async def extract_positions(
+                attempt_positions: list[int],
+                depth: int = 0,
+            ) -> tuple[list[dict[str, Any]], str, list[str]]:
+                shard_messages = [
+                    group_messages[position] for position in attempt_positions
+                ]
+                prompt_turn_limit = self.raw_archive_prompt_view_max_chars
+                if depth:
+                    prompt_turn_limit = min(int(prompt_turn_limit), 1200)
+                shard_text = format_messages_for_prompt(
+                    shard_messages,
+                    max_turns=max(1, (len(shard_messages) + 1) // 2),
+                    timezone_name=self.rp_time_timezone,
+                    max_chars_per_turn=prompt_turn_limit,
+                )
+                candidates = splitter.detect(shard_messages)
+                episodes, mode, errors, _diag = (
+                    await self._extract_episode_blueprints_resilient(
+                        shard_messages,
+                        shard_text,
+                        1,
+                        2,
+                        candidates,
+                        exact_count=False,
+                        source_kind=(
+                            "compensation_shard"
+                            if depth == 0 else "compensation_shard_retry"
+                        ),
+                    )
+                )
+                if mode not in {"llm_primary", "llm_compact_recovery"}:
+                    child_relatives = []
+                    if depth < 2 and len(attempt_positions) > 2:
+                        child_relatives = self._compensation_shards(
+                            shard_messages,
+                            max_messages=max(
+                                2, min(4, len(attempt_positions) // 2)
+                            ),
+                            max_chars=1600,
+                        )
+                    if len(child_relatives) > 1:
+                        self._compensation_progress(
+                            record_id,
+                            "extracting_shards",
+                            current=completed,
+                            total=len(shard_specs),
+                            percent=12 + 34 * completed / max(1, len(shard_specs)),
+                            message=(
+                                f"第 {shard_index + 1} 个分片超时，"
+                                f"正在细分为 {len(child_relatives)} 片重试"
+                            ),
+                        )
+                        merged: list[dict[str, Any]] = []
+                        merged_errors = list(errors)
+                        child_modes: list[str] = []
+                        for child_relative in child_relatives:
+                            child_positions = [
+                                attempt_positions[index]
+                                for index in child_relative
+                            ]
+                            child_episodes, child_mode, child_errors = (
+                                await extract_positions(child_positions, depth + 1)
+                            )
+                            merged.extend(child_episodes)
+                            child_modes.append(child_mode)
+                            merged_errors.extend(child_errors)
+                        merged_mode = (
+                            "llm_compact_recovery"
+                            if "llm_compact_recovery" in child_modes
+                            else "llm_primary"
+                        )
+                        return merged, merged_mode, merged_errors
+                    if depth == 0 and len(attempt_positions) <= 2:
+                        self._compensation_progress(
+                            record_id,
+                            "extracting_shards",
+                            current=completed,
+                            total=len(shard_specs),
+                            percent=12 + 34 * completed / max(1, len(shard_specs)),
+                            message=(
+                                f"第 {shard_index + 1} 个最小分片超时，"
+                                "正在缩短提示后重试"
+                            ),
+                        )
+                        return await extract_positions(attempt_positions, depth + 1)
+                    raise DiaryGenerationDeferred(
+                        "补偿分片仍依赖本地证据保底，拒绝覆盖现有日记",
+                        {
+                            "stage": "compensation_shard_quality",
+                            "group": group_index,
+                            "shard": shard_index,
+                            "depth": depth,
+                            "mode": mode,
+                            "errors": errors,
+                        },
+                    )
+                remapped = []
+                for episode in episodes:
+                    item = dict(episode)
+                    for field in ("scene_start_turn", "scene_end_turn"):
+                        try:
+                            local_index = int(item.get(field))
+                        except (TypeError, ValueError):
+                            local_index = -1
+                        item[field] = (
+                            attempt_positions[local_index]
+                            if 0 <= local_index < len(attempt_positions) else -1
+                        )
+                    remapped_evidence = []
+                    for evidence in item.get("evidence") or []:
+                        if not isinstance(evidence, dict):
+                            continue
+                        projected = dict(evidence)
+                        projected["turn_indexes"] = [
+                            attempt_positions[index]
+                            for index in (evidence.get("turn_indexes") or [])
+                            if isinstance(index, int)
+                            and 0 <= index < len(attempt_positions)
+                        ]
+                        if projected["turn_indexes"]:
+                            remapped_evidence.append(projected)
+                    item["evidence"] = remapped_evidence
+                    if remapped_evidence:
+                        remapped.append(item)
+                if not remapped:
+                    raise DiaryGenerationDeferred(
+                        "补偿分片没有可用的模型证据，旧日记保持原状",
+                        {
+                            "stage": "compensation_shard_empty",
+                            "group": group_index,
+                            "shard": shard_index,
+                            "depth": depth,
+                        },
+                    )
+                return remapped, mode, list(errors)
+
+            async with extraction_slots:
+                remapped, mode, errors = await extract_positions(local_positions)
+            async with completion_lock:
+                cached_shards[cache_id] = {
+                    "episodes": remapped,
+                    "mode": mode,
+                    "errors": list(errors),
+                }
+                self._llm_compensation.checkpoint(record_id, {
+                    "version": 1,
+                    "cache_key": checkpoint_key,
+                    "shards": cached_shards,
+                })
+                completed += 1
+                self._compensation_progress(
+                    record_id,
+                    "extracting_shards",
+                    current=completed,
+                    total=len(shard_specs),
+                    percent=12 + 34 * completed / max(1, len(shard_specs)),
+                    message=(
+                        f"已完成 {completed}/{len(shard_specs)} 个原文证据分片"
+                    ),
+                )
+            return group_index, shard_index, remapped, mode, errors
+
+        results = await asyncio.gather(*(extract_one(spec) for spec in shard_specs))
+        results_by_group: dict[int, list[tuple[int, list[dict[str, Any]], str, list[str]]]] = {}
+        for group_index, shard_index, extracted, mode, errors in results:
+            results_by_group.setdefault(group_index, []).append(
+                (shard_index, extracted, mode, errors)
+            )
+
+        diaries: list[dict[str, Any]] = []
+        for group_index, (old, group_positions) in enumerate(groups):
+            group_messages = [messages[position] for position in group_positions]
+            extracted_rows = sorted(results_by_group.get(group_index, []))
+            extracted = [
+                episode
+                for _shard_index, shard_episodes, _mode, _errors in extracted_rows
+                for episode in shard_episodes
+            ]
+            evidence: list[dict[str, Any]] = []
+            seen_evidence: set[tuple[tuple[int, ...], str]] = set()
+            for episode in extracted:
+                for raw_evidence in episode.get("evidence") or []:
+                    if not isinstance(raw_evidence, dict):
+                        continue
+                    indexes = tuple(
+                        int(value) for value in raw_evidence.get("turn_indexes") or []
+                        if isinstance(value, int)
+                    )
+                    detail = str(
+                        raw_evidence.get("detail")
+                        or raw_evidence.get("quote") or ""
+                    ).strip()
+                    key = (indexes, detail)
+                    if not indexes or not detail or key in seen_evidence:
+                        continue
+                    seen_evidence.add(key)
+                    evidence.append(dict(raw_evidence))
+            if not evidence:
+                raise DiaryGenerationDeferred(
+                    "补偿分片合并后没有可发布证据，旧日记保持原状",
+                    {"stage": "compensation_merge", "group": group_index},
+                )
+            evidence.sort(
+                key=lambda item: min(item.get("turn_indexes") or [10**9])
+            )
+
+            source_chars = sum(
+                len("".join(str(item.get("content") or "").split()))
+                for item in group_messages
+            )
+            evidence = self._budget_compensation_evidence(
+                evidence, source_chars,
+            )
+
+            def join_field(field: str, limit: int) -> str:
+                values = []
+                for episode in extracted:
+                    value = str(episode.get(field) or "").strip()
+                    if value and value not in values:
+                        values.append(value)
+                return "；".join(values)[:limit]
+
+            def unique_list(field: str, limit: int) -> list[str]:
+                values = []
+                for episode in extracted:
+                    for value in episode.get(field) or []:
+                        text = str(value).strip()
+                        if text and text not in values:
+                            values.append(text)
+                return values[:limit]
+
+            event_date = str(
+                old.get("occurred_at") or old.get("event_date")
+                or self._compensation_event_date(group_messages[0])
+            )[:10]
+            merged_episode = {
+                "episode_key": f"compensation_{group_index + 1}",
+                "event_date": event_date,
+                "time_label": join_field("time_label", 80),
+                "time_basis": "conversation_now",
+                "scene_anchor": join_field("scene_anchor", 320),
+                "scene_start_turn": 0,
+                "scene_end_turn": max(0, len(group_messages) - 1),
+                "scene_boundary_reasons": ["compensation_sharded_recovery"],
+                "memory_type": str(
+                    old.get("memory_type")
+                    or next((item.get("memory_type") for item in extracted if item.get("memory_type")), "daily_life")
+                ),
+                "evidence": evidence,
+                "affect_before": str(extracted[0].get("affect_before") or "")[:260],
+                "affect_after": str(extracted[-1].get("affect_after") or "")[:260],
+                "state_change": join_field("state_change", 480),
+                "long_effect": join_field("long_effect", 480),
+                "trigger_hint": join_field("trigger_hint", 480),
+                "retrieval_key": join_field("retrieval_key", 520),
+                "entities": unique_list("entities", 40),
+                "unresolved": unique_list("unresolved", 16),
+                "tags": unique_list("tags", 30),
+                "importance": max(
+                    [_normalize_importance(item.get("importance"), 3) for item in extracted]
+                    or [3]
+                ),
+            }
+            persisted_evidence = [dict(item) for item in evidence]
+            render_episode = dict(merged_episode)
+            render_episode["evidence"] = self._compensation_render_evidence(
+                persisted_evidence,
+            )
+            if not render_episode["evidence"]:
+                raise DiaryGenerationDeferred(
+                    "补偿全局选材后没有可渲染证据，原文保持不变",
+                    {"stage": "compensation_render_projection", "group": group_index},
+                )
+            compact_text = format_messages_for_prompt(
+                group_messages,
+                max_turns=max(1, (len(group_messages) + 1) // 2),
+                timezone_name=self.rp_time_timezone,
+                max_chars_per_turn=140,
+            )
+            self._compensation_progress(
+                record_id,
+                "rendering_groups",
+                current=group_index,
+                total=len(groups),
+                percent=48 + 18 * group_index / max(1, len(groups)),
+                message=f"正在文学化渲染第 {group_index + 1}/{len(groups)} 篇",
+            )
+            rendered = await self._generate_evidence_first_diaries(
+                group_messages,
+                compact_text,
+                1,
+                diary_cap=1,
+                exact_count=True,
+                source_kind=source_kind,
+                prebuilt_episodes=[render_episode],
+                prebuilt_extraction_mode="llm_sharded_recovery",
+            )
+            if len(rendered) != 1:
+                raise DiaryGenerationDeferred(
+                    "补偿分片未能合并成唯一日记，旧日记保持原状",
+                    {"stage": "compensation_render_count", "group": group_index},
+                )
+            diary = dict(rendered[0])
+            # The renderer and its quality gate only need the compact selected
+            # view.  The machine Episode keeps every extracted fact, including
+            # archive_only items, so later retrieval can still return to source.
+            diary["evidence"] = persisted_evidence
+            for item in diary.get("evidence") or []:
+                item["turn_indexes"] = [
+                    original_indexes[group_positions[index]]
+                    for index in (item.get("turn_indexes") or [])
+                    if isinstance(index, int) and 0 <= index < len(group_positions)
+                ]
+            mapped_indexes = [original_indexes[position] for position in group_positions]
+            diary["scene_start_turn"] = min(mapped_indexes)
+            diary["scene_end_turn"] = max(mapped_indexes)
+            diary["event_date"] = event_date
+            diary["_episode_extraction_mode"] = "llm_sharded_recovery"
+            diaries.append(diary)
+            self._compensation_progress(
+                record_id,
+                "rendering_groups",
+                current=group_index + 1,
+                total=len(groups),
+                percent=48 + 18 * (group_index + 1) / max(1, len(groups)),
+                message=f"已完成 {group_index + 1}/{len(groups)} 篇文学日记",
+            )
+        return diaries
+
+    async def _rebuild_committed_compensation_batch(
+        self,
+        record_id: str,
+        batch_id: str,
+        info: dict[str, Any],
+        turns: list[dict[str, Any]],
+        episodes: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Regenerate a published batch, then replace all old Memos or restore all."""
+        old_rows = [item for item in episodes if item.get("source_batch_id") == batch_id]
+        if not old_rows:
+            raise RuntimeError(
+                "已发布批次缺少原文链接；为防重复写入，请走记忆生产页重写预览"
+            )
+        target = len(old_rows)
+        original_indexes = [int(turn.get("turn_index") or 0) for turn in turns]
+        messages = [{
+            "role": str(turn.get("role") or ""),
+            "content": str(turn.get("content") or ""),
+            "event_ts": float(turn.get("event_ts") or 0),
+            "event_timezone": str(
+                turn.get("event_timezone") or self.rp_time_timezone
+            ),
+        } for turn in turns]
+        messages_text = format_messages_for_prompt(
+            messages,
+            max_turns=max(1, (len(messages) + 1) // 2),
+            timezone_name=self.rp_time_timezone,
+            max_chars_per_turn=self.raw_archive_prompt_view_max_chars,
+        )
+        self._compensation_progress(
+            record_id,
+            "regenerating",
+            current=0,
+            total=target,
+            percent=12,
+            message=f"正在按完整原文重建 {target} 篇日记",
+        )
+        batch_token = _ACTIVE_SOURCE_BATCH.set(batch_id)
+        replay_token = _ACTIVE_COMPENSATION_REPLAY.set(True)
+        try:
+            source_kind = str(info.get("source_kind") or "eod")
+            if len(messages) >= 24 or len(messages_text) >= 8000:
+                diaries = await self._generate_compensation_diaries_sharded(
+                    record_id,
+                    old_rows,
+                    messages,
+                    original_indexes,
+                    source_kind=source_kind,
+                )
+            else:
+                diaries = await self._generate_evidence_first_diaries(
+                    messages,
+                    messages_text,
+                    target,
+                    diary_cap=target,
+                    exact_count=True,
+                    source_kind=source_kind,
+                )
+        finally:
+            _ACTIVE_COMPENSATION_REPLAY.reset(replay_token)
+            _ACTIVE_SOURCE_BATCH.reset(batch_token)
+        if len(diaries) != target:
+            raise DiaryGenerationDeferred(
+                "补偿未生成完整分篇，旧日记保持原状",
+                {"stage": "compensation_count", "expected": target, "actual": len(diaries)},
+            )
+        invalid = [
+            str(item.get("episode_key") or "?") for item in diaries
+            if bool(item.get("_render_fallback"))
+            or str(item.get("_episode_extraction_mode") or "")
+            not in {
+                "llm_primary", "llm_compact_recovery", "llm_sharded_recovery",
+            }
+        ]
+        if invalid:
+            raise DiaryGenerationDeferred(
+                "补偿仍依赖本地保底证据，拒绝覆盖现有日记",
+                {"stage": "compensation_quality", "episode_keys": invalid},
+            )
+        pairs = self._match_compensation_diaries(old_rows, diaries)
+        self._compensation_progress(
+            record_id,
+            "preparing",
+            current=0,
+            total=target,
+            percent=68,
+            message="模型结果已通过闸门，正在创建可回滚快照",
+        )
+        previews = []
+        for index, (old, diary) in enumerate(pairs, start=1):
+            previews.append(await self._save_inplace_repair_preview(
+                old,
+                diary,
+                batch_id=batch_id,
+                original_indexes=original_indexes,
+                compensation_record_id=record_id,
+            ))
+            self._compensation_progress(
+                record_id,
+                "preparing",
+                current=index,
+                total=target,
+                percent=68 + (8 * index / max(1, target)),
+                message=f"已准备 {index}/{target} 份原位替换快照",
+            )
+        results = []
+        confirmed_ids = []
+        try:
+            for index, preview in enumerate(previews, start=1):
+                preview_id = str(preview["preview_id"])
+                self._compensation_progress(
+                    record_id,
+                    "committing",
+                    current=index - 1,
+                    total=target,
+                    percent=76 + (20 * (index - 1) / max(1, target)),
+                    message=f"正在原位替换第 {index}/{target} 篇",
+                )
+                results.append(await self._confirm_fallback_repair(preview_id))
+                confirmed_ids.append(preview_id)
+        except Exception:
+            self._compensation_progress(
+                record_id,
+                "rolling_back",
+                current=0,
+                total=len(confirmed_ids),
+                percent=76,
+                message="写回未完整成功，正在恢复全部旧日记",
+            )
+            rollback_errors = []
+            for preview_id in reversed(confirmed_ids):
+                reverted = await self._rollback_diary_rewrite(preview_id=preview_id)
+                rollback_errors.extend(reverted.get("errors") or [])
+            if rollback_errors:
+                logger.error(
+                    "[memos-memory][compensation] batch rollback incomplete id=%s errors=%s",
+                    record_id, rollback_errors,
+                )
+                raise RuntimeError(
+                    "整批替换失败且自动回滚不完整: " + "; ".join(rollback_errors[:4])
+                )
+            raise
+        self._llm_compensation.resolve_batch(batch_id)
+        self._compensation_progress(
+            record_id,
+            "completed",
+            current=target,
+            total=target,
+            percent=100,
+            message=f"整批 {target} 篇已通过质量门槛并原位替换",
+        )
+        return {"id": record_id, "status": "restored", "replaced": results}
+
+    async def _restore_llm_compensation(self, record_id: str) -> dict[str, Any]:
+        """Replay source-backed work; never publish an isolated LLM answer as a diary."""
+        row = self._llm_compensation.get(str(record_id or ""))
+        if row is None:
+            raise ValueError("补偿请求不存在")
+        if row["status"] in {"restored", "dismissed"}:
+            return {"id": record_id, "status": row["status"], "skipped": True}
+        batch_id = str(row.get("source_batch_id") or "")
+        if batch_id and row["task"] == "memory_generation":
+            # AstrBot instantiates plugins before providers. A compensation job
+            # can therefore arrive after WebUI startup but before this plugin's
+            # warmup has successfully bound the configured embedding provider.
+            # Retry normal initialization here instead of treating that startup
+            # race as missing source evidence.
+            if self._episodes is None and not await self._ensure_init():
+                raise RuntimeError("记忆服务尚未初始化，原文库暂不可用")
+            if self._episodes is None:
+                raise RuntimeError("原文库不可用")
+            info = self._episodes.batch_info(batch_id)
+            if not info:
+                raise RuntimeError("原文批次已不存在，拒绝无证据重试")
+            turns = self._episodes.source_turns(batch_id)
+            if not turns:
+                raise RuntimeError("原文轮次为空，拒绝无证据重试")
+            episodes = self._episodes.episodes_for_batch(batch_id)
+            if str(info.get("status") or "") == "committed":
+                return await self._rebuild_committed_compensation_batch(
+                    record_id, batch_id, info, turns, episodes,
+                )
+            if episodes or str(info.get("status") or "") in {"partial", "partial_manual_repair"}:
+                raise RuntimeError("批次部分发布，须先在记忆生产页对账，防止重复写入")
+            messages = [{
+                "role": str(turn.get("role") or ""),
+                "content": str(turn.get("content") or ""),
+                "event_ts": float(turn.get("event_ts") or 0),
+                "event_timezone": str(turn.get("event_timezone") or self.rp_time_timezone),
+            } for turn in turns]
+            self._episodes.mark_batch(batch_id, "archived")
+            count = await self._compress_and_store(
+                str(info.get("session_id") or "compensation:" + batch_id),
+                messages, source_kind=str(info.get("source_kind") or "auto"),
+            )
+            refreshed = self._episodes.batch_info(batch_id) or {}
+            if count > 0 and refreshed.get("status") == "committed":
+                self._llm_compensation.resolve_batch(batch_id)
+                return {"id": record_id, "status": "restored", "diaries": count}
+            self._llm_compensation.finish(
+                record_id, "failed", error="重试未完成，原文仍保留",
+            )
+            return {"id": record_id, "status": "failed", "diaries": 0}
+
+        # Other task families can be rerun as a model request, but their old
+        # execution context may no longer exist. Keep the output for review;
+        # never claim that a profile, dream or time-insight state was committed.
+        registry = self._external_models
+        from .model_tasks import task_key
+        route_key = task_key(str(row.get("label") or row["task"]))
+        provider = registry.followup_provider(
+            route_key if route_key in getattr(registry, "astr_followup_models", {}) else str(row["task"])
+        )
+        if provider is None:
+            raise RuntimeError("原跟接模型或任务已关闭，先在模型调度页恢复配置")
+        request = row["request"]
+        try:
+            response = await self._llm_runtime.call(
+                provider,
+                prompt=str(request.get("prompt") or ""),
+                contexts=request.get("contexts") or [],
+                system_prompt=str(request.get("system_prompt") or ""),
+                timeout=registry.astr_followup_timeout,
+                label=str(row["label"]) + "_manual_replay",
+                optional=bool(request.get("optional")),
+                task_family=str(row["task"]),
+            )
+        except Exception as exc:
+            self._llm_compensation.finish(record_id, "failed", error=str(exc))
+            raise
+        text = str(getattr(response, "completion_text", "") or "")
+        self._llm_compensation.finish(
+            record_id, "model_recovered", result_text=text,
+            message="模型输出已恢复，未自动写入业务状态",
+        )
+        return {"id": record_id, "status": "model_recovered",
+                "output": text, "applied": False}
+
+    def _resolve_chat_provider(self, provider_id: str = "", umo: str = "") -> Any | None:
+        """Resolve plugin-owned chat calls without changing Astr's reply model."""
+        external = getattr(self, "_external_models", None)
+        if external is not None and external.enabled:
+            return external.provider(provider_id)
+        clean = str(provider_id or "").strip()
+        if clean.startswith("external:"):
+            clean = ""
+        try:
+            if clean:
+                return self.context.get_provider_by_id(clean)
+            if umo:
+                return self.context.get_using_provider(umo)
+            return self.context.get_using_provider()
+        except Exception:
+            return None
+
+    def _chat_provider_options(self, current: Any = "") -> list[dict[str, str]]:
+        external = getattr(self, "_external_models", None)
+        if external is not None and external.enabled:
+            return external.provider_options(current)
+        options = [{"value": "", "label": "跟随当前会话模型"}]
+        try:
+            providers = list(self.context.get_all_providers())
+        except Exception:
+            providers = []
+        seen = set()
+        for provider in providers:
+            try:
+                meta = provider.meta()
+                provider_id = str(getattr(meta, "id", "") or "").strip()
+                model = str(getattr(meta, "model", "") or "").strip()
+            except Exception:
+                provider_id = str(getattr(provider, "provider_id", "") or "").strip()
+                model = ""
+            if not provider_id or provider_id in seen:
+                continue
+            seen.add(provider_id)
+            options.append({
+                "value": provider_id,
+                "label": provider_id if not model or model == provider_id else f"{provider_id} · {model}",
+            })
+        configured = str(current or "").strip()
+        if configured and configured not in seen:
+            options.append({"value": configured, "label": configured + " · 当前不可用"})
+        return options
 
     # ---------- 后台对账(v1.3) ----------
     async def _background_reconcile(self):
@@ -2696,6 +4213,37 @@ class MemosMemoryPlugin(Star):
             "content": body,
             "source_updated_ts": source_updated_ts,
         }
+        batch_id = str(machine.get("source_batch_id") or "")
+        try:
+            start = int(machine.get("source_turn_start"))
+            end = int(machine.get("source_turn_end"))
+        except (TypeError, ValueError):
+            start = end = -1
+        if batch_id and 0 <= start <= end and self._episodes is not None:
+            info = self._episodes.batch_info(batch_id)
+            source_turns = self._episodes.source_turns(batch_id) if info else []
+            selected = [
+                turn for turn in source_turns
+                if start <= int(turn.get("turn_index", -1)) <= end
+            ]
+            if selected and int(selected[0].get("turn_index", -1)) == start and int(selected[-1].get("turn_index", -1)) == end:
+                evidence = []
+                for turn in selected:
+                    if str(turn.get("role") or "") != "assistant":
+                        continue
+                    index = int(turn["turn_index"])
+                    quote = str(turn.get("content") or "").strip()[:220]
+                    if quote:
+                        evidence.append({
+                            "kind": "source_turn", "actor": "角色", "detail": quote,
+                            "quote_text": quote, "turn_indexes": [index],
+                            "grounded": True, "tier": "supporting",
+                        })
+                if evidence:
+                    episode["evidence"] = evidence
+                    episode["scene_start_turn"] = start
+                    episode["scene_end_turn"] = end
+                    episode["_portable_source_batch_id"] = batch_id
         return episode, body
 
     async def _rebuild_episodic_from_memos(
@@ -2764,7 +4312,13 @@ class MemosMemoryPlugin(Star):
                     legacy = True
                     source_batch_id = ""
                     source_kind = "legacy_memos"
-                    if existing and existing.get("evidence_quality") in {"source_grounded", "mixed_user_edited"}:
+                    portable_batch_id = str(episode.pop("_portable_source_batch_id", "") or "")
+                    if portable_batch_id:
+                        source_batch_id = portable_batch_id
+                        source_kind = "memos_source_linked_edit"
+                        quality = "mixed_user_edited"
+                        legacy = False
+                    elif existing and existing.get("evidence_quality") in {"source_grounded", "mixed_user_edited"}:
                         original_evidence = self._episodes.evidence_for_memo(memo_name, "", limit=100)
                         unchanged = str(existing.get("diary_content_hash") or "") == content_hash
                         if unchanged:
@@ -3114,7 +4668,10 @@ class MemosMemoryPlugin(Star):
         if self._episodes is None:
             return {"available": False, "reason": "store_unavailable"}
         limit = int(getattr(self, "semantic_state_merge_max_batches", 6))
-        pending = self._episodes.pending_state_updates(limit=limit)
+        pending = self._episodes.pending_state_updates(
+            limit=limit,
+            scope_id=self._semantic_state_scope_id(),
+        )
         if not pending:
             return {"available": True, "pending_batches": 0, "reason": "empty"}
         episodes: list[dict[str, Any]] = []
@@ -3161,6 +4718,11 @@ class MemosMemoryPlugin(Star):
             return {"enabled": True, "ready": False, "reason": "episodic store unavailable"}
         scope_id = self._semantic_state_scope_id()
         state = self._episodes.get_semantic_state(scope_id)
+        queue_summary = self._episodes.semantic_state_queue_summary(scope_id)
+        state_age_hours = (
+            max(0.0, (time.time() - float(state.get("updated_ts") or time.time())) / 3600.0)
+            if state else None
+        )
         data = {
             "enabled": True,
             "ready": bool(state and str(state.get("rendered_text") or "").strip()),
@@ -3168,10 +4730,14 @@ class MemosMemoryPlugin(Star):
             "state": state or {},
             "target_chars": self.semantic_state_target_chars,
             "replaces_profile": self.semantic_state_replace_profile,
-            "pending": int(self._episodes.stats().get("pending_state_updates") or 0),
+            "pending": self._episodes.pending_state_update_count(scope_id),
+            "queue_summary": queue_summary,
             "update_policy": getattr(self, "semantic_state_update_policy", "adaptive"),
-            "batch_threshold": getattr(self, "semantic_state_batch_threshold", 3),
-            "max_wait_hours": getattr(self, "semantic_state_max_wait_hours", 72.0),
+            "batch_threshold": getattr(self, "semantic_state_batch_threshold", 4),
+            "max_wait_hours": getattr(self, "semantic_state_max_wait_hours", 168.0),
+            "minimum_interval_hours": getattr(self, "semantic_state_min_interval_hours", 72.0),
+            "suppress_after_hours": getattr(self, "semantic_state_suppress_after_hours", 168.0),
+            "state_age_hours": round(state_age_hours, 2) if state_age_hours is not None else None,
             "significance_threshold": getattr(
                 self, "semantic_state_significance_threshold", 0.72
             ),
@@ -3350,6 +4916,101 @@ class MemosMemoryPlugin(Star):
             "episodes": len(episodes),
         }
 
+    @staticmethod
+    def _semantic_state_delta_clusters(
+        episodes: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Collapse repeated episode deltas into the state axes they can change."""
+        clusters: dict[str, int] = {}
+        meaningful_episodes = 0
+        for episode in episodes:
+            if not isinstance(episode, dict):
+                continue
+            memory_type = str(episode.get("memory_type") or "plot_fact").strip()
+            try:
+                importance = max(1, min(5, int(episode.get("importance") or 3)))
+            except (TypeError, ValueError):
+                importance = 3
+            state_change = str(episode.get("state_change") or "").strip()
+            long_effect = str(episode.get("long_effect") or "").strip()
+            unresolved = episode.get("unresolved") or []
+            axes: set[str] = set()
+            if memory_type == "promise_or_rule":
+                axes.add("commitments_boundaries")
+            if memory_type == "relationship_shift":
+                axes.add("relationship_position")
+            if memory_type == "behavior_bias":
+                axes.add("behavior_tendencies")
+            if memory_type == "emotional_anchor":
+                axes.add("emotional_baseline")
+            if unresolved:
+                axes.add("open_loops")
+            if (state_change or long_effect) and importance >= 4:
+                axes.add("behavior_tendencies")
+            if memory_type == "plot_fact" and importance >= 5 and (state_change or long_effect):
+                axes.add("relationship_position")
+            # Daily texture can support a repeated pattern, but an isolated casual
+            # scene is not itself a reason to rewrite the current self document.
+            if memory_type == "daily_texture" and importance < 4:
+                axes.discard("behavior_tendencies")
+                axes.discard("emotional_baseline")
+            if axes:
+                meaningful_episodes += 1
+                for axis in axes:
+                    clusters[axis] = clusters.get(axis, 0) + 1
+        return {
+            "cluster_count": len(clusters),
+            "clusters": clusters,
+            "meaningful_episodes": meaningful_episodes,
+            "total_episodes": len(episodes),
+        }
+
+    @staticmethod
+    def _semantic_state_text_similarity(left: str, right: str) -> float:
+        def canonical(value: str) -> str:
+            return re.sub(r"[\W_]+", "", str(value or "").lower(), flags=re.UNICODE)
+
+        a, b = canonical(left), canonical(right)
+        if not a and not b:
+            return 1.0
+        if not a or not b:
+            return 0.0
+        return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
+
+    def _semantic_state_material_change(
+        self,
+        current: dict[str, Any] | None,
+        proposed: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not current or not str(current.get("rendered_text") or "").strip():
+            return {"material": True, "reason": "initial_state", "similarity": 0.0}
+        threshold = float(getattr(self, "semantic_state_noop_similarity", 0.94))
+        fields = (
+            "relationship_position", "commitments_boundaries", "behavior_tendencies",
+            "emotional_baseline", "open_loops",
+        )
+        similarities = {
+            key: self._semantic_state_text_similarity(
+                str(current.get(key) or ""), str(proposed.get(key) or "")
+            )
+            for key in fields
+        }
+        protected_changed = any(
+            similarities[key] < threshold
+            for key in ("commitments_boundaries", "open_loops")
+        )
+        material = protected_changed or any(value < threshold for value in similarities.values())
+        overall = self._semantic_state_text_similarity(
+            str(current.get("rendered_text") or ""),
+            EpisodicStore._render_semantic_state(proposed),
+        )
+        return {
+            "material": material,
+            "reason": "field_changed" if material else "no_material_change",
+            "similarity": round(overall, 4),
+            "field_similarity": {key: round(value, 4) for key, value in similarities.items()},
+        }
+
     def _semantic_state_update_decision(
         self,
         pending: list[dict[str, Any]],
@@ -3357,6 +5018,7 @@ class MemosMemoryPlugin(Star):
     ) -> dict[str, Any]:
         policy = getattr(self, "semantic_state_update_policy", "adaptive")
         signal = self._semantic_state_change_score(episodes)
+        delta = self._semantic_state_delta_clusters(episodes)
         now = time.time()
         oldest_ts = min(
             (float(item.get("created_ts") or now) for item in pending),
@@ -3364,32 +5026,55 @@ class MemosMemoryPlugin(Star):
         )
         age_hours = max(0.0, (now - oldest_ts) / 3600.0)
         failed = any(str(item.get("status") or "") == "failed" for item in pending)
-        state_ready = bool(
-            self._episodes
-            and self._episodes.get_semantic_state(self._semantic_state_scope_id())
+        state = (
+            self._episodes.get_semantic_state(self._semantic_state_scope_id())
+            if self._episodes else None
         )
+        state_ready = bool(state)
+        state_age_hours = (
+            max(0.0, (now - float(state.get("updated_ts") or now)) / 3600.0)
+            if state else None
+        )
+        cluster_threshold = int(getattr(self, "semantic_state_batch_threshold", 4))
+        min_interval = float(getattr(self, "semantic_state_min_interval_hours", 72.0))
+        max_wait = float(getattr(self, "semantic_state_max_wait_hours", 168.0))
+        suppress_after = float(getattr(self, "semantic_state_suppress_after_hours", 168.0))
         reason = "deferred"
         should_update = False
+        discard = False
         if policy == "every_batch":
             should_update, reason = True, "every_batch"
         elif not state_ready:
             should_update, reason = True, "initial_state"
         elif failed:
             should_update, reason = True, "failed_retry"
-        elif bool(signal.get("hard")) or float(signal.get("score") or 0.0) >= float(
-            getattr(self, "semantic_state_significance_threshold", 0.72)
+        elif bool(signal.get("hard")):
+            should_update, reason = True, "hard_change"
+        elif state_age_hours is not None and state_age_hours < min_interval:
+            reason = "minimum_interval"
+        elif int(delta.get("cluster_count") or 0) >= cluster_threshold:
+            should_update, reason = True, "meaningful_delta_threshold"
+        elif (
+            float(signal.get("score") or 0.0)
+            >= float(getattr(self, "semantic_state_significance_threshold", 0.72))
+            and int(delta.get("cluster_count") or 0) >= 2
         ):
-            should_update, reason = True, "significant_change"
-        elif len(pending) >= int(getattr(self, "semantic_state_batch_threshold", 3)):
-            should_update, reason = True, "batch_threshold"
-        elif age_hours >= float(getattr(self, "semantic_state_max_wait_hours", 72.0)):
-            should_update, reason = True, "max_wait"
+            should_update, reason = True, "cross_axis_significant_change"
+        elif age_hours >= max_wait and int(delta.get("cluster_count") or 0) > 0:
+            should_update, reason = True, "max_wait_meaningful"
+        elif age_hours >= suppress_after and int(delta.get("cluster_count") or 0) == 0:
+            discard, reason = True, "no_meaningful_delta"
         return {
             "update": should_update,
+            "discard": discard,
             "reason": reason,
             "pending_batches": len(pending),
             "oldest_hours": round(age_hours, 2),
+            "state_age_hours": round(state_age_hours, 2) if state_age_hours is not None else None,
+            "minimum_interval_hours": min_interval,
+            "cluster_threshold": cluster_threshold,
             "signal": signal,
+            "delta": delta,
             "policy": policy,
         }
 
@@ -3466,6 +5151,27 @@ class MemosMemoryPlugin(Star):
                         state, rendered = retry_state, retry_rendered
             if len(rendered) > int(self.semantic_state_target_chars * 1.6):
                 raise ValueError(f"semantic state remains oversized: {len(rendered)} chars")
+            change = self._semantic_state_material_change(current, state)
+            if not change.get("material"):
+                if queue_batch_ids:
+                    self._episodes.mark_state_updates(
+                        queue_batch_ids, "superseded", "no_material_state_change"
+                    )
+                elif source_batch_id:
+                    self._episodes.mark_state_update(
+                        source_batch_id, "superseded", "no_material_state_change"
+                    )
+                self._log_event("state", "滚动状态内容无实质变化，未创建新版本", {
+                    "scope": scope_id,
+                    "episodes": len(episodes),
+                    "batches": len(queue_batch_ids) if queue_batch_ids else 1,
+                    **change,
+                })
+                logger.info(
+                    "[memos-memory][state] no-op suppressed similarity=%.3f episodes=%s",
+                    float(change.get("similarity") or 0.0), len(episodes),
+                )
+                return {"updated": False, **change}
             saved = self._episodes.upsert_semantic_state(
                 scope_id,
                 state,
@@ -3518,6 +5224,7 @@ class MemosMemoryPlugin(Star):
                 [value for value in episode_ids if value],
             )
             if any(not item.done() for item in self._semantic_state_pending_tasks):
+                self._semantic_state_reschedule_needed = True
                 return
             coro = self._drain_semantic_state_queue()
         else:
@@ -3526,7 +5233,23 @@ class MemosMemoryPlugin(Star):
             )
         task = asyncio.create_task(coro)
         self._semantic_state_pending_tasks.add(task)
-        task.add_done_callback(self._semantic_state_pending_tasks.discard)
+        task.add_done_callback(self._semantic_state_task_done)
+
+    def _semantic_state_task_done(self, task: asyncio.Task) -> None:
+        self._semantic_state_pending_tasks.discard(task)
+        if not self._semantic_state_reschedule_needed:
+            return
+        self._semantic_state_reschedule_needed = False
+        if (
+            getattr(self, "_terminating", False)
+            or not getattr(self, "semantic_state_enable", False)
+            or self._episodes is None
+            or any(not item.done() for item in self._semantic_state_pending_tasks)
+        ):
+            return
+        next_task = asyncio.create_task(self._drain_semantic_state_queue())
+        self._semantic_state_pending_tasks.add(next_task)
+        next_task.add_done_callback(self._semantic_state_task_done)
 
     async def _drain_semantic_state_queue(self, limit: int = 20) -> dict[str, Any]:
         """Coalesce queued deltas without delaying decisive relationship changes."""
@@ -3536,21 +5259,22 @@ class MemosMemoryPlugin(Star):
             max(1, min(100, int(limit))),
             int(getattr(self, "semantic_state_merge_max_batches", 6)),
         )
-        pending = self._episodes.pending_state_updates(limit=merge_limit)
+        pending = self._episodes.pending_state_updates(
+            limit=merge_limit,
+            scope_id=self._semantic_state_scope_id(),
+        )
         if not pending:
             return {"updated": 0, "reason": "empty"}
         batch_ids: list[str] = []
+        orphan_batch_ids: list[str] = []
         episodes: list[dict[str, Any]] = []
         seen_episode_ids: set[str] = set()
         for item in pending:
             batch_id = str(item.get("batch_id") or "")
             batch_episodes = self._episodes.episodes_for_batch(batch_id)
             if not batch_episodes:
-                return {
-                    "updated": 0,
-                    "reason": "waiting_for_episode_view",
-                    "batch_id": batch_id,
-                }
+                orphan_batch_ids.append(batch_id)
+                continue
             batch_ids.append(batch_id)
             for episode in batch_episodes:
                 key = str(episode.get("episode_id") or episode.get("memo_name") or "")
@@ -3559,7 +5283,34 @@ class MemosMemoryPlugin(Star):
                 if key:
                     seen_episode_ids.add(key)
                 episodes.append(episode)
+        if orphan_batch_ids:
+            self._episodes.mark_state_updates(
+                orphan_batch_ids,
+                "superseded",
+                "episode_view_missing",
+            )
+            logger.warning(
+                "[memos-memory][state] isolated %s orphan queue batches without episodes",
+                len(orphan_batch_ids),
+            )
+        if not batch_ids or not episodes:
+            return {
+                "updated": 0,
+                "reason": "orphan_batches_isolated" if orphan_batch_ids else "empty",
+                "orphan_batches": len(orphan_batch_ids),
+            }
         decision = self._semantic_state_update_decision(pending, episodes)
+        if decision.get("discard"):
+            self._episodes.mark_state_updates(
+                batch_ids, "superseded", str(decision.get("reason") or "no_meaningful_delta")
+            )
+            self._semantic_state_last_defer_key = ""
+            self._log_event("state", "日常重复未形成状态变化，已保留 Episode 并清理状态队列", decision)
+            return {
+                "updated": 0,
+                "suppressed_batches": len(batch_ids),
+                **decision,
+            }
         if not decision.get("update"):
             defer_key = ":".join(
                 [batch_ids[-1], str(decision.get("pending_batches")), str(decision.get("reason"))]
@@ -3583,6 +5334,15 @@ class MemosMemoryPlugin(Star):
             queue_batch_ids=batch_ids,
         )
         if not result.get("updated"):
+            if result.get("reason") == "no_material_change":
+                return {
+                    "updated": 0,
+                    "suppressed_batches": len(batch_ids),
+                    "reason": "no_material_change",
+                    "batch_ids": batch_ids,
+                    "decision": decision,
+                    "similarity": result.get("similarity"),
+                }
             return {
                 "updated": 0,
                 "reason": result.get("reason") or "update_failed",
@@ -3619,7 +5379,8 @@ class MemosMemoryPlugin(Star):
             if force:
                 async with self._semantic_state_lock:
                     superseded = self._episodes.supersede_pending_state_updates(
-                        reason or "semantic_state_full_rebuild_empty"
+                        reason or "semantic_state_full_rebuild_empty",
+                        scope_id=self._semantic_state_scope_id(),
                     )
                     cleared = self._episodes.clear_semantic_state(self._semantic_state_scope_id())
                 return {
@@ -3630,7 +5391,8 @@ class MemosMemoryPlugin(Star):
         if force:
             async with self._semantic_state_lock:
                 superseded = self._episodes.supersede_pending_state_updates(
-                    reason or "semantic_state_full_rebuild"
+                    reason or "semantic_state_full_rebuild",
+                    scope_id=self._semantic_state_scope_id(),
                 )
                 result = await self._update_semantic_state_locked(
                     episodes,
@@ -3649,7 +5411,7 @@ class MemosMemoryPlugin(Star):
             return
         task = asyncio.create_task(self._bootstrap_semantic_state(force=True, reason=reason))
         self._semantic_state_pending_tasks.add(task)
-        task.add_done_callback(self._semantic_state_pending_tasks.discard)
+        task.add_done_callback(self._semantic_state_task_done)
 
     async def _semantic_state_maintenance_loop(self) -> None:
         await asyncio.sleep(8)
@@ -3661,7 +5423,10 @@ class MemosMemoryPlugin(Star):
                     await asyncio.sleep(10)
                     continue
                 queue_limit = int(getattr(self, "semantic_state_merge_max_batches", 6))
-                pending = self._episodes.pending_state_updates(limit=queue_limit)
+                pending = self._episodes.pending_state_updates(
+                    limit=queue_limit,
+                    scope_id=self._semantic_state_scope_id(),
+                )
                 if pending:
                     await self._drain_semantic_state_queue(limit=queue_limit)
                 elif self.semantic_state_auto_bootstrap:
@@ -3872,34 +5637,40 @@ class MemosMemoryPlugin(Star):
         provider_id: str,
         timeout: float,
         label: str,
+        optional: bool = False,
+        lane: str = "memory_critical",
+        task_family: str = "memory_generation",
+        allow_followup: bool = True,
+        enqueue_compensation: bool = True,
     ) -> str:
-        prov = None
-        if provider_id:
-            try:
-                prov = self.context.get_provider_by_id(provider_id)
-            except Exception as e:
-                logger.warning(
-                    "[memos-memory] 指定记忆生成 LLM '%s' 解析失败: %s, 回退到压缩/当前对话 LLM",
-                    provider_id, e,
-                )
-        if prov is None and provider_id != self.compress_provider_id and self.compress_provider_id:
-            try:
-                prov = self.context.get_provider_by_id(self.compress_provider_id)
-            except Exception:
-                prov = None
+        prov = self._resolve_chat_provider(provider_id)
+        if (
+            prov is None
+            and not getattr(getattr(self, "_external_models", None), "enabled", False)
+            and provider_id != self.compress_provider_id
+            and self.compress_provider_id
+        ):
+            prov = self._resolve_chat_provider(self.compress_provider_id)
         if prov is None:
-            prov = self.context.get_using_provider()
-        if prov is None:
-            raise RuntimeError("no LLM provider")
+            raise RuntimeError("no plugin LLM provider")
         prov_id = _resolve_provider_name(prov)
         logger.info(
             "[memos-memory] %s LLM = %s (provider_id='%s')",
             label, prov_id, provider_id or self.compress_provider_id or "(auto)",
         )
-        resp = await self._retry(
-            lambda: prov.text_chat(prompt=prompt, contexts=[], system_prompt=""),
-            label,
-            timeout=max(20.0, float(timeout or 120)),
+        call_timeout = max(20.0, float(timeout or 120))
+        resp = await self._plugin_llm_text_chat(
+            prov,
+            prompt=prompt,
+            contexts=[],
+            system_prompt="",
+            timeout=call_timeout,
+            label=label,
+            optional=optional,
+            lane=lane,
+            task_family=task_family,
+            allow_followup=allow_followup,
+            enqueue_compensation=enqueue_compensation,
         )
         return getattr(resp, "completion_text", "") or ""
 
@@ -3992,7 +5763,13 @@ class MemosMemoryPlugin(Star):
                 tier = str(evidence.get("tier") or "supporting").strip().lower()
                 if tier not in {"must_write", "supporting", "archive_only"}:
                     tier = "supporting"
-                if getattr(self, "evidence_tier_enable", True):
+                tier_locked = bool(
+                    evidence.get("tier_locked")
+                    or evidence.get("_tier_locked")
+                )
+                if tier_locked:
+                    pass
+                elif getattr(self, "evidence_tier_enable", True):
                     fact_text = " ".join((detail, quote)).strip()
                     commitment_words = (
                         "答应", "承诺", "约定", "发誓", "一定", "不许", "边界",
@@ -4066,6 +5843,28 @@ class MemosMemoryPlugin(Star):
         pipeline = getattr(self, "_diary_pipeline", None) or DiaryPipeline(self)
         return pipeline.coverage(content, episode)
 
+    @staticmethod
+    def _diary_length_hint(source_chars: int) -> tuple[int, int, str]:
+        """Keep generation guidance strictly inside the publication budget."""
+        source_chars = max(0, int(source_chars or 0))
+        if source_chars < 400:
+            upper = max(160, min(320, int(source_chars * 0.90)))
+        elif source_chars < 1000:
+            upper = max(220, min(700, int(source_chars * 0.72)))
+        elif source_chars < 1800:
+            upper = min(900, int(source_chars * 0.62))
+        elif source_chars < 3500:
+            upper = min(1150, int(source_chars * 0.46))
+        elif source_chars < 7000:
+            upper = min(1500, int(source_chars * 0.35))
+        else:
+            upper = min(1800, int(source_chars * 0.28))
+        lower = max(120, int(upper * 0.58))
+        return lower, upper, (
+            f"约{lower}-{upper}字，必须不超过{upper}字；"
+            "按记忆密度取舍，短场景不要注水，长场景只留转折、约定与代表性细节"
+        )
+
     def _diary_transcript_risk(
         self, content: str, episode: dict[str, Any], raw: str,
     ) -> float:
@@ -4087,6 +5886,267 @@ class MemosMemoryPlugin(Star):
     def _grounded_episode_fallback_diary(episode: dict[str, Any]) -> str:
         return DiaryPipeline.fallback_diary(episode)
 
+    async def _extract_episode_blueprints_resilient(
+        self,
+        messages: list[dict[str, Any]],
+        messages_text: str,
+        target: int,
+        cap: int,
+        candidates: list[Any],
+        *,
+        exact_count: bool,
+        source_kind: str = "auto",
+    ) -> tuple[list[dict[str, Any]], str, list[str], dict[str, Any]]:
+        """Keep source grounding when the structured extraction model is unstable."""
+        extraction_started = time.monotonic()
+        stage_ms: dict[str, int] = {}
+        time_context = recorded_time_context(messages, self.rp_time_timezone)
+        candidate_payload = as_prompt_payload(candidates)
+        extraction_prompt = build_episode_extraction_prompt(
+            self.character_name,
+            messages_text,
+            target,
+            exact_count=exact_count,
+            timezone_name=self.rp_time_timezone,
+            message_time_context=time_context,
+            scene_candidates=candidate_payload,
+            diary_cap=cap,
+        )
+        errors: list[str] = []
+        route_exhausted_kind = ""
+        compensation_shard = str(source_kind or "").startswith(
+            "compensation_shard"
+        )
+        extraction_provider_id = str(
+            self.episode_extraction_provider_id or ""
+        ).strip()
+        if compensation_shard:
+            fast_provider_id = str(
+                getattr(self, "time_insight_llm_provider_id", "")
+                or getattr(self, "config", {}).get(
+                    "time_insight_llm_provider_id", ""
+                )
+                or ""
+            ).strip()
+            if fast_provider_id and fast_provider_id != extraction_provider_id:
+                extraction_provider_id = fast_provider_id
+        if len(messages) >= 24 and len(extraction_prompt) >= 6000:
+            recent = list(getattr(self, "_llm_call_events", []) or [])[-128:]
+            provider = self._resolve_chat_provider(extraction_provider_id)
+            provider_key = PluginLLMRuntime.provider_key(provider) if provider is not None else ""
+            prompt_fingerprint = hashlib.sha256(
+                extraction_prompt.encode("utf-8")
+            ).hexdigest()[:24]
+            for sample in reversed(recent):
+                if (not isinstance(sample, dict)
+                        or sample.get("task") != "episode_extract"
+                        or sample.get("provider") != provider_key
+                        or sample.get("prompt_fingerprint") != prompt_fingerprint):
+                    continue
+                try:
+                    age = time.time() - float(sample.get("ts") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if (0 <= age <= 1800
+                        and sample.get("outcome") in {"timeout", "empty_final"}):
+                    episodes = build_local_grounded_episodes(
+                        messages, candidates, max_episodes=min(target, cap),
+                        timezone_name=self.rp_time_timezone,
+                    )
+                    if episodes:
+                        errors.append("primary:recent_heavy_failure_cooldown")
+                        logger.info(
+                            "[memory][episode] recent heavy extraction failed; "
+                            "use grounded source for this batch provider=%s turns=%d",
+                            provider_key, len(messages),
+                        )
+                        return episodes, "local_grounded_recovery", errors, {
+                            "stage_ms": {"primary": 0, "compact_recovery": 0},
+                            "total_ms": round((time.monotonic() - extraction_started) * 1000),
+                        }
+                break
+        extraction_budget = max(20.0, float(self.episode_extraction_timeout or 120.0))
+        if compensation_shard:
+            extraction_budget = max(extraction_budget, 180.0)
+        # Nightly batches must leave room for a smaller, grounded extraction if
+        # the full structured request stalls. Both stages share one budget.
+        shares_eod_budget = source_kind == "eod" and len(messages) >= 24
+        primary_timeout = (
+            min(extraction_budget, max(20.0, extraction_budget * 0.6))
+            if shares_eod_budget else extraction_budget
+        )
+        primary_started = time.monotonic()
+        try:
+            # The full prompt is a preliminary route for large EOD work. The
+            # context flag keeps the existing call surface stable while
+            # preventing a second external deadline and duplicate recovery row.
+            preliminary_token = _ACTIVE_PRELIMINARY_LLM_ROUTE.set(
+                shares_eod_budget or compensation_shard
+            )
+            try:
+                extraction_text = await self._call_memory_generation_llm(
+                    extraction_prompt,
+                    provider_id=extraction_provider_id,
+                    timeout=primary_timeout,
+                    label="episode_extract",
+                )
+            finally:
+                _ACTIVE_PRELIMINARY_LLM_ROUTE.reset(preliminary_token)
+            episodes = self._parse_episode_blueprints(extraction_text, messages, cap)
+            stage_ms["primary"] = round((time.monotonic() - primary_started) * 1000)
+            if episodes:
+                return episodes, "llm_primary", errors, {
+                    "stage_ms": stage_ms,
+                    "total_ms": round((time.monotonic() - extraction_started) * 1000),
+                }
+            errors.append("primary:no_grounded_episodes")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            stage_ms["primary"] = round((time.monotonic() - primary_started) * 1000)
+            error_text = (str(exc).strip() or type(exc).__name__)[:240]
+            errors.append("primary:" + error_text)
+            if isinstance(exc, LLMRouteExhaustedError):
+                route_exhausted_kind = exc.failure_kind
+            logger.warning(
+                "[memos-memory][episode] 完整证据抽取失败，启动紧凑恢复: %s", error_text,
+            )
+
+        # This is a bounded rescue, not a second full extraction. A provider
+        # that consumed the primary timeout should not stall EOD for 60-90
+        # additional seconds before the source-grounded local fallback.
+        remaining_budget = extraction_budget - (time.monotonic() - extraction_started)
+        recovery_timeout = min(
+            120.0 if compensation_shard else 60.0,
+            remaining_budget if shares_eod_budget else extraction_budget,
+        )
+        if route_exhausted_kind == "transport":
+            errors.append("compact:skipped_after_transport_routes_exhausted")
+            stage_ms["compact_recovery"] = 0
+            recovery_timeout = 0.0
+        elif recovery_timeout < 20.0 and len(messages) >= 32:
+            # Long nightly batches are otherwise forced straight into a local
+            # transcript-derived episode after one exhausted full extraction.
+            recovery_timeout = 60.0
+            errors.append("compact:long_batch_quality_rescue")
+        elif recovery_timeout < 20.0:
+            errors.append("compact:skipped_extraction_budget_exhausted")
+            stage_ms["compact_recovery"] = 0
+            recovery_timeout = 0.0
+        compact_limit = min(target, cap)
+        if len(messages) >= 32:
+            compact_limit = min(cap, max(compact_limit, (len(messages) + 15) // 16))
+        compact_messages_text = format_messages_for_prompt(
+            messages,
+            max_turns=max(1, (len(messages) + 1) // 2),
+            timezone_name=self.rp_time_timezone,
+            max_chars_per_turn=220,
+        )
+        recovery_prompt = build_episode_compact_recovery_prompt(
+            self.character_name,
+            compact_messages_text,
+            compact_limit,
+            message_time_context=time_context,
+            scene_candidates=candidate_payload,
+        )
+        recovery_started = time.monotonic()
+        try:
+            if recovery_timeout <= 0:
+                raise RuntimeError("extraction budget exhausted; local evidence recovery")
+            compact_token = _ACTIVE_PRELIMINARY_LLM_ROUTE.set(
+                compensation_shard
+            )
+            try:
+                recovery_text = await self._call_memory_generation_llm(
+                    recovery_prompt,
+                    provider_id=extraction_provider_id,
+                    timeout=recovery_timeout,
+                    label="episode_extract_compact_retry",
+                )
+            finally:
+                _ACTIVE_PRELIMINARY_LLM_ROUTE.reset(compact_token)
+            episodes = self._parse_episode_blueprints(
+                recovery_text, messages, compact_limit
+            )
+            stage_ms["compact_recovery"] = round(
+                (time.monotonic() - recovery_started) * 1000
+            )
+            if episodes:
+                logger.info(
+                    "[memory][episode] compact recovery succeeded episodes=%d timeout=%.1fs",
+                    len(episodes), recovery_timeout,
+                )
+                return episodes, "llm_compact_recovery", errors, {
+                    "stage_ms": stage_ms,
+                    "total_ms": round((time.monotonic() - extraction_started) * 1000),
+                }
+            errors.append("compact:no_grounded_episodes")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if recovery_timeout > 0:
+                stage_ms["compact_recovery"] = round(
+                    (time.monotonic() - recovery_started) * 1000
+                )
+            error_text = (str(exc).strip() or type(exc).__name__)[:240]
+            if recovery_timeout > 0:
+                errors.append("compact:" + error_text)
+            if recovery_timeout > 0:
+                logger.warning(
+                    "[memos-memory][episode] 紧凑证据抽取仍失败，改用本地原文证据保底: %s",
+                    error_text,
+                )
+            else:
+                logger.info(
+                    "[memos-memory][episode] 紧凑恢复已按路线策略跳过，直接使用原文证据保底"
+                )
+
+        episodes = build_local_grounded_episodes(
+            messages,
+            candidates,
+            max_episodes=min(target, cap),
+            timezone_name=self.rp_time_timezone,
+        )
+        if not episodes:
+            raise ValueError("episode recovery could not build grounded evidence")
+        logger.warning(
+            "[memos-memory][episode] 已启用本地原文证据保底: episodes=%d errors=%s",
+            len(episodes), " | ".join(errors),
+        )
+        return episodes, "local_grounded_recovery", errors, {
+            "stage_ms": stage_ms,
+            "total_ms": round((time.monotonic() - extraction_started) * 1000),
+        }
+
+    @staticmethod
+    def _normalize_diary_render_keys(
+        items: list[dict[str, Any]],
+        episodes: list[dict[str, Any]],
+    ) -> tuple[dict[str, str], int]:
+        """Accept only the safe eN/recovery_eN alias from local recovery."""
+        expected = {
+            str(episode.get("episode_key") or "").strip()
+            for episode in episodes
+            if str(episode.get("episode_key") or "").strip()
+        }
+        rendered: dict[str, str] = {}
+        aliases = 0
+        for item in items:
+            key = str(item.get("episode_key") or "").strip()
+            content = str(item.get("content") or "").strip()
+            if not key or not content:
+                continue
+            target = key
+            if target not in expected:
+                match = re.fullmatch(r"e(\d+)", key, flags=re.I)
+                recovery_key = f"recovery_e{match.group(1)}" if match else ""
+                if recovery_key in expected:
+                    target = recovery_key
+                    aliases += 1
+            if target in expected and target not in rendered:
+                rendered[target] = content
+        return rendered, aliases
+
     async def _generate_evidence_first_diaries(
         self,
         messages: list[dict[str, Any]],
@@ -4095,41 +6155,46 @@ class MemosMemoryPlugin(Star):
         *,
         diary_cap: int = 0,
         exact_count: bool = False,
+        source_kind: str = "auto",
+        prebuilt_episodes: list[dict[str, Any]] | None = None,
+        prebuilt_extraction_mode: str = "local_grounded_recovery",
+        prebuilt_extraction_errors: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        generation_started = time.monotonic()
         splitter = getattr(self, "_scene_splitter", None) or SceneSplitter(
             gap_seconds=float(getattr(self, "scene_split_gap_seconds", 10800) or 10800),
-            max_scenes=int(getattr(self, "diary_count_max_cap", 6) or 6),
+            max_scenes=int(getattr(self, "diary_count_max_cap", 3) or 3),
         )
         scene_enabled = bool(getattr(self, "scene_split_enable", True))
         candidates = splitter.detect(messages) if scene_enabled else []
-        cap = max(1, int(diary_cap or getattr(self, "diary_count_max_cap", 6) or diary_count or 1))
+        cap = max(1, int(diary_cap or getattr(self, "diary_count_max_cap", 3) or diary_count or 1))
         target = max(1, int(diary_count or 1))
-        if scene_enabled:
+        if scene_enabled and str(source_kind or "auto").lower() != "eod":
             target = splitter.dynamic_diary_count(
-                target, messages, candidates, cap, source_kind="eod" if exact_count else "auto",
+                target, messages, candidates, cap, source_kind=source_kind,
             )
         logger.info(
             "[memory][scene] candidates=%d turns=%d target=%d cap=%d boundaries=%s",
             len(candidates), len(messages), target, cap,
             ",".join(sorted({reason for item in candidates for reason in item.reasons})) or "none",
         )
-        extraction_prompt = build_episode_extraction_prompt(
-            self.character_name,
-            messages_text,
-            target,
-            exact_count=exact_count,
-            timezone_name=self.rp_time_timezone,
-            message_time_context=recorded_time_context(messages, self.rp_time_timezone),
-            scene_candidates=as_prompt_payload(candidates),
-            diary_cap=cap,
-        )
-        extraction_text = await self._call_memory_generation_llm(
-            extraction_prompt,
-            provider_id=self.episode_extraction_provider_id,
-            timeout=self.episode_extraction_timeout,
-            label="episode_extract",
-        )
-        episodes = self._parse_episode_blueprints(extraction_text, messages, cap)
+        if prebuilt_episodes is not None:
+            episodes = [dict(item) for item in prebuilt_episodes]
+            extraction_mode = str(
+                prebuilt_extraction_mode or "local_grounded_recovery"
+            )
+            extraction_errors = list(prebuilt_extraction_errors or [])
+            extraction_diag = {"total_ms": 0, "stage_ms": {"archived_recovery": 0}}
+        else:
+            episodes, extraction_mode, extraction_errors, extraction_diag = await self._extract_episode_blueprints_resilient(
+                messages,
+                messages_text,
+                target,
+                cap,
+                candidates,
+                exact_count=exact_count,
+                source_kind=source_kind,
+            )
         scene_report = (
             splitter.validate(episodes, messages, candidates)
             if scene_enabled else {"fixed": [], "overlaps": [], "uncovered": [], "invalid": []}
@@ -4140,50 +6205,224 @@ class MemosMemoryPlugin(Star):
             len(scene_report.get("overlaps") or []), len(scene_report.get("uncovered") or []),
             len(scene_report.get("invalid") or []),
         )
-        if exact_count and 0 < len(episodes) < target:
-            retry_text = await self._call_memory_generation_llm(
-                extraction_prompt
-                + "\n\n【覆盖修正】首轮只提取了 " + str(len(episodes))
-                + " 个情景，目标是 " + str(target)
-                + " 个。请重新检查候选范围、不同日期、地点、目标、关系阶段和情绪转折；"
-                  "补回有来源证据的独立情景，禁止重复、虚构或切碎同一情感弧。重新输出完整 JSON 数组。",
-                provider_id=self.episode_extraction_provider_id,
-                timeout=self.episode_extraction_timeout,
-                label="episode_extract_retry",
+        if exact_count and extraction_mode == "llm_primary" and 0 < len(episodes) < target:
+            extraction_prompt = build_episode_extraction_prompt(
+                self.character_name,
+                messages_text,
+                target,
+                exact_count=True,
+                timezone_name=self.rp_time_timezone,
+                message_time_context=recorded_time_context(messages, self.rp_time_timezone),
+                scene_candidates=as_prompt_payload(candidates),
+                diary_cap=cap,
             )
-            retry_episodes = self._parse_episode_blueprints(retry_text, messages, cap)
-            if len(retry_episodes) > len(episodes):
-                episodes = retry_episodes
-                scene_report = splitter.validate(episodes, messages, candidates)
-                logger.info(
-                    "[memory][scene] retry validated episodes=%d fixed=%d overlaps=%d uncovered=%d invalid=%d",
-                    len(episodes), len(scene_report.get("fixed") or []),
-                    len(scene_report.get("overlaps") or []), len(scene_report.get("uncovered") or []),
-                    len(scene_report.get("invalid") or []),
+            try:
+                retry_text = await self._call_memory_generation_llm(
+                    extraction_prompt
+                    + "\n\n【覆盖修正】首轮只提取了 " + str(len(episodes))
+                    + " 个情景，目标是 " + str(target)
+                    + " 个。请重新检查候选范围、不同日期、地点、目标、关系阶段和情绪转折；"
+                      "补回有来源证据的独立情景，禁止重复、虚构或切碎同一情感弧。重新输出完整 JSON 数组。",
+                    provider_id=self.episode_extraction_provider_id,
+                    timeout=self.episode_extraction_timeout,
+                    label="episode_extract_retry",
+                )
+                retry_episodes = self._parse_episode_blueprints(retry_text, messages, cap)
+                if len(retry_episodes) > len(episodes):
+                    episodes = retry_episodes
+                    scene_report = splitter.validate(episodes, messages, candidates)
+                    logger.info(
+                        "[memory][scene] retry validated episodes=%d fixed=%d overlaps=%d uncovered=%d invalid=%d",
+                        len(episodes), len(scene_report.get("fixed") or []),
+                        len(scene_report.get("overlaps") or []), len(scene_report.get("uncovered") or []),
+                        len(scene_report.get("invalid") or []),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[memos-memory][episode] 覆盖数量修正失败，保留首轮有效 Episode: %s", exc,
                 )
         if not episodes:
             raise ValueError("episode extraction returned no grounded episodes")
+        if scene_enabled and len(messages) >= 32:
+            uncovered_material = [
+                index for index in (scene_report.get("uncovered") or [])
+                if len(str(messages[index].get("content") or "").strip()) > 8
+            ]
+            if len(uncovered_material) > max(3, len(messages) // 10):
+                raise DiaryGenerationDeferred(
+                    "长批次仍有未覆盖的原文情景，已保留原文等待重试",
+                    {"stage": "episode_coverage", "uncovered_turns": uncovered_material[:24],
+                     "source_messages": len(messages), "extraction_mode": extraction_mode,
+                     "extraction_errors": list(extraction_errors)},
+                )
+        if extraction_mode in {"local_grounded_recovery", "llm_compact_recovery"} and len(messages) >= 32:
+            weak_episodes = []
+            for episode in episodes:
+                start = int(episode.get("scene_start_turn") or 0)
+                span = int(episode.get("scene_end_turn") or 0) - start + 1
+                if span < 32:
+                    continue
+                evidence_view = project_grounded_evidence_for_render(
+                    episode.get("evidence") or [], minimum_budget=6,
+                )
+                cited = {
+                    index
+                    for item in evidence_view
+                    if isinstance(item, dict) and item.get("grounded") is True
+                    and str(item.get("tier") or "supporting") != "archive_only"
+                    for index in (item.get("turn_indexes") or [])
+                    if isinstance(index, int) and start <= index < start + span
+                }
+                regions = {min(2, 3 * (index - start) // span) for index in cited}
+                if len(cited) < max(6, (span + 7) // 8) or len(cited) > 24 or len(regions) < 3:
+                    weak_episodes.append(str(episode.get("episode_key") or "?"))
+            if weak_episodes:
+                raise DiaryGenerationDeferred(
+                    "长批次证据不足或过密，原文已保留，等待模型重新抽取",
+                    {"stage": "episode_segmentation", "episode_keys": weak_episodes,
+                     "source_messages": len(messages),
+                     "extraction_mode": extraction_mode,
+                     "extraction_errors": list(extraction_errors)},
+                )
+        unsupported = [
+            str(episode.get("episode_key") or "?") for episode in episodes
+            if not any(
+                isinstance(item, dict)
+                and item.get("grounded") is True
+                and str(item.get("tier") or "supporting") != "archive_only"
+                and str(item.get("detail") or item.get("quote") or "").strip()
+                for item in (episode.get("evidence") or [])
+            )
+        ]
+        if unsupported:
+            raise DiaryGenerationDeferred(
+                "情景缺少可发布的原文证据，已保留原文等待重试",
+                {"stage": "episode_evidence", "episode_keys": unsupported,
+                 "extraction_mode": extraction_mode, "extraction_errors": list(extraction_errors)},
+            )
 
         tier_counts: dict[str, int] = {}
         for episode in episodes:
             for item in episode.get("evidence") or []:
                 tier = str(item.get("tier") or "supporting")
                 tier_counts[tier] = tier_counts.get(tier, 0) + 1
-        logger.info("[memory][episode] episodes=%d tiers=%s", len(episodes), tier_counts)
-
-        render_prompt = build_diary_render_prompt(self.character_name, messages_text, episodes)
-        render_text = await self._call_memory_generation_llm(
-            render_prompt,
-            provider_id=self.diary_render_provider_id,
-            timeout=self.diary_render_timeout,
-            label="diary_render",
+        logger.info(
+            "[memory][episode] episodes=%d tiers=%s extraction=%s recovery_errors=%d",
+            len(episodes), tier_counts, extraction_mode, len(extraction_errors),
         )
-        rendered = {
-            str(item.get("episode_key") or "").strip(): str(item.get("content") or "").strip()
-            for item in self._parse_json_array(render_text)
-            if str(item.get("episode_key") or "").strip() and str(item.get("content") or "").strip()
+
+        long_local_recovery = extraction_mode == "local_grounded_recovery" and len(messages) >= 24
+        long_grounded_projection = (
+            extraction_mode in {"local_grounded_recovery", "llm_sharded_recovery"}
+            and len(messages) >= 24
+        )
+        render_episodes = episodes
+        if long_grounded_projection:
+            source_episodes = [
+                {**episode, "evidence": project_grounded_evidence_for_render(
+                    episode.get("evidence") or [], minimum_budget=6,
+                )}
+                for episode in episodes
+            ]
+            render_episodes = [{
+                key: value for key, value in episode.items()
+                if key in {
+                    "episode_key", "event_date", "time_label", "time_basis",
+                    "scene_anchor", "scene_start_turn", "scene_end_turn",
+                    "memory_type", "state_change", "long_effect",
+                    "trigger_hint", "unresolved", "_episode_extraction_mode",
+                }
+            } | {"evidence": [{
+                key: value for key, value in item.items()
+                if key in {"kind", "actor", "detail", "tier"}
+            } for item in episode.get("evidence") or []]}
+                for episode in source_episodes
+            ]
+        def episode_source_text(episode: dict[str, Any]) -> str:
+            start = max(0, int(episode.get("scene_start_turn") or 0))
+            end = min(
+                len(messages) - 1,
+                int(episode.get("scene_end_turn") if episode.get("scene_end_turn") is not None else start),
+            )
+            if end < start:
+                start, end = 0, max(0, len(messages) - 1)
+            return "\n".join(
+                str(messages[index].get("content") or "")
+                for index in range(start, end + 1)
+            )
+
+        source_text_by_key = {
+            str(episode.get("episode_key") or ""): episode_source_text(episode)
+            for episode in episodes
         }
-        raw_text = "\n".join(str(message.get("content") or "") for message in messages)
+        length_hints: dict[str, str] = {}
+        for key, source_text in source_text_by_key.items():
+            source_chars = len("".join(source_text.split()))
+            _lower, _upper, hint = self._diary_length_hint(source_chars)
+            length_hints[key] = hint
+        render_prompt = build_diary_render_prompt(
+            self.character_name, messages_text, render_episodes,
+            length_hints=length_hints,
+        )
+        render_text = ""
+        render_call_error = ""
+        render_started = time.monotonic()
+        try:
+            render_text = await self._call_memory_generation_llm(
+                render_prompt,
+                provider_id=self.diary_render_provider_id,
+                timeout=self.diary_render_timeout,
+                label=(
+                    "diary_render_grounded"
+                    if long_grounded_projection else "diary_render"
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            render_call_error = (str(exc).strip() or type(exc).__name__)[:240]
+            logger.warning(
+                "[memos-memory][episode] 文学日记渲染调用失败，原文保留且禁止发布回退稿: %s",
+                exc,
+            )
+            if isinstance(exc, LLMEmptyFinalError):
+                # A reasoning-only response is not a transport failure. Let the
+                # existing quality retry handle the missing diary with its full
+                # render deadline instead of spending an extra short retry.
+                render_call_error = ""
+            elif not isinstance(exc, LLMRouteExhaustedError) and (
+                long_grounded_projection or isinstance(exc, (TimeoutError, ConnectionError))
+            ):
+                try:
+                    render_text = await self._call_memory_generation_llm(
+                        render_prompt + "\n\n【有界重试】只输出所列 episode_key 的 JSON 日记。"
+                        "保留重要事实和情感转折，不逐条复述对话；原文另有独立档案。",
+                        provider_id=self.diary_render_provider_id,
+                        timeout=min(120.0, float(self.diary_render_timeout or 180.0)),
+                        label="diary_render_timeout_retry",
+                    )
+                    render_call_error = ""
+                except asyncio.CancelledError:
+                    raise
+                except Exception as retry_exc:
+                    logger.warning(
+                        "[memos-memory][episode] 文学日记有界重试失败，继续保留原文: %s",
+                        retry_exc,
+                    )
+                    render_call_error += "; retry:" + (
+                        str(retry_exc).strip() or type(retry_exc).__name__
+                    )[:160]
+        render_elapsed_ms = round((time.monotonic() - render_started) * 1000)
+        rendered, render_aliases = self._normalize_diary_render_keys(
+            self._parse_json_array(render_text), episodes,
+        )
+        if render_aliases:
+            logger.info(
+                "[memory][diary] normalized %d safe recovery episode key aliases",
+                render_aliases,
+            )
         threshold = float(getattr(self, "diary_must_coverage_threshold", 0.72) or 0.72)
         pipeline = getattr(self, "_diary_pipeline", None) or DiaryPipeline(self)
 
@@ -4191,13 +6430,42 @@ class MemosMemoryPlugin(Star):
             coverage, missing = self._diary_render_coverage(content, episode)
             support = pipeline.support_coverage(content, episode)
             person_ok, person_reason = self._diary_first_person_check(content, episode)
-            risk_detail = pipeline.risk_report(content, raw_text)
+            key = str(episode.get("episode_key") or "")
+            scene_raw = source_text_by_key.get(key, "")
+            scene_chars = len("".join(scene_raw.split()))
+            risk_detail = pipeline.risk_report(content, scene_raw)
             risk = float(risk_detail.risk) if getattr(
                 self, "diary_transcript_check_enable", True
             ) else 0.0
+            evidence = [item for item in (episode.get("evidence") or []) if isinstance(item, dict)]
+            must_count = sum(1 for item in evidence if str(item.get("tier") or "") == "must_write")
+            support_count = sum(1 for item in evidence if str(item.get("tier") or "") == "supporting")
             reasons: list[str] = []
             if coverage < threshold:
                 reasons.append("coverage_below_threshold")
+            ratio_limit = 1.0
+            absolute_limit = 900
+            if scene_chars >= 7000:
+                ratio_limit, absolute_limit = 0.32, 1900
+            elif scene_chars >= 3500:
+                ratio_limit, absolute_limit = 0.40, 1600
+            elif scene_chars >= 1800:
+                ratio_limit, absolute_limit = 0.52, 1250
+            elif scene_chars >= 1000:
+                ratio_limit, absolute_limit = 0.70, 1000
+            elif scene_chars >= 400:
+                ratio_limit, absolute_limit = 0.82, 900
+            allowed_chars = absolute_limit + max(0, must_count - 6) * 90
+            if scene_chars >= 400 and risk_detail.compression_ratio > ratio_limit:
+                reasons.append("scene_compression_too_dense")
+            if len(content) > int(allowed_chars * 1.12):
+                reasons.append("single_diary_too_long")
+            if support_count >= 8 and support > 0.75 and len(content) >= 500:
+                reasons.append("supporting_evidence_oversaturated")
+            if len(content) >= 500 and risk_detail.flow_density >= 0.55:
+                reasons.append("turn_by_turn_flow")
+            if len(content) >= 500 and risk_detail.stage_direction_ratio > 0.12:
+                reasons.append("stage_direction_replay")
             if not person_ok:
                 reasons.append("first_person:" + person_reason)
             if risk >= 0.42:
@@ -4209,6 +6477,10 @@ class MemosMemoryPlugin(Star):
                 "source_overlap_ratio": float(risk_detail.longest_common_ratio),
                 "direct_quote_ratio": float(risk_detail.quote_ratio),
                 "compression_ratio": float(risk_detail.compression_ratio),
+                "flow_density": float(risk_detail.flow_density),
+                "stage_direction_ratio": float(risk_detail.stage_direction_ratio),
+                "scene_source_chars": scene_chars,
+                "length_limit": allowed_chars,
             }
 
         assessments = {
@@ -4225,7 +6497,7 @@ class MemosMemoryPlugin(Star):
         ]
         for key in initial_missing_keys:
             retry_reasons[key] = "missing_episode_key"
-        if retry_reasons:
+        if retry_reasons and not render_call_error:
             retry_rendered: dict[str, str] = {}
             try:
                 retry_text = await self._call_memory_generation_llm(
@@ -4233,16 +6505,21 @@ class MemosMemoryPlugin(Star):
                     + "\n\n【渲染质量修正】以下 episode_key 各自只因所列精确原因需要重写：\n"
                     + json.dumps(retry_reasons, ensure_ascii=False, indent=2)
                     + "\n这是唯一一次重试。重新输出完整 JSON 数组；must_write 不得遗漏，"
-                      "必须保持第一人称私密日记体并降低聊天转录密度，不得新增事实。",
+                      "必须保持第一人称私密日记体并降低聊天转录密度，不得新增事实。"
+                      "长批次恢复稿只保留情景转折、约定与代表性感官细节，"
+                      "不可沿原始轮次逐条铺陈动作；原文已经单独归档。",
                     provider_id=self.diary_render_provider_id,
                     timeout=self.diary_render_timeout,
                     label="diary_render_retry",
                 )
-                retry_rendered = {
-                    str(item.get("episode_key") or "").strip(): str(item.get("content") or "").strip()
-                    for item in self._parse_json_array(retry_text)
-                    if str(item.get("episode_key") or "").strip() and str(item.get("content") or "").strip()
-                }
+                retry_rendered, retry_aliases = self._normalize_diary_render_keys(
+                    self._parse_json_array(retry_text), episodes,
+                )
+                if retry_aliases:
+                    logger.info(
+                        "[memory][diary] normalized %d retry recovery episode key aliases",
+                        retry_aliases,
+                    )
             except Exception as exc:
                 logger.warning("[memos-memory] diary render retry failed; keeping grounded episodes: %s", exc)
             by_key = {episode["episode_key"]: episode for episode in episodes}
@@ -4267,7 +6544,6 @@ class MemosMemoryPlugin(Star):
                     rendered[key] = retry_content
                     assessments[key] = retry_report
 
-        fallback_keys: list[str] = []
         fallback_reasons: dict[str, str] = {}
         missing_keys = [episode["episode_key"] for episode in episodes if episode["episode_key"] not in rendered]
         for episode in episodes:
@@ -4276,22 +6552,32 @@ class MemosMemoryPlugin(Star):
             if key in rendered and current_report is not None and not current_report["reasons"]:
                 continue
             if key not in rendered:
-                fallback_reasons[key] = "missing_key_fallback"
+                fallback_reasons[key] = (
+                    "render_call_failed:" + render_call_error
+                    if render_call_error else "missing_key_fallback"
+                )
             else:
                 fallback_reasons[key] = "grounded_fallback_after:" + ",".join(
                     current_report["reasons"]
                 )
-            fallback = self._grounded_episode_fallback_diary(episode)
-            if not fallback:
-                raise ValueError(f"grounded episode {key} has no renderable evidence")
-            rendered[key] = fallback
-            assessments[key] = assess(fallback, episode)
-            fallback_keys.append(key)
-        if fallback_keys:
+        if fallback_reasons:
             logger.warning(
-                "[memos-memory] renderer left invalid or missing keys (%s); "
-                "using evidence-preserving fallback reasons=%s",
-                ",".join(fallback_keys), fallback_reasons,
+                "[memos-memory][diary] publish blocked; grounded source retained "
+                "keys=%s reasons=%s",
+                ",".join(fallback_reasons), fallback_reasons,
+            )
+            raise DiaryGenerationDeferred(
+                "文学日记尚未生成成功，已保留原文等待重试",
+                {
+                    "stage": "diary_render",
+                    "render_call_error": render_call_error,
+                    "reasons": fallback_reasons,
+                    "episode_keys": list(fallback_reasons),
+                    "extraction_mode": extraction_mode,
+                    "extraction_errors": list(extraction_errors),
+                    "extraction_ms": int(extraction_diag.get("total_ms") or 0),
+                    "render_ms": render_elapsed_ms,
+                },
             )
 
         diaries: list[dict[str, Any]] = []
@@ -4308,13 +6594,24 @@ class MemosMemoryPlugin(Star):
             diary["_source_overlap_ratio"] = round(report["source_overlap_ratio"], 4)
             diary["_direct_quote_ratio"] = round(report["direct_quote_ratio"], 4)
             diary["_compression_ratio"] = round(report["compression_ratio"], 4)
-            diary["_render_retry_reason"] = fallback_reasons.get(key, retry_reasons.get(key, ""))
+            diary["_flow_density"] = round(report["flow_density"], 4)
+            diary["_stage_direction_ratio"] = round(report["stage_direction_ratio"], 4)
+            diary["_scene_source_chars"] = int(report["scene_source_chars"])
+            diary["_render_retry_reason"] = retry_reasons.get(key, "")
             diary["_render_version"] = _PLUGIN_VERSION
             diary["_diary_render_version"] = _PLUGIN_VERSION
+            diary["_episode_extraction_mode"] = extraction_mode
+            diary["_episode_extraction_errors"] = list(extraction_errors)
+            diary["_episode_extraction_ms"] = int(extraction_diag.get("total_ms") or 0)
+            diary["_episode_extraction_stage_ms"] = dict(
+                extraction_diag.get("stage_ms") or {}
+            )
+            diary["_diary_render_ms"] = render_elapsed_ms
+            diary["_memory_generation_ms"] = round(
+                (time.monotonic() - generation_started) * 1000
+            )
             diary["_render_missing"] = list(report["missing"])[:8]
-            diary["_render_fallback"] = key in fallback_keys
-            if key in missing_keys:
-                diary["_render_retry_reason"] = "missing_key_fallback"
+            diary["_render_fallback"] = False
             logger.info(
                 "[memory][diary] %s chars=%d must=%.3f support=%.3f risk=%.3f retry=%s fallback=%s",
                 key, len(diary["content"]), diary["_must_coverage"],
@@ -4623,16 +6920,22 @@ class MemosMemoryPlugin(Star):
                 logger.debug("[memos-memory] similarity cluster rebuild failed: %s", e)
         return (keyword_count, edge_count)
 
-    async def _store_one_diary(self, diary: dict[str, Any], source_session: str = "",
-                               importance: int = 3, manual: bool = False,
-                               source_kind: str = "auto") -> bool:
+    def _prepare_diary_storage(
+        self,
+        diary: dict[str, Any],
+        *,
+        importance: int = 3,
+        manual: bool = False,
+        source_kind: str = "auto",
+    ) -> dict[str, Any] | None:
+        """Normalize one diary once for both create and in-place repair paths."""
         content = (diary.get("content") or "").strip()
         if not content:
-            return False
+            return None
         raw_tags = diary.get("tags") or []
         content, raw_tags = _extract_inline_tags_from_content(content, raw_tags)
         if not content:
-            return False
+            return None
         flow_tags = {
             "#保底", "#保底压缩", "#夜间压缩", "#晚间压缩", "#自动压缩",
             "#eod", "#EOD", "#迁移", "#livingmemory",
@@ -4689,6 +6992,41 @@ class MemosMemoryPlugin(Star):
             f"occurred_at={time_meta['occurred_at']};time_basis={time_meta['time_basis']}"
             f"{';meta64=' + meta64 if meta64 else ''} -->"
         )
+        return {
+            "content": content,
+            "tags": tags,
+            "time_meta": time_meta,
+            "ts_text": ts_text,
+            "importance": imp,
+            "memory_type": memory_type,
+            "long_effect": long_effect,
+            "trigger_hint": trigger_hint,
+            "machine": machine,
+            "memos_text": memos_text,
+        }
+
+    async def _store_one_diary(self, diary: dict[str, Any], source_session: str = "",
+                               importance: int = 3, manual: bool = False,
+                               source_kind: str = "auto",
+                               require_memos: bool = False) -> bool:
+        prepared = self._prepare_diary_storage(
+            diary,
+            importance=importance,
+            manual=manual,
+            source_kind=source_kind,
+        )
+        if prepared is None:
+            return False
+        content = str(prepared["content"])
+        tags = list(prepared["tags"])
+        time_meta = dict(prepared["time_meta"])
+        ts_text = str(prepared["ts_text"])
+        imp = int(prepared["importance"])
+        memory_type = str(prepared["memory_type"])
+        long_effect = str(prepared["long_effect"])
+        trigger_hint = str(prepared["trigger_hint"])
+        machine = dict(prepared["machine"])
+        memos_text = str(prepared["memos_text"])
 
         memo_name = None
         memos_written = False
@@ -4703,6 +7041,9 @@ class MemosMemoryPlugin(Star):
                 source_created_ts, source_updated_ts = memo_source_times(memo)
             except Exception as e:
                 logger.warning("[memos-memory] memos create 失败: %s", e)
+        if require_memos and not memos_written:
+            logger.warning("[memos-memory][diary] Memos 未写入，证据优先日记保留待重试")
+            return False
         if memo_name is None:
             memo_name = f"local/{time.time_ns()}"
 
@@ -4935,8 +7276,22 @@ class MemosMemoryPlugin(Star):
                         vivid_threshold=self.memory_access_vivid_threshold,
                         deep_threshold=self.memory_access_deep_threshold,
                     )
+                    # Queue incremental interference rebuild for this memo
+                    self._episodes.mark_memory_interference_dirty([memo_name])
+                    if self._memory_access_dirty_event is not None:
+                        self._memory_access_dirty_event.set()
             except Exception as exc:
                 logger.debug("[memos-memory][access] new episode sync failed open: %s", exc)
+        # 6.0: enqueue for thread-build analysis (fail-open)
+        if self.thread_memory_enable and self._episodes is not None:
+            try:
+                scope_id = str(getattr(self, "character_name", "") or "default")
+                stored_ep = self._episodes.get_episode(memo_name)
+                if stored_ep:
+                    ep_id = str(stored_ep.get("episode_id") or stored_ep.get("memo_name") or memo_name)
+                    self._episodes.thread_enqueue(scope_id, ep_id)
+            except Exception as exc:
+                logger.debug("[memos-memory][thread] enqueue failed open: %s", exc)
         return True
 
     # ---------- 4.6.0-test3 persistent long-diary workflow ----------
@@ -4975,6 +7330,369 @@ class MemosMemoryPlugin(Star):
                 break
         return output
 
+    def _fallback_repair_candidates(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Published compatibility drafts that can be rebuilt from raw turns."""
+        if self._episodes is None:
+            return []
+        rows = self._episodes.fallback_repair_candidates(
+            limit=max(1, min(500, int(limit))),
+        )
+        output: list[dict[str, Any]] = []
+        for raw in rows:
+            item = dict(raw)
+            item["repairable"] = bool(
+                item.get("memo_name")
+                and item.get("source_batch_id")
+                and int(item.get("source_turns") or 0) > 0
+            )
+            output.append(item)
+        return output
+
+    @staticmethod
+    def _remap_repair_turn_indexes(
+        diary: dict[str, Any], original_indexes: list[int],
+    ) -> None:
+        """Map indexes produced from a scene slice back to its archived batch."""
+        def mapped(value: Any) -> int | None:
+            try:
+                local_index = int(value)
+            except (TypeError, ValueError):
+                return None
+            if 0 <= local_index < len(original_indexes):
+                return int(original_indexes[local_index])
+            return None
+
+        for field in ("scene_start_turn", "scene_end_turn"):
+            value = mapped(diary.get(field))
+            if value is not None:
+                diary[field] = value
+        for evidence in diary.get("evidence") or []:
+            if not isinstance(evidence, dict):
+                continue
+            indexes = evidence.get("turn_indexes")
+            if not isinstance(indexes, list):
+                continue
+            remapped = [mapped(value) for value in indexes]
+            evidence["turn_indexes"] = sorted({
+                int(value) for value in remapped if value is not None
+            })
+
+    async def _save_inplace_repair_preview(
+        self,
+        episode: dict[str, Any],
+        diary: dict[str, Any],
+        *,
+        batch_id: str,
+        original_indexes: list[int],
+        compensation_record_id: str = "",
+    ) -> dict[str, Any]:
+        """Persist one already-validated replacement without touching Memos."""
+        if self._episodes is None or self._memos is None:
+            raise RuntimeError("Memos 或原文库未就绪")
+        memo_name = str(episode.get("memo_name") or "")
+        episode_id = str(episode.get("episode_id") or "")
+        if not memo_name or not episode_id:
+            raise RuntimeError("旧日记缺少稳定标识，禁止原位替换")
+        item = dict(diary)
+        self._remap_repair_turn_indexes(item, original_indexes)
+        item["episode_id"] = episode_id
+        item["_source_batch_id"] = batch_id
+        item["_evidence_quality"] = "source_grounded"
+        item["_render_fallback"] = False
+
+        original_date = str(episode.get("occurred_at") or "")[:10]
+        if original_date:
+            item["occurred_at"] = original_date
+            item["event_date"] = original_date
+            item["time_basis"] = str(
+                episode.get("time_basis") or item.get("time_basis") or "conversation_now"
+            )
+            old_label = str(episode.get("occurred_at") or "")
+            if not str(item.get("time_label") or "").strip():
+                item["time_label"] = next(
+                    (part for part in (
+                        "凌晨", "早晨", "上午", "中午", "下午", "傍晚", "夜晚", "深夜",
+                    ) if part in old_label),
+                    "",
+                )
+
+        current_memo = await self._memos.get_memo(memo_name)
+        if not current_memo:
+            raise RuntimeError("Memos 中的原日记已不存在，禁止创建重复条目")
+        old_content = str(current_memo.get("content") or "")
+        old_episode = self._episodes.episode_snapshot(memo_name)
+        if not old_episode:
+            raise RuntimeError("旧 Episode 快照失败，禁止无回滚写回")
+        preview_id = "repair_" + hashlib.sha256(
+            f"{episode_id}|{compensation_record_id}|{time.time_ns()}".encode("utf-8")
+        ).hexdigest()[:20]
+        payload = {
+            "preview_id": preview_id,
+            "mode": "inplace_fallback_repair",
+            "episode_id": episode_id,
+            "old_memo_name": memo_name,
+            "old_card_text": str(episode.get("card_text") or ""),
+            "old_memo_content": old_content,
+            "old_content_hash": self._content_hash(old_content),
+            "old_episode": old_episode,
+            "source_batch_id": batch_id,
+            "source_turns": len(original_indexes),
+            "source_turn_start": min(original_indexes) if original_indexes else -1,
+            "source_turn_end": max(original_indexes) if original_indexes else -1,
+            "compensation_record_id": str(compensation_record_id or ""),
+            "new_diaries": [item],
+            "created_ts": time.time(),
+        }
+        saved = self._episodes.save_diary_preview(payload)
+        self._episodes.discard_old_previews(keep=20)
+        return (
+            self._episodes.get_diary_preview(
+                str(saved.get("preview_id") or preview_id)
+            ) or saved
+        )
+
+    async def _create_fallback_repair_preview(
+        self, episode_id: str, *, recovery_mode: str = "render",
+    ) -> dict[str, Any]:
+        """Regenerate one bad published fallback without modifying Memos."""
+        if self._episodes is None or self._memos is None:
+            raise RuntimeError("Memos 或原文库未就绪")
+        episode = self._episodes.get_episode_by_id(str(episode_id or ""))
+        if not episode or (recovery_mode != "full" and not bool(episode.get("render_fallback"))):
+            raise RuntimeError("该条目不是待文学重建的回退日记")
+        memo_name = str(episode.get("memo_name") or "")
+        batch_id = str(episode.get("source_batch_id") or "")
+        turns = self._episodes.source_turns(batch_id) if batch_id else []
+        if not turns:
+            raise RuntimeError("原始轮次不可读，禁止无依据重建")
+
+        start = int(episode.get("scene_start_turn") or 0)
+        end = int(episode.get("scene_end_turn") or -1)
+        selected = [
+            turn for turn in turns
+            if start <= int(turn.get("turn_index") or 0) <= end
+        ] if 0 <= start <= end else []
+        if not selected:
+            selected = list(turns)
+        if len(selected) >= (24 if recovery_mode == "full" else 32):
+            raise DiaryGenerationDeferred(
+                "原位修复范围过大，不能强制写成一篇；请在记忆生产页先做分篇重写预览",
+                {"stage": "fallback_repair", "source_messages": len(selected)},
+            )
+        original_indexes = [int(turn.get("turn_index") or 0) for turn in selected]
+        messages = [{
+            "role": str(turn.get("role") or ""),
+            "content": str(turn.get("content") or ""),
+            "event_ts": float(turn.get("event_ts") or 0),
+            "event_timezone": str(
+                turn.get("event_timezone") or self.rp_time_timezone
+            ),
+        } for turn in selected]
+        messages_text = format_messages_for_prompt(
+            messages,
+            max_turns=max(1, (len(messages) + 1) // 2),
+            timezone_name=self.rp_time_timezone,
+            max_chars_per_turn=self.raw_archive_prompt_view_max_chars,
+        )
+        recovery_episodes = None
+        if recovery_mode != "full":
+            recovery_episodes = build_local_grounded_episodes(
+                messages, None, 1, self.rp_time_timezone,
+            )
+            if len(recovery_episodes) != 1:
+                raise RuntimeError("原文证据无法重建成单一情景，禁止写回")
+        diaries = await self._generate_evidence_first_diaries(
+            messages, messages_text, 1, diary_cap=1,
+            exact_count=True, source_kind="fallback_repair",
+            prebuilt_episodes=recovery_episodes,
+        )
+        if len(diaries) != 1 or bool(diaries[0].get("_render_fallback")):
+            raise DiaryGenerationDeferred(
+                "修复生成未通过单篇文学日记闸门，旧内容未改动",
+                {"stage": "fallback_repair", "actual": len(diaries)},
+            )
+        if recovery_mode == "full" and str(diaries[0].get("_episode_extraction_mode") or "") != "llm_primary":
+            raise DiaryGenerationDeferred(
+                "证据抽取仍未恢复，旧保底日记保持原状",
+                {"stage": "fallback_repair", "extraction_mode": diaries[0].get("_episode_extraction_mode")},
+            )
+        return await self._save_inplace_repair_preview(
+            episode,
+            diaries[0],
+            batch_id=batch_id,
+            original_indexes=original_indexes,
+        )
+
+    async def _restore_inplace_repair_state(
+        self,
+        *,
+        memo_name: str,
+        old_content: str,
+        old_episode: dict[str, Any] | None,
+    ) -> None:
+        """Restore Memos, passage index and Episode metadata from one snapshot."""
+        if self._memos is None:
+            raise RuntimeError("Memos 未就绪")
+        restored = await self._memos.update_memo(memo_name, old_content)
+        restored_memo = dict(restored or {})
+        restored_memo.setdefault("name", memo_name)
+        restored_memo["content"] = old_content
+        if self._vec is not None and not await self._index_memo_record(
+            restored_memo, replace=True,
+        ):
+            raise RuntimeError("旧日记正文已恢复，但段落索引恢复失败")
+        snapshot = dict(old_episode or {})
+        if snapshot.get("episode_row"):
+            if not self._episodes or not self._episodes.restore_episode_snapshot(snapshot):
+                raise RuntimeError("旧 Episode 精确快照恢复失败")
+            return
+        if snapshot:
+            raw_reasons = snapshot.pop("scene_boundary_reasons_json", "")
+            if not isinstance(snapshot.get("scene_boundary_reasons"), list):
+                try:
+                    parsed_reasons = json.loads(raw_reasons or "[]")
+                except (TypeError, json.JSONDecodeError):
+                    parsed_reasons = []
+                snapshot["scene_boundary_reasons"] = (
+                    parsed_reasons if isinstance(parsed_reasons, list) else []
+                )
+            _, body, _ = _parse_memo_content(old_content)
+            created_ts, updated_ts = memo_source_times(restored_memo)
+            snapshot["content"] = body
+            snapshot["_stored_memo_name"] = memo_name
+            snapshot["_stored_source_created_ts"] = created_ts
+            snapshot["_stored_source_updated_ts"] = updated_ts
+            snapshot["_stored_time_meta"] = {
+                "occurred_at": str(snapshot.get("occurred_at") or ""),
+                "event_ts": float(snapshot.get("event_ts") or 0),
+                "time_basis": str(snapshot.get("time_basis") or "unknown"),
+            }
+            snapshot["_evidence_quality"] = str(
+                snapshot.get("evidence_quality") or "diary_derived"
+            )
+            snapshot["_diary_render_version"] = str(
+                snapshot.get("diary_render_version") or ""
+            )
+            snapshot["_render_fallback"] = bool(snapshot.get("render_fallback"))
+            for field in (
+                "must_coverage", "support_coverage", "transcript_risk",
+                "source_overlap_ratio", "direct_quote_ratio", "compression_ratio",
+            ):
+                snapshot["_" + field] = float(snapshot.get(field, -1.0))
+            snapshot["_render_retry_reason"] = str(
+                snapshot.get("render_retry_reason") or ""
+            )
+            await self._persist_episode_for_diary(
+                snapshot,
+                source_batch_id=str(snapshot.get("source_batch_id") or ""),
+                source_kind=str(snapshot.get("source_kind") or "rollback"),
+            )
+
+    async def _confirm_fallback_repair(self, preview_id: str) -> dict[str, Any]:
+        """Replace the same Memo only after a strict, source-grounded preview."""
+        if self._episodes is None or self._memos is None:
+            raise RuntimeError("Memos 或原文库未就绪")
+        preview = self._episodes.get_diary_preview(str(preview_id or ""))
+        if not preview:
+            raise RuntimeError("修复预览不存在或已过期")
+        payload = preview.get("payload") if isinstance(preview.get("payload"), dict) else {}
+        if str(payload.get("mode") or "") != "inplace_fallback_repair":
+            raise RuntimeError("该预览不是原位回退修复")
+        if str(preview.get("status") or "") == "confirmed":
+            return {
+                "ok": True, "status": "confirmed", "preview_id": preview_id,
+                "memo_name": str(payload.get("old_memo_name") or ""),
+                "skipped": True,
+            }
+        if str(preview.get("status") or "") != "pending":
+            raise RuntimeError("该修复预览已失效，请重新生成")
+        diaries = payload.get("new_diaries") if isinstance(payload.get("new_diaries"), list) else []
+        if len(diaries) != 1:
+            raise RuntimeError("修复预览必须且只能包含一篇日记")
+        memo_name = str(payload.get("old_memo_name") or "")
+        old_content = str(payload.get("old_memo_content") or "")
+        old_episode = payload.get("old_episode") if isinstance(payload.get("old_episode"), dict) else {}
+        current = await self._memos.get_memo(memo_name)
+        if not current:
+            raise RuntimeError("原 Memo 已不存在，已拒绝写回")
+        current_content = str(current.get("content") or "")
+        if self._content_hash(current_content) != str(payload.get("old_content_hash") or ""):
+            raise RuntimeError("预览后原 Memo 已被修改，请重新生成修复预览")
+
+        diary = dict(diaries[0])
+        diary["episode_id"] = str(payload.get("episode_id") or "")
+        diary["_source_batch_id"] = str(payload.get("source_batch_id") or "")
+        diary["_evidence_quality"] = "source_grounded"
+        diary["_render_version"] = f"{_PLUGIN_VERSION}-repair"
+        diary["_diary_render_version"] = f"{_PLUGIN_VERSION}-repair"
+        diary["_render_fallback"] = False
+        diary["_render_retry_reason"] = ""
+        diary["_original_memo_version"] = old_content[:60000]
+        prepared = self._prepare_diary_storage(
+            diary,
+            importance=_normalize_importance(diary.get("importance"), 3),
+            source_kind="fallback_repair",
+        )
+        if prepared is None:
+            raise RuntimeError("修复日记为空，已拒绝写回")
+        new_content = str(prepared["memos_text"])
+        rollback_id = self._episodes.record_content_rollback(
+            memo_name=memo_name,
+            episode_id=str(payload.get("episode_id") or ""),
+            old_content=old_content,
+            new_content=new_content,
+            old_episode=old_episode,
+            note=f"inplace_fallback_repair:{preview_id}",
+        )
+        try:
+            updated = await self._memos.update_memo(memo_name, new_content)
+            updated_memo = dict(current)
+            updated_memo.update(updated or {})
+            updated_memo["name"] = memo_name
+            updated_memo["content"] = new_content
+            if self._vec is not None and not await self._index_memo_record(
+                updated_memo, replace=True,
+            ):
+                raise RuntimeError("Memos 已写回，但段落索引更新失败")
+            created_ts, updated_ts = memo_source_times(updated_memo)
+            diary["content"] = str(prepared["content"])
+            diary["tags"] = list(prepared["tags"])
+            diary["_stored_memo_name"] = memo_name
+            diary["_stored_source_created_ts"] = created_ts
+            diary["_stored_source_updated_ts"] = updated_ts
+            diary["_stored_time_meta"] = dict(prepared["time_meta"])
+            if not await self._persist_episode_for_diary(
+                diary,
+                source_batch_id=str(payload.get("source_batch_id") or ""),
+                source_kind="fallback_repair",
+            ):
+                raise RuntimeError("Episode 证据视图更新失败")
+            if not self._episodes.record_inplace_preview_success(
+                str(preview_id), memo_name, rollback_id,
+            ):
+                raise RuntimeError("修复预览状态落盘失败")
+            logger.info(
+                "[memos-memory][diary] fallback repaired in place: %s preview=%s",
+                memo_name, preview_id,
+            )
+            return {
+                "ok": True, "status": "confirmed", "preview_id": preview_id,
+                "memo_name": memo_name, "rollback_id": rollback_id,
+                "source_turns": int(payload.get("source_turns") or 0),
+            }
+        except Exception as exc:
+            restore_error = ""
+            try:
+                await self._restore_inplace_repair_state(
+                    memo_name=memo_name,
+                    old_content=old_content,
+                    old_episode=old_episode,
+                )
+                self._episodes.mark_rollback_reverted(rollback_id)
+            except Exception as restore_exc:
+                restore_error = f"；自动恢复失败: {restore_exc}"
+            raise RuntimeError(f"修复写回失败: {exc}{restore_error}") from exc
+
     async def _create_diary_rewrite_preview(self, episode_id: str) -> dict[str, Any]:
         if self._episodes is None:
             raise RuntimeError("原文库未就绪")
@@ -5000,7 +7718,8 @@ class MemosMemoryPlugin(Star):
         candidates = self._scene_splitter.detect(messages) if self.scene_split_enable else []
         cap = max(1, int(self.diary_count_max_cap or 1))
         diaries = await self._generate_evidence_first_diaries(
-            messages, messages_text, self.diary_count, diary_cap=cap, exact_count=False,
+            messages, messages_text, self.diary_count, diary_cap=cap,
+            exact_count=False, source_kind="rewrite",
         )
         preview_id = "rw_" + hashlib.sha256(
             f"{episode_id}|{time.time_ns()}".encode("utf-8")
@@ -5110,7 +7829,7 @@ class MemosMemoryPlugin(Star):
             )
             future.result()
 
-        result = await asyncio.to_thread(
+        result = await self._run_background_work(
             self._episodes.confirm_diary_preview,
             str(preview_id), apply_item, record_rollback, compensate_item,
         )
@@ -5134,12 +7853,43 @@ class MemosMemoryPlugin(Star):
             raise RuntimeError("Memos 或原文库未就绪")
         rows: list[dict[str, Any]] = []
         if preview_id:
-            rows = self._episodes.diary_preview_rollback_targets(str(preview_id))
+            targets = self._episodes.diary_preview_rollback_targets(str(preview_id))
+            for target in targets:
+                rollback_id = int(target.get("rollback_id") or 0)
+                row = self._episodes.rollback_by_id(rollback_id) if rollback_id else None
+                rows.append(row or dict(target))
         elif memo_name:
             rows = self._episodes.rollback_rows_for_memo(str(memo_name))
         deleted = 0
+        restored = 0
         errors: list[str] = []
         for row in rows:
+            rollback_id = int(row.get("rollback_id") or row.get("id") or 0)
+            if row.get("reverted_ts"):
+                continue
+            if str(row.get("note") or "").startswith("inplace_fallback_repair:"):
+                target_name = str(row.get("memo_name") or "")
+                old_content = str(row.get("old_content") or "")
+                if not target_name or not old_content:
+                    errors.append("原位修复回滚记录不完整")
+                    continue
+                try:
+                    current = await self._memos.get_memo(target_name)
+                    if not current or str(current.get("content") or "") != str(row.get("new_content") or ""):
+                        raise RuntimeError("当前日记已被再次修改，拒绝覆盖较新的内容")
+                    await self._restore_inplace_repair_state(
+                        memo_name=target_name,
+                        old_content=old_content,
+                        old_episode=row.get("old_episode")
+                        if isinstance(row.get("old_episode"), dict) else {},
+                    )
+                    restored += 1
+                    if rollback_id:
+                        self._episodes.mark_rollback_reverted(rollback_id)
+                    continue
+                except Exception as exc:
+                    errors.append(f"{target_name}: {exc}")
+                    continue
             new_name = str(row.get("new_memo_name") or row.get("new_content") or "")
             if not new_name:
                 continue
@@ -5149,14 +7899,22 @@ class MemosMemoryPlugin(Star):
                     if self._vec is not None:
                         self._vec.delete_memo_index(new_name)
                     self._episodes.delete_by_memo_name(new_name)
-                    rollback_id = int(row.get("rollback_id") or row.get("id") or 0)
                     if rollback_id:
                         self._episodes.mark_rollback_reverted(rollback_id)
             except Exception as exc:
                 errors.append(f"{new_name}: {exc}")
-        if preview_id and deleted == len([row for row in rows if row.get("new_memo_name")]):
+        completed = deleted + restored
+        actionable = len([
+            row for row in rows
+            if row.get("new_memo_name")
+            or str(row.get("note") or "").startswith("inplace_fallback_repair:")
+        ])
+        if preview_id and completed == actionable:
             self._episodes.update_diary_preview_status(str(preview_id), "discarded")
-        return {"deleted": deleted, "rows": len(rows), "errors": errors}
+        return {
+            "deleted": deleted, "restored": restored,
+            "rows": len(rows), "errors": errors,
+        }
 
     async def _discard_diary_preview(self, preview_id: str) -> dict[str, Any]:
         if self._episodes is None:
@@ -5186,10 +7944,17 @@ class MemosMemoryPlugin(Star):
     async def _production_restore_snapshot(self, file_name: str) -> dict[str, Any]:
         if not await self._ensure_init() or self._episodes is None:
             raise RuntimeError("原文库未就绪")
-        return await asyncio.to_thread(self._episodes.restore_snapshot, str(file_name or ""))
+        return await self._run_background_work(self._episodes.restore_snapshot, str(file_name or ""))
 
-    async def _compress_and_store(self, umo: str, msgs: list[dict[str, Any]], diary_count: int | None = None,
-                                  source_kind: str = "auto", buffer_up_to_seq: int | None = None) -> int:
+    async def _compress_and_store(
+        self,
+        umo: str,
+        msgs: list[dict[str, Any]],
+        diary_count: int | None = None,
+        source_kind: str = "auto",
+        buffer_up_to_seq: int | None = None,
+        diary_cap_override: int | None = None,
+    ) -> int:
         if not self.character_name:
             logger.debug("[memos-memory] 跳过压缩: character_name 未配置")
             return 0
@@ -5203,13 +7968,33 @@ class MemosMemoryPlugin(Star):
                 return 0
         elif len(msgs) < _MIN_MSGS_TO_COMPRESS:
             return 0
+        from .generation_v2.integration import pending, produce
+        owned = await asyncio.to_thread(pending, self, umo)
+        if getattr(self, "generation_v2_enable", False) or owned:
+            if self._episodes is None or self._vec is None or self._memos is None:
+                self._log_event("compress", "6.1 production dependencies unavailable; buffer retained", {})
+                return 0
+            return await produce(self, umo, msgs, buffer_up_to_seq, source_kind,
+                                 diary_cap_override or self.diary_count_max_cap)
+        if self.evidence_first_generation_enable and self.raw_evidence_archive_enable and self._episodes is None:
+            self._log_event("compress", "原文库未就绪，保留缓冲等待取证", {
+                "session": umo[:12], "buffer_preserved": True,
+            })
+            return 0
         n_msg = len(msgs)
         recorded_dates = recorded_message_dates(msgs, self.rp_time_timezone)
         requested_dc = diary_count or self.diary_count
         candidates = self._scene_splitter.detect(msgs) if self.scene_split_enable else []
-        diary_cap = max(1, int(self.diary_count_max_cap or 1))
+        diary_cap = max(
+            1,
+            int(
+                diary_cap_override
+                if diary_cap_override is not None
+                else (self.diary_count_max_cap or 1)
+            ),
+        )
         base_target = min(diary_cap, max(requested_dc, len(recorded_dates), 1))
-        dc = (
+        dc = base_target if source_kind == "eod" else (
             self._scene_splitter.dynamic_diary_count(
                 base_target, msgs, candidates, diary_cap, source_kind=source_kind,
             )
@@ -5259,6 +8044,36 @@ class MemosMemoryPlugin(Star):
                     sum(1 for message in msgs if str(message.get("role") or "") == "assistant"),
                     source_batch_id,
                 )
+                batch_info = self._episodes.batch_info(source_batch_id) or {}
+                batch_status = str(batch_info.get("status") or "")
+                if batch_status == "committed":
+                    existing = self._episodes.episodes_for_batch(source_batch_id)
+                    if existing:
+                        if buffer_up_to_seq is not None and self._vec is not None:
+                            await self._vec.buffer_drop(umo, buffer_up_to_seq)
+                            self._buffer[umo] = await self._vec.buffer_take(
+                                umo, last_seq=buffer_up_to_seq,
+                            )
+                        logger.info(
+                            "[memos-memory][compress] already committed batch=%s; skipped duplicate Memos write",
+                            source_batch_id,
+                        )
+                        return len(existing)
+                if batch_status in {"generation_deferred", "generation_failed"}:
+                    retry_ts = float(batch_info.get("next_retry_ts") or 0)
+                    if time.time() < retry_ts:
+                        logger.info(
+                            "[memos-memory][compress] retry cooldown batch=%s until=%d",
+                            source_batch_id, int(retry_ts),
+                        )
+                        return 0
+                if batch_status in {"partial", "partial_manual_repair"}:
+                    logger.warning(
+                        "[memos-memory][compress] partial batch=%s requires manual reconciliation; "
+                        "automatic replay blocked to avoid duplicate Memos",
+                        source_batch_id,
+                    )
+                    return 0
             except Exception as e:
                 logger.warning("[memos-memory][episode] 原始证据归档失败，保留 buffer: %s", e)
                 return 0
@@ -5278,22 +8093,89 @@ class MemosMemoryPlugin(Star):
         generation_mode = "legacy"
         if self.evidence_first_generation_enable and self._episodes is not None:
             try:
-                diaries = await self._generate_evidence_first_diaries(
-                    msgs,
-                    messages_text,
-                    dc,
-                    diary_cap=diary_cap,
-                    exact_count=False,
-                )
+                batch_token = _ACTIVE_SOURCE_BATCH.set(source_batch_id)
+                try:
+                    diaries = await self._generate_evidence_first_diaries(
+                        msgs,
+                        messages_text,
+                        dc,
+                        diary_cap=diary_cap,
+                        exact_count=False,
+                        source_kind=source_kind,
+                    )
+                finally:
+                    _ACTIVE_SOURCE_BATCH.reset(batch_token)
                 generation_mode = "evidence_first"
+                extraction_mode = str(
+                    diaries[0].get("_episode_extraction_mode") or "unknown"
+                ) if diaries else "empty"
+                extraction_errors = max(
+                    (len(item.get("_episode_extraction_errors") or []) for item in diaries),
+                    default=0,
+                )
+                extraction_ms = max(
+                    (int(item.get("_episode_extraction_ms") or 0) for item in diaries),
+                    default=0,
+                )
+                render_ms = max(
+                    (int(item.get("_diary_render_ms") or 0) for item in diaries),
+                    default=0,
+                )
+                render_fallbacks = sum(
+                    1 for item in diaries if bool(item.get("_render_fallback"))
+                )
                 self._log_event("compress", f"证据优先生成完成: {len(diaries)}个情景", {
                     "session": umo[:12], "source_batch_id": source_batch_id,
+                    "target": dc, "cap": diary_cap,
+                    "extraction_mode": extraction_mode,
+                    "extraction_errors": extraction_errors,
+                    "extraction_ms": extraction_ms,
+                    "render_ms": render_ms,
+                    "render_fallbacks": render_fallbacks,
                 })
+                logger.info(
+                    "[memory][episode] generation summary source=%s target=%d cap=%d "
+                    "actual=%d extraction=%s errors=%d extraction_ms=%d "
+                    "render_ms=%d render_fallbacks=%d",
+                    source_kind, dc, diary_cap, len(diaries), extraction_mode,
+                    extraction_errors, extraction_ms, render_ms, render_fallbacks,
+                )
+            except DiaryGenerationDeferred as e:
+                diagnostics = dict(getattr(e, "diagnostics", {}) or {})
+                logger.warning(
+                    "[memos-memory][episode] 文学生成未达发布标准，原文与缓冲均保留: %s",
+                    e,
+                )
+                self._log_event("compress", "文学日记待重试，未写入 Memos", {
+                    "session": umo[:12], "source_batch_id": source_batch_id,
+                    "buffer_preserved": True, **diagnostics,
+                })
+                if source_batch_id and self._episodes is not None:
+                    self._episodes.mark_batch(
+                        source_batch_id,
+                        "generation_deferred",
+                        error=str(e),
+                        retry_after=300.0,
+                        increment_attempt=True,
+                    )
+                return 0
             except Exception as e:
-                logger.warning("[memos-memory][episode] 证据优先生成失败，回退兼容日记流程: %s", e)
-                self._log_event("compress", "证据优先生成降级", {
-                    "session": umo[:12], "error": str(e)[:240],
+                logger.warning(
+                    "[memos-memory][episode] 证据优先生成失败，原文与缓冲均保留: %s", e,
+                )
+                self._log_event("compress", "证据优先生成失败，未进入兼容摘要", {
+                    "session": umo[:12], "source_batch_id": source_batch_id,
+                    "error": str(e)[:240], "buffer_preserved": True,
                 })
+                if source_batch_id and self._episodes is not None:
+                    self._episodes.mark_batch(
+                        source_batch_id,
+                        "generation_failed",
+                        error=str(e),
+                        retry_after=300.0,
+                        increment_attempt=True,
+                    )
+                return 0
         llm_text = ""
         if not diaries:
             generation_mode = "legacy"
@@ -5310,6 +8192,35 @@ class MemosMemoryPlugin(Star):
             if source_batch_id and self._episodes is not None:
                 self._episodes.mark_batch(source_batch_id, "parse_failed")
             return 0
+        if generation_mode == "legacy":
+            pipeline = getattr(self, "_diary_pipeline", None) or DiaryPipeline(self)
+            source_text = "\n".join(str(message.get("content") or "") for message in msgs)
+            rejected: dict[int, list[str]] = {}
+            for index, diary in enumerate(diaries):
+                content = str(diary.get("content") or "").strip()
+                person = pipeline.first_person_check(content)
+                risk = pipeline.risk_report(content, source_text)
+                reasons = []
+                if not person.passed:
+                    reasons.append("first_person:" + person.reason)
+                if risk.high:
+                    reasons.append("transcript_risk")
+                if len(source_text) > 300 and pipeline._evidence_overlap(content, source_text) < 0.08:
+                    reasons.append("insufficient_source_support")
+                if reasons:
+                    rejected[index] = reasons
+            if rejected:
+                self._log_event("compress", "兼容日记未通过发布门槛，原文待重试", {
+                    "session": umo[:12], "source_batch_id": source_batch_id,
+                    "rejected": rejected, "buffer_preserved": True,
+                })
+                if source_batch_id and self._episodes is not None:
+                    self._episodes.mark_batch(
+                        source_batch_id, "generation_deferred",
+                        error="legacy_diary_quality_gate",
+                        retry_after=300.0, increment_attempt=True,
+                    )
+                return 0
         for diary in diaries:
             diary["_source_batch_id"] = source_batch_id
         labels_by_date = recorded_time_labels_by_date(msgs, self.rp_time_timezone)
@@ -5388,7 +8299,10 @@ class MemosMemoryPlugin(Star):
         for d in diaries:
             # v1.8.3: use LLM importance if provided, fallback to auto_importance.
             imp = _normalize_importance(d.get("importance"), self._auto_importance(d.get("content", "")))
-            if await self._store_one_diary(d, source_session=umo, importance=imp, source_kind=source_kind):
+            if await self._store_one_diary(
+                d, source_session=umo, importance=imp, source_kind=source_kind,
+                require_memos=True,
+            ):
                 stored_count += 1
                 try:
                     await self._persist_episode_for_diary(
@@ -5407,10 +8321,16 @@ class MemosMemoryPlugin(Star):
                 "session": umo[:12], "stored": stored_count, "parsed": len(diaries), "buffer_preserved": True,
             })
             if source_batch_id and self._episodes is not None:
-                self._episodes.mark_batch(source_batch_id, "partial")
+                self._episodes.mark_batch(source_batch_id, "partial_manual_repair")
             return 0
         if source_batch_id and self._episodes is not None:
             self._episodes.mark_batch(source_batch_id, "committed")
+            if all(
+                not diary.get("_render_fallback")
+                and str(diary.get("_episode_extraction_mode") or "llm_primary") == "llm_primary"
+                for diary in diaries
+            ):
+                self._llm_compensation.resolve_batch(source_batch_id)
         if self.semantic_state_enable and self._episodes is not None:
             state_episodes = self._episodes.episodes_for_batch(source_batch_id) if source_batch_id else diaries
             self._schedule_semantic_state_update(
@@ -5432,8 +8352,15 @@ class MemosMemoryPlugin(Star):
         self._log_event("compress", f"压缩完成: {stored_count}篇日记", {"session": umo[:12], "count": stored_count, "total": self._compress_count})
         return stored_count
 
-    async def _compress_with_lock(self, umo: str, msgs: list[dict[str, Any]], diary_count: int | None = None,
-                                  source_kind: str = "auto", buffer_up_to_seq: int | None = None) -> int:
+    async def _compress_with_lock(
+        self,
+        umo: str,
+        msgs: list[dict[str, Any]],
+        diary_count: int | None = None,
+        source_kind: str = "auto",
+        buffer_up_to_seq: int | None = None,
+        diary_cap_override: int | None = None,
+    ) -> int:
         lock = self._compress_locks.setdefault(umo, asyncio.Lock())
         if lock.locked():
             self._log_event("compress", "skip concurrent compress", {"session": umo[:12], "msg_count": len(msgs)})
@@ -5442,11 +8369,19 @@ class MemosMemoryPlugin(Star):
             return await self._compress_and_store(
                 umo, msgs, diary_count=diary_count, source_kind=source_kind,
                 buffer_up_to_seq=buffer_up_to_seq,
+                diary_cap_override=diary_cap_override,
             )
 
     # ---------- on_llm_response: 累积 + 触发 ----------
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, response: LLMResponse):
+        # Release the AstrBot foreground lease before scheduling response-side
+        # perception, state updates or compression. A missing response hook is
+        # still bounded by the runtime lease expiry.
+        try:
+            self._llm_runtime.end_foreground(scope=event.unified_msg_origin)
+        except Exception:
+            pass
         if not self.enable:
             return
         try:
@@ -5480,6 +8415,35 @@ class MemosMemoryPlugin(Star):
             logger.warning("[memos-memory][xinchao] response perception scheduling failed: %s", e)
         try:
             response_text = (getattr(response, "completion_text", "") or "").strip()
+            is_chunk = bool(getattr(response, "is_chunk", False))
+            request_id = str(event.get_extra("memos_memory_request_id", "") or "")
+            if not request_id:
+                request_id = str(getattr(event, "_memos_memory_request_id", "") or "")
+            assembled_text = (
+                self._consistency_response_text(
+                    request_id, response_text, is_chunk=is_chunk
+                )
+                if request_id
+                else response_text
+            )
+            if request_id and self._episodes is not None:
+                self._record_request_observation(
+                    request_id,
+                    answer_hash=hashlib.sha256(assembled_text.encode("utf-8")).hexdigest()
+                    if assembled_text else "",
+                    answer_chars=len(assembled_text),
+                    answer_preview=assembled_text[:240],
+                    chunk_status="chunk" if is_chunk else "final",
+                    response_status="completed" if assembled_text else "empty",
+                )
+                service = getattr(self._episodes, "consistency_service", None)
+                if service is not None and not is_chunk:
+                    service.submit_response({
+                        "request_id": request_id,
+                        "answer": assembled_text,
+                        "response_status": "completed" if assembled_text else "empty",
+                        "chunk_status": "final",
+                    })
             self._record_memory_access_response(event, response_text)
         except Exception as e:
             logger.debug("[memos-memory][access] response hook failed open: %s", e)
@@ -5691,6 +8655,245 @@ class MemosMemoryPlugin(Star):
         self.episodic_db_path = migrate_episode_db_location(self.episodic_db_path)
         return self.episodic_db_path
 
+    @staticmethod
+    def _request_emotion_signal(event: Any) -> float:
+        """Reuse the existing Xinchao appraisal without starting another model call."""
+        try:
+            appraisal = event.get_extra("xinchao_live_appraisal", None)
+        except Exception:
+            appraisal = getattr(event, "_xinchao_live_appraisal", None)
+        if not isinstance(appraisal, dict):
+            return 0.0
+        levels = appraisal.get("activationLevels") or {}
+        if not isinstance(levels, dict):
+            return 0.0
+        values = []
+        for value in levels.values():
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                values.append(number)
+        return max(0.0, min(1.0, max(values, default=0.0)))
+
+    def _prospective_emotion_signal(self, event: Any, query_plan: Any) -> float:
+        """Fuse current-turn local cues with Xinchao's existing appraisal."""
+        planned = (
+            query_plan.get("emotion_signal", 0.0)
+            if isinstance(query_plan, dict)
+            else getattr(query_plan, "emotion_signal", 0.0)
+        )
+        try:
+            planned = float(planned)
+        except (TypeError, ValueError):
+            planned = 0.0
+        if not math.isfinite(planned):
+            planned = 0.0
+        return max(
+            max(0.0, min(1.0, planned)),
+            self._request_emotion_signal(event),
+        )
+
+    async def _append_prospective_only_canary(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+        request_stat: dict[str, Any],
+        request_now: datetime,
+        *,
+        fallback_outcome: str,
+    ) -> bool:
+        """Append only a due prospective item when mature recall has no block."""
+        if not (
+            bool(getattr(self, "thread_memory_enable", False))
+            and bool(getattr(self, "thread_prospective_enable", True))
+        ):
+            return False
+        try:
+            query = str(getattr(event, "message_str", "") or "").strip()
+            if not query:
+                return False
+            contexts = self._normalize_contexts(getattr(req, "contexts", None))
+            plan = self._query_planner.rewrite(query, contexts)
+            if plan is None or not bool(getattr(plan, "prospective_intent", False)):
+                return False
+            context_text = ""
+            if bool(getattr(plan, "use_context", False)):
+                context_text = "\n".join(
+                    self._ctx_content(item)
+                    for item in contexts[-self.query_plan_context_window:]
+                    if self._ctx_role(item) in {"user", "assistant"}
+                    and self._ctx_content(item)
+                )[-self.recall_context_query_max_chars:]
+            extra_before = self._extra_parts_text(req)
+            current_time_valid = bool(re.search(
+                r"(?is)<CurrentTimeContext\b[^>]*>.*?</CurrentTimeContext>",
+                extra_before,
+            ))
+            result = await self._compose_thread_canary_for_request(
+                query=query,
+                context_text=context_text,
+                selected_hits=[],
+                query_plan=plan,
+                scope_id=str(self.character_name or "default"),
+                session_id=str(
+                    getattr(req, "session_id", None)
+                    or event.unified_msg_origin
+                ),
+                request_id=str(request_stat.get("request_id") or ""),
+                current_time_valid=current_time_valid,
+                base_memory_chars=0,
+                preexisting_chars=(
+                    len(extra_before) + self._request_context_chars(req)
+                ),
+                now_ts=request_now.timestamp(),
+                emotion_signal=self._prospective_emotion_signal(event, plan),
+            )
+            text = str(result.get("text") or "")
+            evidence = [
+                dict(item) for item in (result.get("evidence") or [])
+                if isinstance(item, dict)
+            ]
+            surface_item_id = str(
+                result.get("prospective_surface_item_id") or ""
+            )
+            request_id = str(request_stat.get("request_id") or "")
+            if not text or not evidence or not surface_item_id:
+                if text:
+                    await self._finalize_thread_canary_observation(
+                        request_id,
+                        injected=False,
+                        append_status="prospective_evidence_incomplete",
+                    )
+                return False
+            reservation = ""
+            if self._episodes is not None:
+                reserved = self._episodes.thread_reserve_prospective_surface(
+                    surface_item_id,
+                    request_id=request_id,
+                    reserved_ts=request_now.timestamp(),
+                )
+                if not reserved.get("reserved"):
+                    await self._finalize_thread_canary_observation(
+                        request_id,
+                        injected=False,
+                        append_status="prospective_reservation_suppressed",
+                    )
+                    return False
+                reservation = str(reserved.get("reservation") or "")
+            if not reservation:
+                await self._finalize_thread_canary_observation(
+                    request_id,
+                    injected=False,
+                    append_status="prospective_reservation_unavailable",
+                )
+                return False
+            from astrbot.core.agent.message import TextPart
+            try:
+                if getattr(req, "extra_user_content_parts", None) is None:
+                    req.extra_user_content_parts = []
+                req.extra_user_content_parts.append(
+                    TextPart(text=text).mark_as_temp()
+                )
+            except Exception:
+                self._episodes.thread_release_prospective_surface(
+                    surface_item_id, reservation
+                )
+                await self._finalize_thread_canary_observation(
+                    request_id,
+                    injected=False,
+                    append_status="append_failed",
+                )
+                raise
+            try:
+                surface = self._episodes.thread_commit_prospective_surface(
+                    surface_item_id,
+                    reservation,
+                    surfaced_ts=request_now.timestamp(),
+                    cooldown_seconds=self.thread_prospective_cooldown_seconds,
+                )
+                result.setdefault("metrics", {})[
+                    "prospective_cooldown_updated"
+                ] = bool(surface.get("updated"))
+            except Exception as exc:
+                logger.warning(
+                    "[memos-memory][thread][prospective] cooldown update "
+                    "failed open: %s",
+                    exc,
+                )
+            result.setdefault("metrics", {}).update({
+                "injected": True,
+                "append_confirmed": True,
+                "append_status": "prospective_only_appended",
+                "actual_chars": len(text),
+            })
+            await self._finalize_thread_canary_observation(
+                request_id,
+                injected=True,
+                append_status="prospective_only_appended",
+                actual_text=text,
+                actual_evidence=evidence,
+            )
+            extra_parts = [
+                str(getattr(part, "text", "") or "")
+                for part in (req.extra_user_content_parts or [])
+                if str(getattr(part, "text", "") or "")
+            ]
+            if request_id:
+                self._record_request_observation(
+                    request_id,
+                    scope_id=str(self.character_name or "default"),
+                    query_text=query[:1000],
+                    evidence_json=json.dumps(evidence, ensure_ascii=False),
+                    extra_parts_json=json.dumps(extra_parts, ensure_ascii=False),
+                    extra_parts_hash=hashlib.sha256(
+                        "\n".join(extra_parts).encode("utf-8")
+                    ).hexdigest(),
+                    extra_parts_chars=sum(len(part) for part in extra_parts),
+                    hit_order_json="[]",
+                    append_status="prospective_only_appended",
+                    snapshot_complete=1,
+                    thread_used=1,
+                    response_status="pending",
+                )
+                self._submit_consistency_snapshot({
+                    "request_id": request_id,
+                    "scope_id": str(self.character_name or "default"),
+                    "query": query[:1000],
+                    "query_text": query[:1000],
+                    "thread_text": text,
+                    "references": evidence,
+                    "snapshot_complete": True,
+                    "thread_used": True,
+                })
+            request_stat.update({
+                "outcome": "prospective_only_injected",
+                "fallback_outcome": fallback_outcome,
+                "thread_canary": dict(result.get("metrics") or {}),
+                "chars": len(text),
+                "count": 0,
+                "memos": [],
+                "duration_ms": round(
+                    max(
+                        0.0,
+                        time.time() - float(
+                            request_stat.get("ts") or time.time()
+                        ),
+                    ) * 1000,
+                    1,
+                ),
+            })
+            self._remember_injection_stats(request_stat)
+            return True
+        except Exception as exc:
+            logger.debug(
+                "[memos-memory][thread][prospective] prospective-only append "
+                "failed open: %s",
+                exc,
+            )
+            return False
+
     def _build_query_plan(self, user_query: str, contexts: list[Any] | None) -> dict[str, Any] | None:
         planner = getattr(self, "_query_planner", None) or QueryPlanner(self)
         result = planner.rewrite(user_query, contexts)
@@ -5711,6 +8914,7 @@ class MemosMemoryPlugin(Star):
             "use_context_reason": result.context_used_reason,
             "context_used_reason": result.context_used_reason,
             "rewritten": result.rewritten,
+            "emotion_signal": float(getattr(result, "emotion_signal", 0.0) or 0.0),
             "_plan_object": result,
         }
 
@@ -5728,6 +8932,7 @@ class MemosMemoryPlugin(Star):
                 context_used_reason=str(local_plan.get("context_used_reason") or "specific_query"),
                 confidence=float(local_plan.get("confidence") or 0.0),
                 resolved_entities=list(local_plan.get("resolved_entities") or []),
+                emotion_signal=float(local_plan.get("emotion_signal") or 0.0),
                 raw_standalone=user_query,
             )
         async def _caller(prompt: str) -> str:
@@ -5754,6 +8959,7 @@ class MemosMemoryPlugin(Star):
             "use_context": updated.use_context,
             "context_used_reason": updated.context_used_reason,
             "rewritten": updated.rewritten,
+            "emotion_signal": float(getattr(updated, "emotion_signal", 0.0) or 0.0),
             "_plan_object": updated,
         })
         return out
@@ -5761,7 +8967,7 @@ class MemosMemoryPlugin(Star):
     def _detect_scene_candidates(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         splitter = getattr(self, "_scene_splitter", None) or SceneSplitter(
             gap_seconds=float(getattr(self, "scene_split_gap_seconds", 10800) or 10800),
-            max_scenes=int(getattr(self, "diary_count_max_cap", 6) or 6),
+            max_scenes=int(getattr(self, "diary_count_max_cap", 3) or 3),
         )
         return as_prompt_payload(splitter.detect(messages))
 
@@ -5772,7 +8978,7 @@ class MemosMemoryPlugin(Star):
         from .scene_splitter import SceneCandidate
         splitter = getattr(self, "_scene_splitter", None) or SceneSplitter(
             gap_seconds=float(getattr(self, "scene_split_gap_seconds", 10800) or 10800),
-            max_scenes=int(getattr(self, "diary_count_max_cap", 6) or 6),
+            max_scenes=int(getattr(self, "diary_count_max_cap", 3) or 3),
         )
         prepared = [SceneCandidate(
             start_turn=int(item.get("start_turn", 0)),
@@ -5832,7 +9038,7 @@ class MemosMemoryPlugin(Star):
             self._embed(plan["search_text"], timeout=self.recall_embed_timeout),
             timeout=max(2.0, float(self.recall_embed_timeout or 12) + 1.0),
         )
-        cards = await asyncio.to_thread(
+        cards = await self._run_background_work(
             self._episodes.search_cards,
             query_vec,
             plan["search_text"],
@@ -5992,6 +9198,7 @@ class MemosMemoryPlugin(Star):
         source_evidence_enabled: bool | None = None,
         bm25_weight: float = 0.30,
         optimizer_enabled: bool | None = None,
+        scope: str = "",
     ) -> tuple[list[dict], dict[str, Any], dict[str, list[str]]]:
         if self._vec is None:
             return [], {"mode": "lean", "ready": False}, {}
@@ -6035,12 +9242,12 @@ class MemosMemoryPlugin(Star):
         )
         search_tasks: list[Any] = [direct_coro]
         if event_enabled:
-            search_tasks.append(asyncio.to_thread(
+            search_tasks.append(self._run_background_work(
                 self._episodes.search_cards,
                 query_vec, plan["search_text"], event_limit,
             ))
         if source_enabled:
-            search_tasks.append(asyncio.to_thread(
+            search_tasks.append(self._run_background_work(
                 self._episodes.search_source_turns,
                 query_vec, plan["search_text"], event_limit,
             ))
@@ -6269,7 +9476,19 @@ class MemosMemoryPlugin(Star):
                         float(existing.get("score") or 0.0), float(hit.get("score") or 0.0)
                     )
                     existing["_temporal_rescue"] = True
-        hits = [item for key, item in merged.items() if key]
+        from .generation_v2.integration import search_evidence, visible_hits
+        evidence_hits = await asyncio.to_thread(search_evidence, self, scope, user_query)
+        for evidence_hit in evidence_hits:
+            key = evidence_hit["memo_name"]
+            if key in merged:
+                merged[key]["_v2_evidence"] = evidence_hit["_v2_evidence"]
+                merged[key]["_v2_job"] = evidence_hit["_v2_job"]
+                for score_key in ("score", "relevance"):
+                    merged[key][score_key] = max(float(merged[key].get(score_key) or 0), evidence_hit[score_key])
+            else:
+                merged[key] = evidence_hit
+        hits = await asyncio.to_thread(visible_hits, self,
+                                      [item for key, item in merged.items() if key], scope)
         for hit in hits:
             if hit.get("_episodic"):
                 continue
@@ -6695,7 +9914,7 @@ class MemosMemoryPlugin(Star):
 
         list_fields = (
             "_route_evidence", "_matched_passages", "_source_turn_hits",
-            "_unresolved",
+            "_unresolved", "_v2_evidence",
         )
         for key in list_fields:
             incoming = rescue.get(key)
@@ -7135,6 +10354,15 @@ class MemosMemoryPlugin(Star):
     def _request_now() -> datetime:
         return datetime.now(timezone.utc)
 
+    def _begin_llm_foreground_lease(self, event: AstrMessageEvent) -> None:
+        """Mark the upcoming AstrBot response after plugin preflight LLM work."""
+        try:
+            provider = self.context.get_using_provider(event.unified_msg_origin)
+            if provider is not None:
+                self._llm_runtime.begin_foreground(provider, event.unified_msg_origin)
+        except Exception as exc:
+            logger.debug("[memos-memory][llm] foreground lease unavailable: %s", exc)
+
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
         if not self.enable:
@@ -7185,11 +10413,18 @@ class MemosMemoryPlugin(Star):
         except Exception as e:
             logger.debug("[memos-memory] cache prefix snapshot failed: %s", e)
         request_stat = self._request_injection_stat(event, req)
+        try:
+            request_stat["query_text"] = str(getattr(event, "message_str", "") or "").strip()[:1000]
+        except Exception:
+            request_stat["query_text"] = ""
         self._remember_injection_stats(request_stat)
         try:
             event.set_extra("memos_memory_request_id", request_stat["request_id"])
         except Exception:
-            pass
+            try:
+                setattr(event, "_memos_memory_request_id", request_stat["request_id"])
+            except Exception:
+                pass
         state_chars = self._inject_semantic_state_for_request(req, request_stat)
         time_insight_result: dict[str, Any] = {"chars": 0, "selected": 0, "mode": "disabled"}
         try:
@@ -7207,7 +10442,14 @@ class MemosMemoryPlugin(Star):
             logger.warning("[memos-memory][time-insight] request failed open: %s", e)
             time_insight_chars = 0
         if not self.enable_auto_recall:
-            self._finish_request_injection_stat(request_stat, "recall_disabled")
+            if not await self._append_prospective_only_canary(
+                event, req, request_stat, request_now,
+                fallback_outcome="recall_disabled",
+            ):
+                self._finish_request_injection_stat(
+                    request_stat, "recall_disabled"
+                )
+            self._begin_llm_foreground_lease(event)
             return
         fast_count = self._local_index_memo_count_fast()
         if fast_count == 0:
@@ -7215,10 +10457,18 @@ class MemosMemoryPlugin(Star):
                 "stage": "pre_init",
                 "reason": "skip memory init only; time/context governance already applied",
             })
-            self._finish_request_injection_stat(request_stat, "empty_index")
+            if not await self._append_prospective_only_canary(
+                event, req, request_stat, request_now,
+                fallback_outcome="empty_index",
+            ):
+                self._finish_request_injection_stat(
+                    request_stat, "empty_index"
+                )
+            self._begin_llm_foreground_lease(event)
             return
         if not await self._ensure_init():
             self._finish_request_injection_stat(request_stat, "init_failed")
+            self._begin_llm_foreground_lease(event)
             return
         if state_chars <= 0:
             state_chars = self._inject_semantic_state_for_request(req, request_stat)
@@ -7229,6 +10479,7 @@ class MemosMemoryPlugin(Star):
                     "reason": "avoid memory retrieval before first sync/reindex",
                 })
                 self._finish_request_injection_stat(request_stat, "empty_index")
+                self._begin_llm_foreground_lease(event)
                 return
         except Exception as e:
             logger.debug("[memos-memory] early memory count check failed: %s", e)
@@ -7238,6 +10489,7 @@ class MemosMemoryPlugin(Star):
             query = ""
         if not query:
             self._finish_request_injection_stat(request_stat, "empty_query")
+            self._begin_llm_foreground_lease(event)
             return
         session_key = getattr(req, "session_id", None) or event.unified_msg_origin
         context_query_parts = 0
@@ -7266,6 +10518,9 @@ class MemosMemoryPlugin(Star):
                             provider_id=self.query_plan_llm_provider_id or self.episode_extraction_provider_id,
                             timeout=30.0,
                             label="query_plan_disambiguate",
+                            optional=True,
+                            lane="interactive_optional",
+                            task_family="query_plan",
                         )
                     query_plan = await self._query_planner.maybe_llm_disambiguate(
                         query_plan, disambiguation_context, _query_llm,
@@ -7306,6 +10561,10 @@ class MemosMemoryPlugin(Star):
             query = user_query
             context_used = False
             context_used_reason = "planner_failure_local_fallback"
+        # All plugin-owned preflight LLM calls are now complete. From this
+        # point until on_llm_response, low-priority background work should not
+        # compete with AstrBot's foreground model response.
+        self._begin_llm_foreground_lease(event)
         intent = str(getattr(query_plan, "intent", "specific"))
         confidence = float(getattr(query_plan, "confidence", 0.0) or 0.0)
         resolved_entities = list(getattr(query_plan, "resolved_entities", []) or [])
@@ -7411,7 +10670,8 @@ class MemosMemoryPlugin(Star):
                     "candidate_pool": self.lean_recall_candidate_k,
                 })
                 hits, recall_routes_diag, recall_facets = await asyncio.wait_for(
-                    self._lean_recall_search(retrieval_user_query, retrieval_context_text, current_md),
+                    self._lean_recall_search(retrieval_user_query, retrieval_context_text, current_md,
+                                             scope=event.unified_msg_origin),
                     timeout=max(2.0, float(self.recall_search_timeout or 18)),
                 )
                 self._log_event("recall", f"lean recall: {len(hits)} candidates", recall_routes_diag)
@@ -7562,7 +10822,11 @@ class MemosMemoryPlugin(Star):
                     })
                 except Exception as exc:
                     logger.debug("[memos-memory][recall] empty observation write failed open: %s", exc)
-            self._finish_request_injection_stat(request_stat, "no_hits")
+            if not await self._append_prospective_only_canary(
+                event, req, request_stat, request_now,
+                fallback_outcome="no_hits",
+            ):
+                self._finish_request_injection_stat(request_stat, "no_hits")
             return
 
         target_label = (
@@ -7863,6 +11127,81 @@ class MemosMemoryPlugin(Star):
             }
             for item in (access_result.get("items") or [])[:12]
         ]
+        # 5.1 ACCESS runs after the baseline has been frozen. It owns a
+        # separate temporal slot and precise-rescue slot, so it never replaces,
+        # reranks or consumes a mature recall slot.
+        takeover_appends: list[dict[str, Any]] = []
+        access_summary["route_mode"] = self.memory_access_route_mode
+        access_summary["supplement_holdout"] = False
+        if (
+            self.memory_forgetting_enable
+            and self.memory_access_route_mode == "supplement"
+            and self.memory_access_supplement_max > 0
+        ):
+            supplement_started = time.monotonic()
+            try:
+                breaker = self._episodes.memory_access_breaker_status(
+                    config=self._memory_access_config(),
+                )
+                request_id = str(request_stat.get("request_id") or "")
+                holdout = False
+                holdout_key = str(event.unified_msg_origin or request_id)
+                if self.memory_access_supplement_holdout_percent > 0 and holdout_key:
+                    bucket = int(
+                        hashlib.sha256(holdout_key.encode("utf-8")).hexdigest()[:8], 16
+                    ) % 100
+                    holdout = bucket < self.memory_access_supplement_holdout_percent
+                access_summary["supplement_holdout"] = holdout
+                access_summary["supplement_breaker"] = breaker
+                if not breaker.get("tripped") and not holdout:
+                    original_names = [str(h.get("memo_name") or "") for h in selected_hits]
+                    local_now = request_now.astimezone(timezone_or_default(self.rp_time_timezone))
+                    temporal_constraint = parse_temporal_constraint(
+                        retrieval_user_query, local_now,
+                    ).as_dict()
+                    proposed_appends = self._episodes.compute_memory_supplement_appends(
+                        access_result,
+                        original_selected=original_names,
+                        temporal_constraint=temporal_constraint,
+                        config=self._memory_access_config(),
+                    )
+                    applied_appends: list[dict[str, Any]] = []
+                    access_items = {
+                        str(item.get("memo_name") or ""): item
+                        for item in (access_result.get("items") or [])
+                    }
+                    for ap in proposed_appends:
+                        memo_name = ap["memo_name"]
+                        hit = self._materialize_memory_access_hit(
+                            memo_name, hits, {**access_items.get(memo_name, {}), **ap},
+                        )
+                        if hit and memo_name not in original_names:
+                            selected_hits.append(hit)
+                            applied_appends.append(ap)
+                        elif not hit:
+                            logger.warning(
+                                "[memos-memory][access] supplement candidate unavailable: %s",
+                                memo_name,
+                            )
+                    takeover_appends = applied_appends
+            except Exception as exc:
+                self._record_memory_access_fail_open("supplement", exc)
+                logger.warning("[memos-memory][access] supplement failed open: %s", exc)
+                takeover_appends = []
+            finally:
+                access_summary["supplement_latency_ms"] = round(
+                    max(0.0, time.monotonic() - supplement_started) * 1000.0, 2
+                )
+        access_summary["takeover_appends"] = takeover_appends
+        access_summary["supplement_appends"] = takeover_appends
+        from .generation_v2.integration import visible_hits
+        selected_hits = await asyncio.to_thread(visible_hits, self, selected_hits, event.unified_msg_origin)
+        baseline_selected_count = int(recall_diag.get("selected") or 0)
+        recall_diag["baseline_selected"] = baseline_selected_count
+        recall_diag["selected"] = len(selected_hits)
+        recall_diag["takeover_appended"] = len(takeover_appends)
+        recall_diag["supplement_appended"] = len(takeover_appends)
+        recall_diag["supplement_separate_quota"] = True
         recall_diag["memory_access"] = access_summary
         request_stat["memory_access"] = access_summary
         self._log_event(
@@ -7891,26 +11230,52 @@ class MemosMemoryPlugin(Star):
         injection_modes = {"full": 0, "passage": 0, "compact": 0}
         for rank, h in enumerate(selected_hits):
             mn = h.get("memo_name", "")
-            if self.recall_dedup_window > 0 and mn and mn in dedup_window and not lean_ready:
+            if (
+                self.recall_dedup_window > 0 and mn and mn in dedup_window
+                and not lean_ready and not h.get("_access_takeover")
+            ):
                 continue
             content = await self._fetch_memo_content(mn, h.get("chunk_text", ""))
             if not content:
                 continue
+            is_access_canary = bool(h.get("_access_takeover"))
+            is_access_supplement = bool(h.get("_access_supplement"))
             use_full, mode_reason = self._should_inject_full_diary(h, content, rank, query)
+            if is_access_canary:
+                use_full = False
+                mode_reason = "access_supplement"
             passage_detail = None
             inject_content = content
             if not use_full:
                 inject_content, passage_detail = self._expanded_matched_passage(h, content)
+            if is_access_canary:
+                canary_limit = 520 if is_access_supplement else 320
+                inject_content = " ".join(str(inject_content or "").split()).strip()
+                if len(inject_content) > canary_limit:
+                    inject_content = inject_content[:canary_limit].rstrip() + "..."
             mode = "full" if use_full else "passage"
-            injection_modes[mode] += 1
             h["_injection_mode"] = mode
             h["_injection_mode_reason"] = mode_reason
-            if lean_ready:
+            if lean_ready or is_access_canary:
                 self._prepare_fused_memory_hit(
                     user_query,
                     h,
-                    include_source_evidence=mn in evidence_expansion_names,
+                    include_source_evidence=(
+                        mn in evidence_expansion_names or is_access_canary
+                    ),
                 )
+            requires_source = bool(
+                is_access_canary
+                and str(h.get("_access_takeover_presentation") or "") == "compact_source_evidence"
+            )
+            if requires_source and not h.get("_fusion_source_evidence"):
+                self._trace(
+                    "access",
+                    f"supplement source evidence unavailable, fallback to matched history memo={mn}",
+                    level="warning",
+                )
+                h["_access_takeover_presentation"] = "matched_passage_or_episode"
+            injection_modes[mode] += 1
             block = self._format_inject_block(
                 h, inject_content, passage_mode=not use_full, passage_detail=passage_detail,
                 reference_now_ts=request_now.timestamp(),
@@ -7922,11 +11287,59 @@ class MemosMemoryPlugin(Star):
                 "diary_chars": int(part_chars.get("diary") or len(block)),
                 "event_core_chars": int(part_chars.get("event_core") or 0),
                 "source_evidence_chars": int(part_chars.get("source_evidence") or 0),
+                "access_supplement": is_access_supplement,
+                "access_slot": str(h.get("_access_slot") or ""),
                 "_hit": h, "_content": content,
             })
+            if h.get("_access_takeover") and not h.get("_access_takeover_logged"):
+                takeover_item = next(
+                    (item for item in takeover_appends if item.get("memo_name") == mn), {}
+                )
+                try:
+                    self._episodes.log_memory_takeover_append(
+                        request_id=str(request_stat.get("request_id") or ""),
+                        memo_name=mn,
+                        cue_grade=str(takeover_item.get("cue_grade") or ""),
+                        append_rank=int(takeover_item.get("append_rank") or (rank + 1)),
+                        reason=str(takeover_item.get("reason") or h.get("_access_takeover_reason") or ""),
+                        evidence_terms=list(dict.fromkeys(
+                            self._query_terms(
+                                " ".join(
+                                    str(item.get("content") or "")
+                                    for item in (h.get("_source_turn_hits") or [])[:2]
+                                    if isinstance(item, dict)
+                                )
+                            )
+                        ))[:16],
+                        policy_version=str(
+                            takeover_item.get("policy_version") or "access_supplement_v1"
+                        ),
+                        route_mode=self.memory_access_route_mode,
+                        slot=str(takeover_item.get("slot") or h.get("_access_slot") or ""),
+                        scores=dict(h.get("_access_scores") or {}),
+                        evidence_quality=str(h.get("_access_evidence_quality") or ""),
+                        source_recoverable=bool(h.get("_access_source_recoverable")),
+                    )
+                    h["_access_takeover_logged"] = True
+                except Exception as exc:
+                    logger.warning(
+                        "[memos-memory][access] takeover audit failed open: %s", exc,
+                    )
             total += len(block)
             if mn and self.recall_dedup_window > 0:
                 seen_in_this_call.add(mn)
+        injected_takeover_names = {
+            str(entry.get("memo_name") or "") for entry in blocks
+            if bool((entry.get("_hit") or {}).get("_access_takeover"))
+        }
+        takeover_appends = [
+            item for item in takeover_appends
+            if str(item.get("memo_name") or "") in injected_takeover_names
+        ]
+        access_summary["takeover_appends"] = takeover_appends
+        access_summary["supplement_appends"] = takeover_appends
+        recall_diag["takeover_appended"] = len(takeover_appends)
+        recall_diag["supplement_appended"] = len(takeover_appends)
         # v4.5.1 soft injection target: when the assembled memory set exceeds the
         # target, degrade items from the lowest rank upward (full diary ->
         # passage -> compact excerpt) instead of dropping them. The top-ranked
@@ -7996,7 +11409,13 @@ class MemosMemoryPlugin(Star):
             entry.pop("_hit", None)
             entry.pop("_content", None)
         if not blocks:
-            self._finish_request_injection_stat(request_stat, "no_injectable_blocks")
+            if not await self._append_prospective_only_canary(
+                event, req, request_stat, request_now,
+                fallback_outcome="no_injectable_blocks",
+            ):
+                self._finish_request_injection_stat(
+                    request_stat, "no_injectable_blocks"
+                )
             return
         if self.recall_dedup_window > 0:
             prev_q = self._recent_injected.get(session_key)
@@ -8012,6 +11431,13 @@ class MemosMemoryPlugin(Star):
             rp_block_chars = rp_stat.get("block_chars", {}) if isinstance(rp_stat, dict) else {}
             current_time_chars = int(rp_block_chars.get("time") or 0) if isinstance(rp_block_chars, dict) else 0
             enhancer_total_chars = int(rp_stat.get("used") or 0) if isinstance(rp_stat, dict) else 0
+            current_time_match = re.search(
+                r"(?is)<CurrentTimeContext\b[^>]*>.*?</CurrentTimeContext>",
+                extra_before,
+            )
+            if current_time_chars <= 0 and current_time_match is not None:
+                current_time_chars = len(current_time_match.group(0))
+            enhancer_accounted_chars = max(enhancer_total_chars, current_time_chars)
             enhancer_chars = max(0, enhancer_total_chars - current_time_chars)
             xinchao_chars = sum(
                 len(match.group(0))
@@ -8019,7 +11445,7 @@ class MemosMemoryPlugin(Star):
             )
             other_extra_chars = max(
                 0,
-                len(extra_before) - enhancer_total_chars - xinchao_chars - time_insight_chars,
+                len(extra_before) - enhancer_accounted_chars - xinchao_chars - time_insight_chars,
             )
             evidence_packet = self._format_episode_evidence_packet(user_query, selected_hits)
             text_block, inject_parts = self._format_injection_with_profile(
@@ -8030,10 +11456,32 @@ class MemosMemoryPlugin(Star):
                 semantic_state_already_injected=state_chars > 0,
             )
             memory_full_chars = int(inject_parts.get("memory_full", len(text_block)))
+            current_time_valid = bool(
+                current_time_chars > 0 and current_time_match is not None
+            )
+            thread_canary = await self._compose_thread_canary_for_request(
+                query=user_query,
+                context_text=retrieval_context_text,
+                selected_hits=selected_hits,
+                query_plan=query_plan,
+                scope_id=str(self.character_name or "default"),
+                session_id=str(session_key),
+                request_id=str(request_stat.get("request_id") or ""),
+                current_time_valid=current_time_valid,
+                base_memory_chars=memory_full_chars,
+                preexisting_chars=len(extra_before) + context_chars,
+                now_ts=request_now.timestamp(),
+                emotion_signal=self._prospective_emotion_signal(
+                    event, query_plan,
+                ),
+            )
+            thread_text = str(thread_canary.get("text") or "")
+            thread_metrics = dict(thread_canary.get("metrics") or {})
             context_stat = self._context_stats.get(event.unified_msg_origin, {}) if isinstance(self._context_stats, dict) else {}
+            pre_composition = request_stat.get("composition") if isinstance(request_stat.get("composition"), dict) else {}
             composition = {
                 "current_time": current_time_chars,
-                "profile": int(inject_parts.get("profile", 0)),
+                "profile": int(pre_composition.get("profile") or 0) + int(inject_parts.get("profile", 0)),
                 "semantic_state": state_chars,
                 "time_insight": time_insight_chars + int(inject_parts.get("time_insight", 0)),
                 "diary": int(inject_parts.get("diary", total)),
@@ -8043,7 +11491,12 @@ class MemosMemoryPlugin(Star):
                 "xinchao": xinchao_chars,
                 "enhancer": enhancer_chars,
                 "context": context_chars,
+                "thread_context": len(thread_text),
                 "other_extra": other_extra_chars,
+                "access_supplement": sum(
+                    len(str(entry.get("text") or "")) for entry in blocks
+                    if bool(entry.get("access_supplement"))
+                ),
             }
             stat = request_stat
             stat.update({
@@ -8054,12 +11507,19 @@ class MemosMemoryPlugin(Star):
                 "order": self.inject_order,
                 "format": self.inject_format,
                 "composition": composition,
-                "total_est_chars": sum(composition.values()),
+                # access_supplement is an observational subset of the memory
+                # block, not an additional injection category.
+                "total_est_chars": sum(
+                    value for key, value in composition.items()
+                    if key != "access_supplement"
+                ),
+                "composition_overlay_keys": ["access_supplement"],
                 "context_total": context_stat.get("total"),
                 "context_kept": context_stat.get("kept"),
                 "context_trimmed": context_stat.get("trimmed"),
                 "enhancer_blocks": rp_stat.get("injected", []) if isinstance(rp_stat, dict) else [],
                 "recall_postprocess": recall_diag,
+                "thread_canary": thread_metrics,
                 "injection_modes": injection_modes,
                 "injection_budget": budget_diag,
                 "memos": [block.get("memo_name", "") for block in blocks if block.get("memo_name")],
@@ -8069,7 +11529,169 @@ class MemosMemoryPlugin(Star):
             })
             if getattr(req, "extra_user_content_parts", None) is None:
                 req.extra_user_content_parts = []
+            request_id = str(request_stat.get("request_id") or "")
+            canary_evidence = [
+                dict(item) for item in (thread_canary.get("evidence") or [])
+                if isinstance(item, dict)
+            ]
+            prospective_surface_item_id = str(
+                thread_canary.get("prospective_surface_item_id") or ""
+            )
+            reservation = ""
+            if thread_text and prospective_surface_item_id:
+                try:
+                    episodes = getattr(self, "_episodes", None)
+                    reserved = (
+                        episodes.thread_reserve_prospective_surface(
+                            prospective_surface_item_id,
+                            request_id=request_id,
+                            reserved_ts=request_now.timestamp(),
+                        )
+                        if episodes is not None
+                        else {"reserved": False}
+                    )
+                    reservation = str(reserved.get("reservation") or "")
+                    if not reserved.get("reserved") or not reservation:
+                        thread_text = str(
+                            thread_canary.get("fallback_text") or ""
+                        )
+                        canary_evidence = [
+                            dict(item) for item in (
+                                thread_canary.get("fallback_evidence") or []
+                            )
+                            if isinstance(item, dict)
+                        ]
+                        thread_metrics["prospective_surface_suppressed"] = True
+                except Exception as exc:
+                    thread_text = str(thread_canary.get("fallback_text") or "")
+                    canary_evidence = [
+                        dict(item) for item in (
+                            thread_canary.get("fallback_evidence") or []
+                        )
+                        if isinstance(item, dict)
+                    ]
+                    thread_metrics["prospective_surface_suppressed"] = True
+                    logger.warning(
+                        "[memos-memory][thread][prospective] reservation failed "
+                        "open: %s",
+                        exc,
+                    )
+            thread_appended = False
+            if thread_text:
+                try:
+                    req.extra_user_content_parts.append(
+                        TextPart(text=thread_text).mark_as_temp()
+                    )
+                    thread_appended = True
+                except Exception:
+                    if reservation and self._episodes is not None:
+                        self._episodes.thread_release_prospective_surface(
+                            prospective_surface_item_id, reservation
+                        )
+                    thread_text = ""
+                    canary_evidence = []
+                    logger.warning(
+                        "[memos-memory][thread][canary] temporary append failed "
+                        "open"
+                    )
+            if thread_appended and reservation and self._episodes is not None:
+                try:
+                    surface = self._episodes.thread_commit_prospective_surface(
+                        prospective_surface_item_id,
+                        reservation,
+                        surfaced_ts=request_now.timestamp(),
+                        cooldown_seconds=self.thread_prospective_cooldown_seconds,
+                    )
+                    thread_metrics["prospective_cooldown_updated"] = bool(
+                        surface.get("updated")
+                    )
+                except Exception as exc:
+                    # The short lease remains until expiry after visible append,
+                    # preventing an immediate duplicate even if commit fails.
+                    logger.warning(
+                        "[memos-memory][thread][prospective] cooldown update "
+                        "failed open: %s",
+                        exc,
+                    )
+            if thread_appended:
+                append_status = "appended"
+            elif thread_metrics.get("selected_for_append"):
+                append_status = (
+                    "prospective_reservation_suppressed"
+                    if thread_metrics.get("prospective_surface_suppressed")
+                    else "append_failed"
+                )
+            elif thread_metrics.get("would_inject"):
+                append_status = "shadow_preview"
+            else:
+                append_status = "empty"
+            thread_metrics.update({
+                "injected": bool(thread_appended),
+                "append_confirmed": bool(thread_appended),
+                "append_status": append_status,
+                "actual_chars": len(thread_text) if thread_appended else 0,
+            })
+            await self._finalize_thread_canary_observation(
+                str(request_stat.get("request_id") or ""),
+                injected=thread_appended,
+                append_status=append_status,
+                actual_text=thread_text if thread_appended else "",
+                actual_evidence=canary_evidence if thread_appended else [],
+            )
+            composition["thread_context"] = len(thread_text)
             req.extra_user_content_parts.append(TextPart(text=text_block).mark_as_temp())
+            # Persist only the actual append, never Shadow previews/candidates.
+            if request_id:
+                actual_evidence = []
+                if thread_appended:
+                    actual_evidence.extend(canary_evidence)
+                actual_evidence.extend({
+                    "text": str(block.get("text") or ""),
+                    "source": "diary_injection",
+                    "category": str(block.get("memory_type") or block.get("mode") or "memory"),
+                    "memo_name": str(block.get("memo_name") or ""),
+                    "episode_id": str(block.get("episode_id") or ""),
+                    "occurred_at": str(
+                        block.get("occurred_at") or block.get("ts_text")
+                        or block.get("_occurred_at") or block.get("_ts_text") or ""
+                    ),
+                    "memory_type": str(block.get("memory_type") or ""),
+                    "status": str(block.get("status") or ""),
+                    "evidence_quality": str(
+                        block.get("evidence_quality") or block.get("source_quality") or "diary_derived"
+                    ),
+                } for block in blocks if block.get("text"))
+                extra_parts = [
+                    str(getattr(part, "text", "") or "") for part in (req.extra_user_content_parts or [])
+                    if str(getattr(part, "text", "") or "")
+                ]
+                self._record_request_observation(
+                    request_id,
+                    scope_id=str(self.character_name or "default"),
+                    query_text=user_query[:1000],
+                    evidence_json=json.dumps(actual_evidence, ensure_ascii=False),
+                    extra_parts_json=json.dumps(extra_parts, ensure_ascii=False),
+                    extra_parts_hash=hashlib.sha256("\n".join(extra_parts).encode("utf-8")).hexdigest(),
+                    extra_parts_chars=sum(len(part) for part in extra_parts),
+                    hit_order_json=json.dumps([str(block.get("memo_name") or "") for block in blocks], ensure_ascii=False),
+                    append_status="appended",
+                    snapshot_complete=1,
+                    thread_used=bool(actual_evidence),
+                    response_status="pending",
+                )
+                self._submit_consistency_snapshot({
+                    "request_id": request_id,
+                    "scope_id": str(self.character_name or "default"),
+                    "query": user_query[:1000],
+                    "query_text": user_query[:1000],
+                    "thread_text": "\n".join(
+                        part for part in (thread_text if thread_appended else "", text_block)
+                        if part
+                    ),
+                    "references": actual_evidence,
+                    "snapshot_complete": True,
+                    "thread_used": bool(actual_evidence),
+                })
             self._time_insight.move_injection_last(req)
             self._xinchao.move_injection_last(req)
             self._remember_injection_stats(stat)
@@ -8087,10 +11709,11 @@ class MemosMemoryPlugin(Star):
                     f"注入 {len(blocks)}条 "
                     f"diary={composition['diary']}字 memory={memory_full_chars}字 "
                     f"event={composition['event_core']}字 evidence={composition['evidence']}字 "
+                    f"access={composition['access_supplement']}字 "
                     f"state={composition['semantic_state']} profile={composition['profile']} current_time={composition['current_time']} "
                     f"time={composition['time_insight']} "
                     f"xinchao={composition['xinchao']} "
-                    f"enhancer={composition['enhancer']} "
+                    f"enhancer={composition['enhancer']} thread={composition['thread_context']} "
                     f"context={composition['context']} full={injection_modes['full']} passage={injection_modes['passage']} "
                     f"compact={injection_modes.get('compact', 0)} soft_target={budget_diag['budget']} "
                     f"overflow={budget_diag['overflow_chars']}"
@@ -8099,11 +11722,12 @@ class MemosMemoryPlugin(Star):
             )
 
             logger.info(
-                "[memos-memory] 注入 %d 条记忆 | diary=%d字 event=%d字 evidence=%d字 state=%d字 memory=%d字 profile=%d current_time=%d time=%d xinchao=%d enhancer=%d context=%d | full=%d passage=%d compact=%d soft_target=%d overflow=%d 顺序=%s 格式=%s",
+                "[memos-memory] 注入 %d 条记忆 | diary=%d字 event=%d字 evidence=%d字 access=%d字 state=%d字 memory=%d字 profile=%d current_time=%d time=%d xinchao=%d enhancer=%d thread=%d context=%d | baseline=%d supplement=%d(T=%d,A=%d) full=%d passage=%d compact=%d soft_target=%d overflow=%d 顺序=%s 格式=%s",
                 len(blocks),
                 int(composition.get("diary") or 0),
                 int(composition.get("event_core") or 0),
                 int(composition.get("evidence") or 0),
+                int(composition.get("access_supplement") or 0),
                 int(composition.get("semantic_state") or 0),
                 memory_full_chars,
                 int(composition.get("profile") or 0),
@@ -8111,7 +11735,12 @@ class MemosMemoryPlugin(Star):
                 int(composition.get("time_insight") or 0),
                 int(composition.get("xinchao") or 0),
                 int(composition.get("enhancer") or 0),
+                int(composition.get("thread_context") or 0),
                 int(composition.get("context") or 0),
+                int(recall_diag.get("baseline_selected") or 0),
+                len(takeover_appends),
+                sum(1 for item in takeover_appends if str(item.get("slot") or "") == "T"),
+                sum(1 for item in takeover_appends if str(item.get("slot") or "") == "A"),
                 injection_modes["full"],
                 injection_modes["passage"],
                 injection_modes.get("compact", 0),
@@ -8162,6 +11791,12 @@ class MemosMemoryPlugin(Star):
                 ]
             except Exception:
                 runs = []
+            new_evidence = self._profile_new_evidence_count(
+                conn, float(row["updated_ts"] or 0)
+            )
+            effective_days = max(30, int(self.profile_auto_update_days or 0))
+            identity_limit = int(getattr(self, "identity_core_inject_chars", 1000))
+            minimum_evidence = int(getattr(self, "profile_min_new_evidence", 8))
             return {
                 "enabled": self.enable_affiliate_profile,
                 "connected": True,
@@ -8177,6 +11812,20 @@ class MemosMemoryPlugin(Star):
                 "history": history,
                 "history_count": len(history),
                 "runs": runs,
+                "role": "stable_identity_core",
+                "identity_core_chars": min(
+                    identity_limit,
+                    len(row["profile"] or "") + len(row["profile_facts"] or ""),
+                ),
+                "new_identity_evidence": new_evidence,
+                "minimum_new_evidence": minimum_evidence,
+                "effective_auto_update_days": effective_days,
+                "auto_update_eligible": bool(
+                    self.profile_auto_update_days > 0
+                    and age_days is not None
+                    and age_days >= effective_days
+                    and new_evidence >= minimum_evidence
+                ),
             }
         except Exception as e:
             return {"enabled": self.enable_affiliate_profile, "connected": False, "reason": str(e)}
@@ -8197,28 +11846,86 @@ class MemosMemoryPlugin(Star):
             + "\n</CurrentSemanticState>"
         )
 
+    @staticmethod
+    def _compact_identity_text(value: str, budget: int) -> str:
+        text = re.sub(r"[ \t]+", " ", str(value or "")).strip()
+        if budget <= 0 or len(text) <= budget:
+            return text
+        pieces = [
+            part.strip() for part in re.split(r"(?<=[。！？；\n])", text)
+            if part.strip()
+        ]
+        kept: list[str] = []
+        used = 0
+        for piece in pieces:
+            if used + len(piece) > budget:
+                break
+            kept.append(piece)
+            used += len(piece)
+        if kept:
+            return "".join(kept).strip()
+        return text[:budget].rstrip("，、；:： ") + "。"
+
+    def _identity_core_injection_block(self) -> str:
+        inject_chars = int(getattr(self, "identity_core_inject_chars", 0))
+        if not self.enable_affiliate_profile or inject_chars <= 0:
+            return ""
+        status = self._affiliate_profile_status()
+        if not status.get("connected") or not status.get("fresh", True):
+            return ""
+        budget = inject_chars
+        profile_budget = max(240, int(budget * 0.68))
+        facts_budget = max(120, budget - profile_budget)
+        profile = self._compact_identity_text(status.get("profile") or "", profile_budget)
+        facts = self._compact_identity_text(status.get("profile_facts") or "", facts_budget)
+        if not profile and not facts:
+            return ""
+        bits = [
+            '<LongTermIdentityCore temporal_role="stable_identity">',
+            "这是角色跨月稳定的人格与关系内核，不是近期情绪、事件清单或当前时间。"
+            "与滚动状态冲突时：稳定人格由此处约束，近期情绪和未决事项以滚动状态为准。",
+        ]
+        if profile:
+            bits.append(profile)
+        if facts:
+            bits.append("[稳定事实]\n" + facts)
+        bits.append("</LongTermIdentityCore>")
+        return "\n".join(bits)
+
     def _inject_semantic_state_for_request(
         self,
         req: ProviderRequest,
         request_stat: dict[str, Any],
     ) -> int:
-        state_block = self._semantic_state_injection_block()
-        if not state_block:
-            return 0
+        identity_done = bool(request_stat.get("identity_core_injected"))
+        state_done = bool(request_stat.get("semantic_state_injected"))
+        identity_block = "" if identity_done else self._identity_core_injection_block()
+        state_block = "" if state_done else self._semantic_state_injection_block()
+        if not identity_block and not state_block:
+            return int(request_stat.get("semantic_state_chars") or 0)
         try:
             from astrbot.core.agent.message import TextPart
             if getattr(req, "extra_user_content_parts", None) is None:
                 req.extra_user_content_parts = []
-            req.extra_user_content_parts.append(TextPart(text=state_block).mark_as_temp())
+            if identity_block:
+                req.extra_user_content_parts.append(TextPart(text=identity_block).mark_as_temp())
+                identity_chars = len(identity_block)
+                request_stat["identity_core_injected"] = True
+                request_stat["profile_chars"] = identity_chars
+                request_stat.setdefault("composition", {})["profile"] = identity_chars
+                request_stat["total_est_chars"] = int(request_stat.get("total_est_chars") or 0) + identity_chars
+            if state_block:
+                req.extra_user_content_parts.append(TextPart(text=state_block).mark_as_temp())
+                state_chars = len(state_block)
+                request_stat["semantic_state_injected"] = True
+                request_stat["semantic_state_chars"] = state_chars
+                request_stat.setdefault("composition", {})["semantic_state"] = state_chars
+                request_stat["total_est_chars"] = int(request_stat.get("total_est_chars") or 0) + state_chars
             self._xinchao.move_injection_last(req)
-            state_chars = len(state_block)
-            request_stat["semantic_state_chars"] = state_chars
-            request_stat.setdefault("composition", {})["semantic_state"] = state_chars
-            request_stat["total_est_chars"] = int(request_stat.get("total_est_chars") or 0) + state_chars
-            return state_chars
+            return int(request_stat.get("semantic_state_chars") or 0)
         except Exception as exc:
             logger.warning("[memos-memory][state] injection failed open: %s", exc)
-            return 0
+            return int(request_stat.get("semantic_state_chars") or 0)
 
     def _format_injection_with_profile(
         self,
@@ -8231,7 +11938,11 @@ class MemosMemoryPlugin(Star):
         profile_block = ""
         state_block = self._semantic_state_injection_block() if include_semantic_state else ""
         state_active = bool(state_block or semantic_state_already_injected)
-        if self.enable_affiliate_profile and not (state_active and self.semantic_state_replace_profile):
+        if (
+            self.enable_affiliate_profile
+            and int(getattr(self, "identity_core_inject_chars", 0)) <= 0
+            and not (state_active and self.semantic_state_replace_profile)
+        ):
             st = self._affiliate_profile_status()
             if st.get("connected") and st.get("fresh", True):
                 facts = (st.get("profile_facts") or "").strip()
@@ -8354,6 +12065,20 @@ class MemosMemoryPlugin(Star):
         )
         conn.commit()
 
+    def _profile_new_evidence_count(self, conn, since_ts: float) -> int:
+        try:
+            persona_types = tuple(_PERSONA_TYPES)
+            row = conn.execute(
+                f"""SELECT COUNT(DISTINCT memo_name) AS n FROM chunks
+                    WHERE created_ts>?
+                      AND (memory_type IN ({','.join('?' for _ in persona_types)})
+                           OR importance>=4 OR manual=1)""",
+                (float(since_ts or 0), *persona_types),
+            ).fetchone()
+            return int(row["n"] or 0) if row else 0
+        except Exception:
+            return 0
+
     async def _profile_auto_loop(self):
         await asyncio.sleep(60)
         while True:
@@ -8378,7 +12103,12 @@ class MemosMemoryPlugin(Star):
             row = conn.execute("SELECT updated_ts FROM memory_affiliate_profile WHERE id=1").fetchone()
             if not row or not row["updated_ts"]:
                 return True
-            return time.time() - float(row["updated_ts"]) >= self.profile_auto_update_days * 86400
+            effective_days = max(30, int(self.profile_auto_update_days or 0))
+            if time.time() - float(row["updated_ts"]) < effective_days * 86400:
+                return False
+            return self._profile_new_evidence_count(
+                conn, float(row["updated_ts"] or 0)
+            ) >= int(getattr(self, "profile_min_new_evidence", 8))
         except Exception:
             return False
 
@@ -8411,10 +12141,13 @@ class MemosMemoryPlugin(Star):
             raise RuntimeError("vec not ready")
         conn = self._vec._connect()
         self._init_profile_schema(conn)
-        current = conn.execute("SELECT profile, profile_facts, version FROM memory_affiliate_profile WHERE id=1").fetchone()
+        current = conn.execute(
+            "SELECT profile, profile_facts, version, updated_ts FROM memory_affiliate_profile WHERE id=1"
+        ).fetchone()
         current_profile = current["profile"] if current else ""
         current_facts = current["profile_facts"] if current else ""
         version = int(current["version"] or 0) if current else 0
+        current_updated_ts = float(current["updated_ts"] or 0) if current else 0.0
 
         def rows(sql: str, params=()):
             try:
@@ -8466,6 +12199,7 @@ class MemosMemoryPlugin(Star):
             "current_profile": current_profile or "",
             "current_facts": current_facts or "",
             "version": version,
+            "current_updated_ts": current_updated_ts,
             "recent": recent,
             "important": important,
             "manual": manual,
@@ -8486,42 +12220,47 @@ class MemosMemoryPlugin(Star):
         return "\n".join(lines)
 
     async def _profile_call_llm(self, prompt: str) -> str:
-        prov = None
-        if self.profile_provider_id:
-            try:
-                prov = self.context.get_provider_by_id(self.profile_provider_id)
-            except Exception as e:
-                logger.warning("[memos-memory][profile] provider %s failed: %s", self.profile_provider_id, e)
-        if prov is None:
-            prov = self.context.get_using_provider()
+        prov = self._resolve_chat_provider(self.profile_provider_id)
         if prov is None:
             raise RuntimeError("no LLM provider")
         logger.info("[memos-memory][profile] LLM=%s", _resolve_provider_name(prov))
-        resp = await self._retry(
-            lambda: prov.text_chat(prompt=prompt, contexts=[], system_prompt=""),
-            "profile_llm",
-            timeout=max(20.0, float(self.profile_llm_timeout or 90)),
-            offload_thread=True,
+        call_timeout = max(20.0, float(self.profile_llm_timeout or 90))
+        resp = await self._plugin_llm_text_chat(
+            prov,
+            prompt=prompt,
+            contexts=[],
+            system_prompt="",
+            timeout=call_timeout,
+            label="profile_llm",
+            optional=True,
+            lane="background_state",
+            task_family="profile",
         )
         return getattr(resp, "completion_text", "") or ""
 
     def _profile_build_prompt(self, src: dict[str, Any]) -> str:
         character = self.character_name or "角色"
+        identity_limit = int(getattr(self, "identity_core_inject_chars", 1000))
+        target_chars = int(self.profile_target_chars or 1000)
+        if identity_limit > 0:
+            target_chars = min(target_chars, identity_limit)
+        target_facts = min(int(self.profile_facts_target_count or 20), 20)
         payload = "\n\n".join([
             self._profile_format_items("最近人格类记忆", src["recent"]),
             self._profile_format_items("高重要度长期记忆", src["important"]),
             self._profile_format_items("手动钉记忆", src["manual"]),
             self._profile_format_items("高反馈记忆", src["feedback"]),
         ])
-        return f"""你是长期 RP 角色人格画像维护器。请为 {character} 生成一份“当前长期人格画像”。
+        return f"""你是长期 RP 角色人格内核维护器。请为 {character} 生成一份“稳定人格与关系内核”。
 
-这不是原始人设，不要写成角色设定卡；它是长期相处后形成的动态状态。
-更新方式是融合：读取旧画像、稳定事实和新记忆后，重写当前画像，而不是追加历史版本。
+它不是原始人设卡，也不是近期情绪或事件摘要；近期关系张力、情绪底色和未决事项由滚动状态负责。
+这里仅保留跨月稳定的人格、价值取向、依恋与防御方式、长期关系定位、明确承诺边界、稳定偏好和反应模式。
+更新方式是融合：读取旧内核、稳定事实和新证据后，重写当前内核，而不是追加历史版本。
 
-效果第一：重要的长期变化、承诺、称呼、边界、关键情绪变化、行为倾向不能丢。不要因为追求短而删掉关键内容。
-但也不要按月份堆叠，不要逐条复述记忆，不要写“某月画像”。请合并重复倾向。
+只有反复出现或被明确确认的变化才能进入人格内核。单次疲惫、短暂生气、某一晚的情绪和未完成话题不要写入。
+重要的长期承诺、称呼、边界、恐惧、渴望与稳定行为倾向不能丢；不要按月份堆叠，也不要逐条复述记忆。
 
-建议画像约 {self.profile_target_chars} 字；稳定事实约 {self.profile_facts_target_count} 条以内。
+内核目标约 {target_chars} 字；稳定事实约 {target_facts} 条以内。
 
 旧画像:
 {src['current_profile']}
@@ -8534,7 +12273,7 @@ class MemosMemoryPlugin(Star):
 
 输出 JSON:
 {{
-  "profile": "当前长期人格画像，强调她现在的内心状态、亲密边界、稳定反应、害怕/渴望/承诺/习惯。",
+  "profile": "跨月稳定的人格与关系内核，强调价值、依恋、防御、长期边界、稳定反应、害怕/渴望/承诺/习惯。",
   "profile_facts": ["稳定事实1", "稳定事实2"],
   "notes": "本次融合更新说明，简短"
 }}
@@ -8573,7 +12312,7 @@ class MemosMemoryPlugin(Star):
         if src.get("current_profile"):
             history.append({
                 "version": int(src.get("version") or 0),
-                "updated_ts": time.time(),
+                "updated_ts": float(src.get("current_updated_ts") or time.time()),
                 "profile": src.get("current_profile"),
                 "profile_facts": src.get("current_facts"),
             })
@@ -8800,6 +12539,7 @@ class MemosMemoryPlugin(Star):
 
     @staticmethod
     def _hit_evidence_text(hit: dict) -> str:
+        grounded = " ".join(str(f.get("claim") or "") for f in hit.get("_v2_evidence", [])[:3])
         base = " ".join(str(hit.get(key) or "") for key in (
             "retrieval_key", "scene_anchor", "state_change", "entities", "trigger_hint",
             "long_effect", "tags", "chunk_text", "ts_text", "occurred_at",
@@ -8809,7 +12549,7 @@ class MemosMemoryPlugin(Star):
             for item in (hit.get("_source_turn_hits") or [])[:3]
             if isinstance(item, dict)
         )
-        return (base + " " + source).strip()
+        return (grounded + " " + base + " " + source).strip()
 
     def _hit_facet_coverage(self, hit: dict, facets: dict[str, list[str]]) -> set[tuple[str, str]]:
         text = self._hit_evidence_text(hit)
@@ -9284,6 +13024,11 @@ class MemosMemoryPlugin(Star):
         """Attach compact event and first-hand evidence layers to one diary hit."""
         hit["_fusion_event_core"] = []
         hit["_fusion_source_evidence"] = []
+        if hit.get("_v2_evidence"):
+            from .generation_v2.integration import attach_evidence
+            attach_evidence(hit, include_source_evidence,
+                            getattr(self, "episodic_evidence_per_memory", 3))
+            return
         if self._episodes is None:
             return
         memo_name = str(hit.get("memo_name") or "")
@@ -9606,7 +13351,7 @@ class MemosMemoryPlugin(Star):
         # diary 格式(默认): 时间锚 + 正文
         return wrap_historical("记忆正文: " + content)
 
-    async def _eval_recall_query(self, query: str, top_k: int | None = None) -> dict[str, Any]:
+    async def _eval_recall_query(self, query: str, top_k: int | None = None, scope: str = "") -> dict[str, Any]:
         """Dry-run recall for WebUI lab/commands. Does not mutate dedup state or inject."""
         eval_now_ts = self._request_now().timestamp()
         if not await self._ensure_init() or self._vec is None:
@@ -9632,7 +13377,9 @@ class MemosMemoryPlugin(Star):
         )
         lean_ready = bool(episodic_ready and self.lean_recall_enable)
         if lean_ready:
-            hits, routes_diag, facets = await self._lean_recall_search(query, "", current_md)
+            from .generation_v2.integration import sole_published_scope
+            scope = scope or await asyncio.to_thread(sole_published_scope, self)
+            hits, routes_diag, facets = await self._lean_recall_search(query, "", current_md, scope=scope)
         elif episodic_ready:
             hits, routes_diag, facets = await self._episodic_recall_search(query, "", current_md)
         else:
@@ -10572,9 +14319,13 @@ class MemosMemoryPlugin(Star):
             return
         try:
             existing = self._vec._connect().execute(
-                "SELECT memo_name, MAX(source_updated_ts) AS ts FROM chunks GROUP BY memo_name"
+                "SELECT memo_name, MAX(source_updated_ts) AS ts, MAX(content_hash) AS body_hash "
+                "FROM chunks GROUP BY memo_name"
             ).fetchall()
-            existing_map = {r["memo_name"]: float(r["ts"]) for r in existing}
+            existing_map = {
+                r["memo_name"]: (float(r["ts"] or 0), str(r["body_hash"] or ""))
+                for r in existing
+            }
         except Exception:
             existing_map = {}
         synced = 0
@@ -10586,8 +14337,9 @@ class MemosMemoryPlugin(Star):
             mt = source_updated_ts
             if not content or not name:
                 continue
-            ts_old = existing_map.get(name, 0)
-            if name in existing_map and ((mt and mt <= ts_old + 1) or (not mt and ts_old > 0)):
+            _, body, _ = _parse_memo_content(content)
+            body_hash = self._content_hash(body) if body else ""
+            if not _memo_requires_sync(name, mt, body_hash, existing_map):
                 skipped += 1
                 continue
             try:
@@ -10956,6 +14708,10 @@ class MemosMemoryPlugin(Star):
             except Exception as e:
                 logger.warning("[memos-memory][xinchao] initialize failed open: %s", e)
             try:
+                await self._house.initialize()
+            except Exception as e:
+                logger.warning("[memos-memory][house] initialize failed open: %s", e)
+            try:
                 await self._time_insight.initialize()
             except Exception as e:
                 logger.warning("[memos-memory][time-insight] initialize failed open: %s", e)
@@ -11174,7 +14930,7 @@ class MemosMemoryPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     def _plan_eod_checkpoint(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
-        """Size an evidence-extraction window without forcing diary count."""
+        """Plan a conservative target plus a separate soft extraction cap."""
         assistant_messages = [
             message for message in messages if message.get("role") == "assistant"
         ]
@@ -11200,24 +14956,44 @@ class MemosMemoryPlugin(Star):
                     windows += 1
             previous_ts = event_ts or previous_ts
             previous_date = current_date or previous_date
-        density_capacity = max(1, (turns + 7) // 8) if turns else 0
-        configured_cap = max(
-            1, int(getattr(self, "eod_checkpoint_max_diaries", 6) or 6)
-        )
+        # Density controls how much freedom a healthy extraction model receives;
+        # it must never force extra diaries by itself. Only represented dates and
+        # long real-time gaps raise the deterministic target.
+        density_capacity = max(1, (turns + 5) // 6) if turns else 0
+        source_chars = sum(len(str(item.get("content") or "")) for item in messages)
+        scene_candidates = self._scene_splitter.detect(messages) if (
+            turns and getattr(self, "scene_split_enable", True)
+        ) else []
+        # Large, multi-arc nights need a modest default even without a long
+        # clock gap. Lexical hints alone never split a short or sparse chat.
+        narrative_target = 1 if turns else 0
+        if turns >= 12 and source_chars >= 6000 and len(scene_candidates) >= 4:
+            narrative_target = 2
+        if turns >= 24 and source_chars >= 12000 and len(scene_candidates) >= 6:
+            narrative_target = 3
+        configured_cap = max(1, min(
+            int(getattr(self, "eod_checkpoint_max_diaries", 3) or 3),
+            int(getattr(self, "diary_count_max_cap", 3) or 3),
+        ))
+        target = min(
+            configured_cap,
+            max(1, len(dates), windows),
+        ) if turns else 0
         capacity = min(
             configured_cap,
-            max(1, len(dates), windows, density_capacity),
+            max(target, density_capacity, narrative_target),
         ) if turns else 0
-        # _compress_and_store raises this lower bound to the number of represented
-        # dates, so a long cross-day backlog never loses calendar coverage.
         return {
             "turns": turns,
             "dates": dates,
             "scene_windows": windows,
             "density_capacity": density_capacity,
+            "narrative_target": narrative_target,
+            "scene_candidates": len(scene_candidates),
+            "diary_target": target,
             "diary_capacity": capacity,
             "message_count": len(messages),
-            "chars": sum(len(str(item.get("content") or "")) for item in messages),
+            "chars": source_chars,
         }
 
     async def _run_eod_flush_once(self, now: datetime | None = None) -> dict[str, Any]:
@@ -11264,23 +15040,28 @@ class MemosMemoryPlugin(Star):
             if int(retry.get("attempts") or 0) >= 3 or now_ts < float(retry.get("next_ts") or 0.0):
                 stats["cooldown"] += 1
                 continue
-            eod_count = int(plan["diary_capacity"])
+            eod_target = int(plan["diary_target"])
+            eod_cap = int(plan["diary_capacity"])
             stats["attempted"] += 1
-            stats["planned"] += eod_count
+            stats["planned"] += eod_target
             session_diag = {"session": umo[:12], "snapshot_seq": snapshot_seq_int, **plan}
             stats["sessions"].append(session_diag)
             logger.info(
-                "[memos-memory][eod] checkpoint: %d turns, %d dates, %d windows -> up to %d diaries",
-                plan["turns"], len(plan["dates"]), plan["scene_windows"], eod_count,
+                "[memos-memory][eod] checkpoint: %d turns, %d dates, %d windows "
+                "-> target %d / soft cap %d diaries",
+                plan["turns"], len(plan["dates"]), plan["scene_windows"],
+                eod_target, eod_cap,
             )
             self._log_event(
-                "compress", f"夜间检查点: {plan['turns']}轮 -> 最多{eod_count}个情景",
+                "compress",
+                f"夜间检查点: {plan['turns']}轮 -> 目标{eod_target}篇/软上限{eod_cap}篇",
                 {**session_diag, "attempt": int(retry["attempts"]) + 1},
             )
             try:
                 written = await self._compress_with_lock(
-                    umo, snapshot, diary_count=eod_count, source_kind="eod",
+                    umo, snapshot, diary_count=eod_target, source_kind="eod",
                     buffer_up_to_seq=snapshot_seq,
+                    diary_cap_override=eod_cap,
                 )
             except Exception as exc:
                 logger.warning("[memos-memory][eod] compress failed: %s", exc)
@@ -11361,9 +15142,13 @@ class MemosMemoryPlugin(Star):
             if self._pending_restore_checked:
                 return dict(self._startup_restore_result)
             try:
-                result = await asyncio.to_thread(self._data_backup.apply_pending_restore)
+                result = await self._run_background_work(self._data_backup.apply_pending_restore)
             except Exception as exc:
+                if (self._data_backup.backup_dir / "restore_journal.json").exists():
+                    raise RuntimeError("restore recovery required before store use") from exc
                 result = {"applied": False, "reason": "failed", "error": str(exc)[:500]}
+            if (self._data_backup.backup_dir / "restore_journal.json").exists():
+                raise RuntimeError("restore recovery required before store use")
             self._startup_restore_result = dict(result or {})
             self._pending_restore_checked = True
             if result.get("applied"):
@@ -11379,13 +15164,13 @@ class MemosMemoryPlugin(Star):
             return dict(self._startup_restore_result)
 
     async def _data_backup_list(self) -> dict[str, Any]:
-        return await asyncio.to_thread(self._data_backup.list_archives)
+        return await self._run_background_work(self._data_backup.list_archives)
 
     async def _data_backup_inspect(self, file_name: str) -> dict[str, Any]:
-        return await asyncio.to_thread(self._data_backup.inspect, file_name)
+        return await self._run_background_work(self._data_backup.inspect, file_name)
 
     async def _prepare_data_restore(self, file_name: str) -> dict[str, Any]:
-        result = await asyncio.to_thread(self._data_backup.prepare_restore, file_name)
+        result = await self._run_background_work(self._data_backup.prepare_restore, file_name)
         pending = result.get("pending_restore") or {}
         logger.warning(
             "[memos-memory][backup] restore scheduled for next reload file=%s safety=%s",
@@ -11398,13 +15183,13 @@ class MemosMemoryPlugin(Star):
         return result
 
     async def _cancel_data_restore(self) -> dict[str, Any]:
-        result = await asyncio.to_thread(self._data_backup.cancel_restore)
+        result = await self._run_background_work(self._data_backup.cancel_restore)
         if result.get("cancelled"):
             logger.info("[memos-memory][backup] pending restore cancelled")
         return result
 
     async def _delete_data_backup(self, file_name: str) -> dict[str, Any]:
-        result = await asyncio.to_thread(self._data_backup.delete_archive, file_name)
+        result = await self._run_background_work(self._data_backup.delete_archive, file_name)
         logger.info("[memos-memory][backup] deleted %s", file_name)
         return result
 
@@ -11414,7 +15199,7 @@ class MemosMemoryPlugin(Star):
         force: bool = False,
         reason: str = "scheduled",
     ) -> dict[str, Any]:
-        result = await asyncio.to_thread(
+        result = await self._run_background_work(
             self._data_backup.create,
             force=force,
             reason=reason,
@@ -11453,8 +15238,17 @@ class MemosMemoryPlugin(Star):
                 await asyncio.sleep(1800)
 
     async def terminate(self):
+        self._terminating = True
+        generation_service = getattr(self, "_generation_v2_service", None)
+        if generation_service is not None:
+            await generation_service.close()
+        self._semantic_state_reschedule_needed = False
         try:
             self._save_runtime_telemetry(force=True)
+        except Exception:
+            pass
+        try:
+            await self._house.terminate()
         except Exception:
             pass
         try:
@@ -11472,6 +15266,7 @@ class MemosMemoryPlugin(Star):
             "_source_turn_vector_migration_task",
             "_semantic_state_task",
             "_memory_access_task",
+            "_thread_build_task",
         ):
             t = getattr(self, tn, None)
             if t is not None:
@@ -11481,6 +15276,12 @@ class MemosMemoryPlugin(Star):
                 except Exception:
                     pass
         for task in list(getattr(self, "_semantic_state_pending_tasks", set())):
+            try:
+                task.cancel()
+                owned_tasks.append(task)
+            except Exception:
+                pass
+        for task in list(getattr(self, "_llm_compensation_tasks", {}).values()):
             try:
                 task.cancel()
                 owned_tasks.append(task)
@@ -11506,13 +15307,28 @@ class MemosMemoryPlugin(Star):
         except Exception:
             pass
         try:
-            if self._vec is not None:
-                self._vec.close()
+            await self._external_models.close()
         except Exception:
             pass
         try:
-            if self._episodes is not None:
-                self._episodes.close()
+            await self._llm_runtime.close()
         except Exception:
             pass
+        def close_stores() -> None:
+            for store in (
+                getattr(self, "_vec", None),
+                getattr(self, "_episodes", None),
+            ):
+                if store is not None:
+                    try:
+                        store.close()
+                    except Exception:
+                        logger.exception("[memos-memory] deferred store close failed")
+
+        tracker = getattr(self, "_background_work", None)
+        if tracker is None or await tracker.drain(timeout=30.0):
+            close_stores()
+        else:
+            logger.warning("[memos-memory] worker drain timed out; store close deferred")
+            tracker.after_drain(close_stores)
         logger.info("[memos-memory] terminated")

@@ -9,7 +9,7 @@
 *{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font-family:Inter,"Segoe UI","Microsoft YaHei",sans-serif;letter-spacing:0}.shell{min-height:100vh;display:grid;grid-template-columns:76px minmax(0,1fr)}
 .rail{position:sticky;top:0;height:100vh;background:#18231f;color:#fff;padding:16px 10px;display:flex;flex-direction:column;align-items:center;gap:12px}.mark{width:44px;height:44px;display:grid;place-items:center;border:1px solid #51625b;font-weight:800;font-size:13px}.rail a{width:44px;height:38px;display:grid;place-items:center;color:#bfcac5;text-decoration:none;border-radius:6px;font-size:11px}.rail a:hover,.rail a.active{background:#2c3d36;color:#fff}.rail .spacer{flex:1}.rail .version{writing-mode:vertical-rl;color:#85958e;font-size:10px}
 main{min-width:0;padding:26px 30px 40px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:22px}.top h1{margin:0;font-size:28px}.top p{margin:6px 0 0;color:var(--muted);font-size:13px}.actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}button,input,select{font:inherit;letter-spacing:0}.btn{height:36px;padding:0 13px;border:1px solid var(--line);border-radius:6px;background:var(--white);color:var(--ink);cursor:pointer}.btn:hover{border-color:#9aaba3}.btn.primary{background:var(--green);border-color:var(--green);color:#fff}.btn:disabled{opacity:.5;cursor:wait}
-.banner{display:flex;align-items:center;gap:12px;background:#edf5f1;border-left:4px solid var(--green);padding:12px 14px;margin-bottom:18px}.dot{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 0 5px rgba(20,118,92,.12)}.banner strong{font-size:13px}.banner span{color:var(--muted);font-size:12px}.metrics{display:grid;grid-template-columns:repeat(6,minmax(110px,1fr));gap:10px;margin-bottom:18px}.metric{background:var(--white);border:1px solid var(--line);border-radius:7px;padding:14px;min-height:92px;animation:rise .35s ease both}.metric small{display:block;color:var(--muted);font-size:11px}.metric b{display:block;font-size:25px;margin-top:10px}.metric em{font-style:normal;color:var(--muted);font-size:11px}
+.banner{display:flex;align-items:center;gap:12px;background:#edf5f1;border-left:4px solid var(--green);padding:12px 14px;margin-bottom:18px}.dot{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 0 5px rgba(20,118,92,.12)}.banner strong{font-size:13px}.banner span{color:var(--muted);font-size:12px}.metrics{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px;margin-bottom:18px}.metric{background:var(--white);border:1px solid var(--line);border-radius:7px;padding:14px;min-height:92px;animation:rise .35s ease both}.metric small{display:block;color:var(--muted);font-size:11px}.metric b{display:block;font-size:25px;margin-top:10px}.metric em{font-style:normal;color:var(--muted);font-size:11px}.metric.deferred{border-left:3px solid var(--blue)}
 .workspace{display:grid;grid-template-columns:minmax(500px,1.65fr) minmax(310px,.8fr);gap:14px}.panel{background:var(--white);border:1px solid var(--line);border-radius:7px;box-shadow:var(--shadow);min-width:0}.panel-head{min-height:52px;padding:12px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:10px}.panel-head h2{font-size:14px;margin:0}.panel-head span{font-size:11px;color:var(--muted)}.filters{display:flex;gap:7px}.filters input,.filters select{height:32px;border:1px solid var(--line);border-radius:5px;background:#fff;padding:0 9px;min-width:0}.filters input{width:180px}
 .statebar{height:12px;margin:14px;display:flex;overflow:hidden;background:#edf0ee}.statebar i{display:block;height:100%;transition:width .5s ease}.statebar .vivid{background:var(--green)}.statebar .latent{background:var(--amber)}.statebar .deep{background:var(--red)}
 .table-wrap{overflow:auto;max-height:440px}table{border-collapse:collapse;width:100%;font-size:12px}th,td{text-align:left;padding:9px 11px;border-bottom:1px solid #edf0ee;vertical-align:top}th{position:sticky;top:0;background:#f9faf9;color:var(--muted);font-weight:600;z-index:1}tbody tr{cursor:pointer}tbody tr:hover{background:#f3f7f5}.mono{font-family:"Cascadia Mono",Consolas,monospace;font-size:11px}.pill{display:inline-flex;align-items:center;height:21px;padding:0 7px;border-radius:999px;font-size:10px;font-weight:700}.pill.vivid{background:#dff1e9;color:#0b684e}.pill.latent{background:#f8ead2;color:#87520d}.pill.deep{background:#f4dfe2;color:#8e3040}.score{font-variant-numeric:tabular-nums;font-weight:700}.scene{max-width:310px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -17,9 +17,38 @@ main{min-width:0;padding:26px 30px 40px}.top{display:flex;align-items:flex-start
 .graph-panel{grid-column:1/-1}.graph-grid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(300px,.7fr)}#graph{width:100%;height:460px;display:block;background:#fafcfb;border-right:1px solid var(--line)}.legend{padding:14px}.legend h3{font-size:12px;margin:0 0 10px}.legend-row{display:flex;align-items:center;gap:8px;font-size:11px;margin:8px 0}.swatch{width:10px;height:10px;border-radius:50%}.swatch.vivid{background:var(--green)}.swatch.latent{background:var(--amber)}.swatch.deep{background:var(--red)}.edge-key{width:28px;border-top:2px solid var(--blue)}
 .lab{grid-column:1/-1;display:grid;grid-template-columns:minmax(280px,.75fr) minmax(0,1.25fr)}.lab-form{padding:15px;border-right:1px solid var(--line)}.lab-form textarea{width:100%;min-height:96px;resize:vertical;border:1px solid var(--line);border-radius:5px;padding:10px;font:inherit}.lab-result{padding:15px;min-height:160px}.compare{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.compare section{border-left:3px solid var(--line);padding-left:10px}.compare section:last-child{border-color:var(--green)}.compare h4{font-size:12px;margin:0 0 8px}.compare ol{margin:0;padding-left:20px;font-size:11px}.compare li{margin:5px 0;overflow-wrap:anywhere}.toast{position:fixed;right:24px;bottom:24px;background:#17211e;color:#fff;padding:10px 13px;border-radius:6px;font-size:12px;opacity:0;transform:translateY(8px);pointer-events:none;transition:.2s}.toast.show{opacity:1;transform:none}@keyframes rise{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
 @media(max-width:1040px){.metrics{grid-template-columns:repeat(3,1fr)}.workspace{grid-template-columns:1fr}.graph-panel,.lab{grid-column:auto}.graph-grid,.lab{grid-template-columns:1fr}#graph{border-right:0;border-bottom:1px solid var(--line)}.lab-form{border-right:0;border-bottom:1px solid var(--line)}}
-@media(max-width:700px){.shell{grid-template-columns:1fr}.rail{position:static;height:auto;flex-direction:row;justify-content:flex-start;overflow:auto}.rail .spacer,.rail .version{display:none}main{padding:18px 12px}.top{display:block}.actions{justify-content:flex-start;margin-top:14px}.metrics{grid-template-columns:repeat(2,1fr)}.filters{flex-wrap:wrap}.filters input{width:150px}.panel{box-shadow:none}}
+.eval-panel{grid-column:1/-1}
+.gates{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;padding:14px 16px 4px}
+.gate{background:var(--white);border:1px solid var(--line);border-left-width:3px;border-radius:7px;padding:11px 12px;display:flex;flex-direction:column;gap:7px;animation:rise .35s ease both}
+.gate small{display:block;color:var(--muted);font-size:11px;line-height:1.35}
+.gate .verdict{display:inline-flex;align-items:center;align-self:flex-start;height:21px;padding:0 7px;border-radius:999px;font-size:10px;font-weight:700}
+.gate .val{color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
+.gate.pass{border-left-color:var(--green)}
+.gate.pass .verdict{background:#dff1e9;color:#0b684e}
+.gate.fail{border-left-color:var(--red)}
+.gate.fail .verdict{background:#f4dfe2;color:#8e3040}
+.gate.idle{border-left-color:var(--line)}
+.gate.idle .verdict{background:var(--paper);color:var(--muted)}
+.grade{display:inline-flex;align-items:center;justify-content:center;min-width:19px;height:19px;padding:0 5px;border-radius:5px;font-size:10px;font-weight:700}
+.grade.a{background:#dff1e9;color:#0b684e}
+.grade.b{background:#e2eef0;color:#265c72}
+.grade.c{background:#f8ead2;color:#87520d}
+.grade.d{background:var(--paper);color:var(--muted)}
+.eval-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 16px 0}
+.eval-bar .chip{border:1px solid var(--line);background:var(--white);border-radius:999px;padding:4px 11px;font-size:11px;color:var(--muted);cursor:pointer}
+.eval-bar .chip:hover{border-color:var(--green);color:var(--ink)}
+.eval-bar .chip.on{background:#dff1e9;border-color:#bfe0d3;color:#0b684e;font-weight:700}
+.eval-note{padding:0 16px 14px;color:var(--muted);font-size:11px;line-height:1.5}
+.lab-grade{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:9px;font-size:11px;color:var(--muted)}
+.lab-grade .warn{color:var(--red);font-weight:700}
+.takeover-panel{grid-column:1/-1}.takeover-grid{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(260px,.75fr);gap:14px;padding:14px}.conditions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.condition{border:1px solid var(--line);border-left:3px solid var(--red);padding:9px;border-radius:6px;min-height:66px}.condition.pass{border-left-color:var(--green)}.condition b{display:block;font-size:11px}.condition span{display:block;margin-top:6px;color:var(--muted);font-size:10px;line-height:1.4}.breaker-box{border-left:3px solid var(--green);background:#f7faf8;padding:12px}.breaker-box.tripped{border-left-color:var(--red);background:#fbf4f5}.breaker-box h3{margin:0 0 7px;font-size:13px}.case-target{width:min(340px,100%);height:30px;border:1px solid var(--line);border-radius:5px;padding:0 8px;font:inherit}.case-actions{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.btn.small{height:30px;padding:0 9px;font-size:11px}.confirmed{color:var(--green);font-weight:700}.unconfirmed{color:var(--amber)}
+.takeover-log{padding:0 14px 14px}.takeover-log h3{font-size:12px;margin:2px 0 9px}.takeover-log .table-wrap{max-height:260px;border:1px solid var(--line)}.use-pending{color:var(--amber)}.use-yes{color:var(--green);font-weight:700}.use-no{color:var(--red);font-weight:700}
+.observation-panel{grid-column:1/-1}.observation-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;padding:14px}.observation-summary .gate{min-height:84px}.observation-tools{display:flex;align-items:center;gap:7px;flex-wrap:wrap}.observation-tools input{height:32px;border:1px solid var(--line);border-radius:5px;padding:0 9px;width:190px}.observation-tools label{display:flex;align-items:center;gap:5px;color:var(--muted);font-size:11px}.observation-tools input[type=checkbox]{width:auto;height:auto}.query-cell{max-width:400px}.query-cell b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.query-cell small{display:block;color:var(--muted);margin-top:4px}.change-yes{color:var(--green);font-weight:700}.change-no{color:var(--muted)}.observation-detail{display:none;padding:14px 16px;border-top:1px solid var(--line);background:#fafcfb}.observation-detail.open{display:block}.observation-detail .compare{margin-bottom:12px}.candidate-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.candidate{border:1px solid var(--line);border-left:3px solid var(--line);padding:9px;border-radius:5px;font-size:11px}.candidate.recommended{border-left-color:var(--green)}.candidate .candidate-top{display:flex;justify-content:space-between;gap:8px}.candidate .candidate-meta{color:var(--muted);margin-top:6px;line-height:1.5}.feedback-row{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-top:12px}.feedback-row select,.feedback-row input{height:32px;border:1px solid var(--line);border-radius:5px;padding:0 8px}.feedback-row input{min-width:260px;flex:1}.privacy-note{padding:0 16px 14px;color:var(--muted);font-size:11px;line-height:1.5}
+@media(max-width:1040px){.gates{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:900px){.takeover-grid,.conditions,.candidate-grid{grid-template-columns:1fr}.observation-summary{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:700px){.shell{grid-template-columns:1fr}.rail{position:static;height:auto;flex-direction:row;justify-content:flex-start;overflow:auto}.rail .spacer,.rail .version{display:none}main{padding:18px 12px}.top{display:block}.actions{justify-content:flex-start;margin-top:14px}.metrics{grid-template-columns:repeat(2,1fr)}.filters{flex-wrap:wrap}.filters input{width:150px}.panel{box-shadow:none}.gates{grid-template-columns:1fr}}
 </style>
-</head>
+<link rel="stylesheet" href="/assets/workbench.css?v=610blue1"><link rel="stylesheet" href="/assets/atelier.css?v=610blue1"><script src="/assets/lucide.min.js" defer></script><script src="/assets/workbench.js?v=610blue1" defer></script></head>
 <body>
 <div class="shell">
   <aside class="rail">
@@ -27,14 +56,16 @@ main{min-width:0;padding:26px 30px 40px}.top{display:flex;align-items:flex-start
     <a href="/" title="主 WebUI">HOME</a>
     <a href="/production" title="记忆生产">MAKE</a>
     <a class="active" href="/access" title="记忆可达性">ACCESS</a>
+    <a href="/forgetting" title="非破坏式遗忘">FORGET</a>
+    <a href="/threads" title="记忆脉络">THREAD</a>
     <a href="/xinchao" title="心潮">MIND</a>
     <a href="/console" title="控制台">LOG</a>
-    <div class="spacer"></div><div class="version">5.0.0-test0</div>
+    <div class="spacer"></div><div class="version">6.1.0</div>
   </aside>
   <main>
     <header class="top">
-      <div><h1>记忆可达性</h1><p>ACCESS STATE / INTERFERENCE / SHADOW</p></div>
-      <div class="actions"><button class="btn" id="maintain">重算状态</button><button class="btn primary" id="rebuild">重建派生层</button></div>
+      <div><h1>记忆可达性</h1><p>ACCESS STATE / EVALUATION / GUARDED TAKEOVER</p></div>
+      <div class="actions"><button class="btn" id="export-analysis">导出分析包</button><button class="btn" id="maintain">重算状态</button><button class="btn primary" id="rebuild">重建派生层</button></div>
     </header>
     <div class="banner" id="banner"><i class="dot"></i><strong>正在读取访问层</strong><span></span></div>
     <section class="metrics">
@@ -42,8 +73,10 @@ main{min-width:0;padding:26px 30px 40px}.top{display:flex;align-items:flex-start
       <div class="metric"><small>鲜明</small><b id="m-vivid">-</b><em>自然可达</em></div>
       <div class="metric"><small>潜伏</small><b id="m-latent">-</b><em>需一般线索</em></div>
       <div class="metric"><small>深层</small><b id="m-deep">-</b><em>需精确线索</em></div>
+      <div class="metric deferred"><small>暂缓淡出</small><b id="m-deferred">-</b><em id="m-evidence">证据不足</em></div>
       <div class="metric"><small>类型化干扰边</small><b id="m-edges">-</b><em id="m-groups">- 组</em></div>
-      <div class="metric"><small>Shadow 请求</small><b id="m-shadow">-</b><em id="m-rescues">- 次深层救回</em></div>
+      <div class="metric"><small>候选图预算</small><b id="m-pairs">-</b><em id="m-build">等待重建</em></div>
+      <div class="metric"><small>ACCESS 观测</small><b id="m-shadow">-</b><em id="m-rescues">- 次深层救回</em></div>
     </section>
     <div class="workspace">
       <section class="panel">
@@ -53,7 +86,18 @@ main{min-width:0;padding:26px 30px 40px}.top{display:flex;align-items:flex-start
       </section>
       <aside class="panel"><div class="panel-head"><h2>记忆剖面</h2><span id="detail-meta">选择一篇记忆</span></div><div class="detail" id="detail"><div class="empty">暂无选择</div></div></aside>
       <section class="panel graph-panel"><div class="panel-head"><h2>可达与干扰图</h2><span id="graph-meta">0 nodes · 0 edges</span></div><div class="graph-grid"><canvas id="graph"></canvas><div class="legend"><h3>状态</h3><div class="legend-row"><i class="swatch vivid"></i>鲜明</div><div class="legend-row"><i class="swatch latent"></i>潜伏</div><div class="legend-row"><i class="swatch deep"></i>深层</div><h3>关系</h3><div class="legend-row"><i class="edge-key"></i>同事件复述 / 主题相近 / 阶段矛盾 / 因果链</div><p class="mono" id="edge-summary"></p></div></div></section>
-      <section class="panel lab"><div class="lab-form"><div class="panel-head" style="padding:0 0 12px;border:0"><h2>Shadow 对照</h2><span>不写入召回结果</span></div><textarea id="lab-query" placeholder="输入真实问题"></textarea><button class="btn primary" id="simulate" style="margin-top:8px">运行对照</button></div><div class="lab-result" id="lab-result"><div class="empty">等待一次检索</div></div></section>
+      <section class="panel lab"><div class="lab-form"><div class="panel-head" style="padding:0 0 12px;border:0"><h2>ACCESS 诊断 / 线索实验室</h2><span>只做模拟，不写入在线补充或再巩固</span></div><textarea id="lab-query" placeholder="输入真实问题，查看 A/B/C/D 线索等级、时间约束与候选诊断"></textarea><button class="btn primary" id="simulate" style="margin-top:8px">运行诊断</button></div><div class="lab-result" id="lab-result"><div class="empty">等待一次检索</div></div></section>
+      <section class="panel observation-panel"><div class="panel-head"><h2>真实 Shadow 评测流水</h2><div class="observation-tools"><input id="observation-search" placeholder="筛选真实 query"><label><input type="checkbox" id="observation-changed">仅看有变化</label><label><input type="checkbox" id="observation-rescued">仅看救援</label><button class="btn small" id="observation-refresh">刷新</button></div></div>
+        <div class="observation-summary"><div class="gate idle"><small>近 30 天请求</small><span class="verdict" id="o-requests">0</span><span class="val">真实聊天自动留档</span></div><div class="gate idle"><small>Shadow 建议变化</small><span class="verdict" id="o-change">0%</span><span class="val" id="o-change-meta">0 次</span></div><div class="gate idle"><small>池外 / 深层救援</small><span class="verdict" id="o-rescue">0 / 0</span><span class="val">独立线索通道</span></div><div class="gate idle"><small>回答平均采用率</small><span class="verdict" id="o-use">0%</span><span class="val" id="o-use-meta">等待回复样本</span></div></div>
+        <div class="table-wrap"><table><thead><tr><th>时间</th><th>真实 query</th><th>基线 / Shadow</th><th>救援</th><th>回答采用</th><th>反馈</th></tr></thead><tbody id="observation-rows"></tbody></table></div><div class="observation-detail" id="observation-detail"></div><p class="privacy-note">自动保存在本地 episodic_memory.db。分析包包含真实 query、排名诊断及评测用短线索，但不包含 Memos Token、模型密钥、日记正文或完整原文档案；query 本身可能含私密聊天内容，请主动决定是否分享。</p></section>
+      <section class="panel eval-panel"><div class="panel-head"><h2>自动校准与回归评测</h2><div class="actions"><span id="eval-meta">尚未评测</span><select id="eval-scope"><option value="calibration">自动校准（推荐）</option><option value="strict">严格原文验证</option><option value="all">全部案例诊断</option></select><button class="btn" id="eval-generate">从现有记忆生成</button><button class="btn primary" id="eval-run">运行真实召回评测</button></div></div>
+        <div class="gates" id="eval-gates"></div>
+        <div class="gates" id="eval-calibration"></div>
+        <p class="eval-note" id="eval-note">默认用原文链接与语料内独特线索评估排序质量。评测结果用于调参和回归，不会删改旧主召回，也不会强迫 T/A 槽补满。</p>
+        <div class="eval-bar" id="eval-type-filters"></div>
+        <div class="table-wrap"><table><thead><tr><th>类型</th><th>查询</th><th>期望篇目</th><th>实际</th><th>命中</th><th>确认</th><th>操作</th></tr></thead><tbody id="eval-rows"></tbody></table></div>
+      </section>
+      <section class="panel takeover-panel"><div class="panel-head"><h2>Stage 2 补充支路</h2><span id="takeover-meta">正在检查</span></div><div class="takeover-grid"><div class="conditions" id="takeover-conditions"></div><aside class="breaker-box" id="breaker-box"><h3>补充断路器</h3><p id="breaker-text" class="mono">正在读取</p><button class="btn small" id="breaker-reset">重置断路器</button></aside></div><div class="takeover-log"><h3>最近 T/A 补充流水</h3><div class="table-wrap"><table><thead><tr><th>时间</th><th>篇目</th><th>槽位</th><th>追加位次</th><th>理由</th><th>回复使用</th></tr></thead><tbody id="takeover-rows"></tbody></table></div></div></section>
     </div>
   </main>
 </div><div class="toast" id="toast"></div>
@@ -65,17 +109,151 @@ async function api(path,opt){const r=await fetch(path,opt);const j=await r.json(
 async function post(path,body){return api(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})})}
 function toast(msg){const el=document.getElementById("toast");el.textContent=msg;el.classList.add("show");setTimeout(()=>el.classList.remove("show"),2200)}
 function stateLabel(s){return s==="vivid"?"鲜明":s==="latent"?"潜伏":"深层"}
-function renderOverview(d){S.overview=d;const st=d.states||{},total=Number(d.total||0);document.getElementById("m-total").textContent=num(total);document.getElementById("m-vivid").textContent=num(st.vivid);document.getElementById("m-latent").textContent=num(st.latent);document.getElementById("m-deep").textContent=num(st.deep);document.getElementById("m-edges").textContent=num(d.edges);document.getElementById("m-groups").textContent=num(d.groups)+" 组";document.getElementById("m-shadow").textContent=num(d.shadow_requests);document.getElementById("m-rescues").textContent=num(d.deep_rescues)+" 次深层救回";["vivid","latent","deep"].forEach(k=>document.getElementById("bar-"+k).style.width=(total?Number(st[k]||0)*100/total:0)+"%");const b=document.getElementById("banner"),shadow=(d.settings||{}).shadow_mode;b.querySelector("strong").textContent=d.ready?(shadow?"Shadow 观察中":"访问层已接管"):"访问层未就绪";b.querySelector("span").textContent=shadow?"4.6.2 的真实召回与注入名单保持不变":"当前设置允许访问层影响真实路径"}
+function dt(v){return v?new Date(Number(v)*1000).toLocaleString():"-"}
+function renderOverview(d){S.overview=d;const st=d.states||{},ar=d.age_references||{},de=d.decay_eligibility||{},er=d.evidence_readiness||{},ix=d.index_meta||{},total=Number(d.total||0),settings=d.settings||{},route=String(settings.route_mode||"shadow");document.getElementById("m-total").textContent=num(total);document.getElementById("m-vivid").textContent=num(st.vivid);document.getElementById("m-latent").textContent=num(st.latent);document.getElementById("m-deep").textContent=num(st.deep);document.getElementById("m-deferred").textContent=num(de.deferred);document.getElementById("m-evidence").textContent="可回原文 "+num(er.source_linked)+" / "+num(total);document.getElementById("m-edges").textContent=num(d.edges);document.getElementById("m-groups").textContent=num(d.groups)+" 组 · 事实时钟 "+num(ar.event)+" / 代理 "+num(ar.source_updated_proxy)+" / 未知 "+num(ar.unknown);document.getElementById("m-pairs").textContent=num(ix.interference_candidate_pairs);document.getElementById("m-build").textContent=(Number(ix.interference_build_ms||0)/1000).toFixed(2)+" 秒 · "+Number(ix.interference_pairs_per_memory||0).toFixed(1)+" 对/篇 · "+String(ix.interference_scale_health||"unbuilt");document.getElementById("m-shadow").textContent=num(d.shadow_requests);document.getElementById("m-rescues").textContent=num(d.deep_rescues)+" 次深层救回";["vivid","latent","deep"].forEach(k=>document.getElementById("bar-"+k).style.width=(total?Number(st[k]||0)*100/total:0)+"%");const b=document.getElementById("banner"),online=route==="supplement";b.querySelector("strong").textContent=d.ready?(online?"Stage 2 补充在线":"ACCESS 影子诊断中"):"访问层未就绪";b.querySelector("span").textContent=online?"旧主召回完整保留；独立 T 时间槽与 A 精确救援槽各最多补 1 条，未达门槛补 0 条":"影子模式只记录诊断，不改变旧主召回；非破坏式遗忘不会删除记忆"}
 async function loadOverview(){renderOverview(await api("/api/access/overview"))}
 function renderRows(){document.getElementById("rows").innerHTML=S.memories.map(x=>`<tr data-memo="${esc(x.memo_name)}"><td><span class="pill ${esc(x.access_state)}">${stateLabel(x.access_state)}</span></td><td><div class="mono">${esc(x.memo_name)}</div><div class="scene">${esc(x.scene_anchor||x.retrieval_key||"")}</div></td><td class="score">${pct(x.accessibility)}</td><td>${pct(x.persistence)}</td><td>${pct(x.interference_load)}</td><td>${esc(x.occurred_at||"-")}</td></tr>`).join("")||"<tr><td colspan='6'><div class='empty'>没有符合条件的记忆</div></td></tr>";document.querySelectorAll("#rows tr[data-memo]").forEach(el=>el.onclick=()=>openDetail(el.dataset.memo))}
 async function loadMemories(){const q=encodeURIComponent(document.getElementById("search").value.trim()),state=encodeURIComponent(document.getElementById("state").value);const d=await api(`/api/access/memories?limit=220&q=${q}&state=${state}`);S.memories=d.items||[];renderRows();drawGraph()}
-async function openDetail(name){const d=await api("/api/access/detail/"+encodeURIComponent(name));S.selected=name;const a=d.access||{},e=d.episode||{},c=a.cue_signature||{},edges=a.interference||[];document.getElementById("detail-meta").textContent=stateLabel(a.access_state)+" · "+pct(a.accessibility);const cues=[...(c.dates||[]),...(c.entities||[]),...(c.quotes||[])].slice(0,18);document.getElementById("detail").innerHTML=`<h3>${esc(name)}</h3><div>${esc(e.scene_anchor||e.retrieval_key||"")}</div><dl><dt>自然可达</dt><dd>${pct(a.accessibility)}</dd><dt>持久性</dt><dd>${pct(a.persistence)}</dd><dt>鲜明度</dt><dd>${pct(a.vividness)}</dd><dt>独特性</dt><dd>${pct(a.distinctiveness)}</dd><dt>干扰负载</dt><dd>${pct(a.interference_load)}</dd><dt>成功使用</dt><dd>${num(a.successful_use_count)}</dd><dt>再巩固</dt><dd>${num(a.reconsolidation_count)}</dd></dl><div class="cue-list">${cues.map(x=>`<span class="cue">${esc(x)}</span>`).join("")||"<span class='cue'>暂无结构化线索</span>"}</div><h4 class="subhead">干扰关系</h4>${edges.slice(0,8).map(x=>`<div class="edge-row"><div>${esc(x.source_memo===name?x.target_memo:x.source_memo)}<br><small>${esc(x.edge_type)}</small></div><b>${pct(x.strength)}</b></div>`).join("")||"<div class='event-row'>无显著干扰边</div>"}`;drawGraph()}
+async function openDetail(name){const d=await api("/api/access/detail/"+encodeURIComponent(name));S.selected=name;const a=d.access||{},e=d.episode||{},c=a.cue_signature||{},edges=a.interference||[],clock=a.age_reference_kind==="event"?"事实事件时间":a.age_reference_kind==="source_updated_proxy"?"来源更新时间（仅衰减代理）":"未知（不使用迁移时间）",reasons=(a.protection_reasons||[]).map(x=>`<span class="cue">${esc(x)}</span>`).join("");document.getElementById("detail-meta").textContent=stateLabel(a.access_state)+" · "+pct(a.accessibility);const cues=[...(c.dates||[]),...(c.entities||[]),...(c.quotes||[])].slice(0,18);document.getElementById("detail").innerHTML=`<h3>${esc(name)}</h3><div>${esc(e.scene_anchor||e.retrieval_key||"")}</div><dl><dt>自然可达</dt><dd>${pct(a.accessibility)}</dd><dt>遗忘资格</dt><dd><b>${esc(a.eligibility_label||"")}</b></dd><dt>判定置信</dt><dd>${pct(a.state_confidence)}</dd><dt>持久性</dt><dd>${pct(a.persistence)}</dd><dt>鲜明度</dt><dd>${pct(a.vividness)}</dd><dt>独特性</dt><dd>${pct(a.distinctiveness)}</dd><dt>干扰负载</dt><dd>${pct(a.interference_load)}</dd><dt>衰减时钟</dt><dd>${esc(clock)}</dd><dt>成功使用</dt><dd>${num(a.successful_use_count)}</dd><dt>再巩固</dt><dd>${num(a.reconsolidation_count)}</dd></dl><h4 class="subhead">资格依据</h4><div class="cue-list">${reasons||"<span class='cue'>普通记忆，当前允许自然淡出</span>"}</div><h4 class="subhead">可救援线索</h4><div class="cue-list">${cues.map(x=>`<span class="cue">${esc(x)}</span>`).join("")||"<span class='cue'>暂无结构化线索</span>"}</div><h4 class="subhead">干扰关系</h4>${edges.slice(0,8).map(x=>`<div class="edge-row"><div>${esc(x.source_memo===name?x.target_memo:x.source_memo)}<br><small>${esc(x.edge_type)}</small></div><b>${pct(x.strength)}</b></div>`).join("")||"<div class='event-row'>无显著干扰边</div>"}`;drawGraph()}
 async function loadEdges(){const d=await api("/api/access/interference?limit=500");S.edges=d.items||[];drawGraph()}
 function drawGraph(){const canvas=document.getElementById("graph"),rect=canvas.getBoundingClientRect(),ratio=Math.min(2,window.devicePixelRatio||1);canvas.width=Math.max(1,rect.width*ratio);canvas.height=Math.max(1,rect.height*ratio);const ctx=canvas.getContext("2d");ctx.scale(ratio,ratio);const w=rect.width,h=rect.height,nodes=S.memories.slice(0,100);ctx.clearRect(0,0,w,h);if(!nodes.length)return;const map=new Map(),cx=w/2,cy=h/2,r=Math.min(w,h)*.39;nodes.forEach((x,i)=>{const a=i/nodes.length*Math.PI*2+(i%7)*.03,rr=r*(.52+.48*((i*37)%97)/97),p={x:cx+Math.cos(a)*rr,y:cy+Math.sin(a)*rr,data:x};map.set(x.memo_name,p)});ctx.globalAlpha=.38;S.edges.forEach(e=>{const a=map.get(e.source_memo),b=map.get(e.target_memo);if(!a||!b)return;ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.strokeStyle=e.edge_type==="contradictory_stage"?"#a33e4c":e.edge_type==="causal_chain"?"#34738d":"#7f9088";ctx.lineWidth=.5+Number(e.strength||0)*1.8;ctx.stroke()});ctx.globalAlpha=1;nodes.forEach(x=>{const p=map.get(x.memo_name),sel=x.memo_name===S.selected,size=4+Number(x.retrieval_count||0)*.3+(sel?4:0);ctx.beginPath();ctx.arc(p.x,p.y,Math.min(11,size),0,Math.PI*2);ctx.fillStyle=x.access_state==="vivid"?"#14765c":x.access_state==="latent"?"#ba7819":"#a33e4c";ctx.fill();if(sel){ctx.strokeStyle="#17211e";ctx.lineWidth=2;ctx.stroke()}});canvas._nodes=[...map.values()];document.getElementById("graph-meta").textContent=nodes.length+" nodes · "+S.edges.length+" edges";const counts={};S.edges.forEach(e=>counts[e.edge_type]=(counts[e.edge_type]||0)+1);document.getElementById("edge-summary").textContent=Object.entries(counts).map(x=>x[0]+" "+x[1]).join("\n")}
 document.getElementById("graph").onclick=e=>{const c=e.currentTarget,r=c.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top,n=(c._nodes||[]).map(p=>({p,d:Math.hypot(p.x-x,p.y-y)})).sort((a,b)=>a.d-b.d)[0];if(n&&n.d<16)openDetail(n.p.data.memo_name)};
-async function simulate(){const q=document.getElementById("lab-query").value.trim();if(!q)return toast("请输入问题");const btn=document.getElementById("simulate");btn.disabled=true;try{const d=await post("/api/access/simulate",{query:q}),a=d.access||{},b=d.baseline||{};document.getElementById("lab-result").innerHTML=`<div class="compare"><section><h4>4.6 基线 · ${esc(b.architecture||"")}</h4><ol>${(b.selected||[]).map(x=>`<li>${esc(x)}</li>`).join("")||"<li>无入选</li>"}</ol></section><section><h4>5.0 Shadow · ${a.would_change?"建议有变化":"与基线一致"}</h4><ol>${(a.recommended||[]).map(x=>`<li>${esc(x)}</li>`).join("")||"<li>无建议</li>"}</ol></section></div><p class="mono">exact cues ${num(a.exact_cue_count)} · deep rescue ${num(a.deep_rescue_count)} · candidates ${num(a.candidate_count)}</p>`}catch(e){toast(e.message)}finally{btn.disabled=false}}
+async function simulate(){const q=document.getElementById("lab-query").value.trim();if(!q)return toast("请输入问题");const btn=document.getElementById("simulate");btn.disabled=true;try{const d=await post("/api/access/simulate",{query:q}),a=d.access||{},b=d.baseline||{};const sd=a.same_day||{},gradeTag=g=>`<span style="font-weight:700;color:${{"A":"#14765c","B":"#4a7a64","C":"#ba7819"}[g]||"#666"}">[${g}]</span>`;const gradeRow=`<p class="mono">查询等级 ${gradeTag(a.query_grade||"D")} ${a.date_only_query?"· 日期范围查询":""}${sd.temporal_scope_count>1?" · 同日 "+sd.temporal_scope_count+"篇"+(sd.ambiguous_same_day?" <b style='color:#a33e4c'>消歧分差不足</b>":""):""}`;document.getElementById("lab-result").innerHTML=gradeRow+`</p><div class="compare"><section><h4>旧主召回 · ${esc(b.architecture||"")}</h4><ol>${(b.selected||[]).map(x=>`<li>${esc(x)}</li>`).join("")||"<li>无入选</li>"}</ol></section><section><h4>ACCESS 候选诊断 · ${a.would_change?"发现潜在补充":"未发现额外候选"}</h4><ol>${(a.recommended||[]).map(x=>`<li>${esc(x)}</li>`).join("")||"<li>无建议</li>"}</ol></section></div><p class="mono">精确线索 ${num(a.exact_cue_count)} · 深层救回 ${num(a.deep_rescue_count)} · 候选 ${num(a.candidate_count)}</p>`}catch(e){toast(e.message)}finally{btn.disabled=false}}
 async function mutation(path,label){const btn=document.activeElement;btn.disabled=true;try{const d=await post(path,{});toast(label+"完成 · "+num(d.updated||d.episodes)+" 条");await Promise.all([loadOverview(),loadMemories(),loadEdges()])}catch(e){toast(e.message)}finally{btn.disabled=false}}
 let timer;document.getElementById("search").oninput=()=>{clearTimeout(timer);timer=setTimeout(loadMemories,260)};document.getElementById("state").onchange=loadMemories;document.getElementById("simulate").onclick=simulate;document.getElementById("rebuild").onclick=()=>mutation("/api/access/rebuild","重建");document.getElementById("maintain").onclick=()=>mutation("/api/access/maintenance","维护");window.onresize=()=>drawGraph();
 Promise.all([loadOverview(),loadMemories(),loadEdges()]).catch(e=>toast(e.message));
+
+function renderObservationSummary(s){s=s||{};document.getElementById("o-requests").textContent=num(s.requests);document.getElementById("o-change").textContent=pct(s.changed_rate);document.getElementById("o-change-meta").textContent=num(s.changed)+" 次建议不同";document.getElementById("o-rescue").textContent=num(s.pool_rescue_requests)+" / "+num(s.deep_rescue_requests);document.getElementById("o-use").textContent=pct(s.average_response_use_rate);document.getElementById("o-use-meta").textContent=num(s.responses)+" 次已有回答"}
+function feedbackLabel(v){return {baseline_better:"基线更好",shadow_better:"Shadow 更好",equivalent:"基本等价",uncertain:"不确定",clear:"清除标记"}[v]||"未反馈"}
+function renderObservations(){const rows=document.getElementById("observation-rows"),list=S.observations||[];rows.innerHTML=list.map(x=>{const changed=x.would_change?`<span class="change-yes">变化</span>`:`<span class="change-no">一致</span>`,use=Number(x.response_memories)<0?"待回答":num(x.response_used)+" / "+num(x.response_memories)+" · "+pct(x.response_use_rate),rescue=num(x.rescue_pool_count)+" / "+num(x.deep_rescue_count);return `<tr data-request="${esc(x.request_id)}"><td class="mono">${esc(dt(x.created_ts))}</td><td class="query-cell"><b title="${esc(x.query_text)}">${esc(x.query_text||"(空 query)")}</b><small>${gradeTag(x.query_grade)} · 候选 ${num(x.candidate_count)}</small></td><td>${changed}<br><small>${num((x.baseline||[]).length)} / ${num((x.recommended||[]).length)}</small></td><td>${esc(rescue)}<br><small>池外 / 深层</small></td><td>${esc(use)}</td><td>${esc(feedbackLabel(x.feedback_verdict))}</td></tr>`}).join("")||"<tr><td colspan='6'><div class='empty'>还没有真实 Shadow 样本。正常聊天并触发一次记忆召回后会自动出现。</div></td></tr>";rows.querySelectorAll("tr[data-request]").forEach(el=>el.onclick=()=>openObservation(el.dataset.request))}
+async function loadObservations(){const q=encodeURIComponent(document.getElementById("observation-search").value.trim()),changed=document.getElementById("observation-changed").checked?"1":"",rescued=document.getElementById("observation-rescued").checked?"1":"";const d=await api(`/api/access/observations?limit=120&q=${q}&changed=${changed}&rescued=${rescued}`);S.observations=d.items||[];renderObservationSummary(d.summary_30d||{});renderObservations()}
+async function openObservation(id){const x=await api("/api/access/observation/"+encodeURIComponent(id)),detail=x.detail||{},items=detail.items||[],box=document.getElementById("observation-detail");S.observation=x;box.classList.add("open");box.innerHTML=`<div class="compare"><section><h4>旧主召回</h4><ol>${(x.baseline||[]).map(n=>`<li>${esc(n)}</li>`).join("")||"<li>无</li>"}</ol></section><section><h4>ACCESS 影子建议 ${x.would_change?"· 有潜在补充":"· 一致"}</h4><ol>${(x.recommended||[]).map(n=>`<li>${esc(n)}</li>`).join("")||"<li>无</li>"}</ol></section></div><div class="candidate-grid">${items.map(i=>`<div class="candidate ${i.recommended?"recommended":""}"><div class="candidate-top"><b>${esc(i.memo_name)}</b><span>${gradeTag(i.cue_grade)} ${i.recommended?"建议":""}</span></div><div class="candidate-meta">基础 ${Number(i.base_score||0).toFixed(3)} · 可达后 ${Number(i.access_score||0).toFixed(3)} · 状态 ${esc(i.access_state)}<br>线索 ${Number(i.cue_support||0).toFixed(3)} · 路由 ${Number(i.route_support||0).toFixed(3)} · ${esc(i.candidate_source||"")}${i.rescued?" · 已救回":""}</div></div>`).join("")||"<div class='empty'>无候选详情</div>"}</div><div class="feedback-row"><b>这次哪边更好</b><select id="observation-verdict"><option value="uncertain">不确定</option><option value="shadow_better">ACCESS 建议更好</option><option value="baseline_better">旧主召回更好</option><option value="equivalent">基本等价</option><option value="clear">清除标记</option></select><input id="observation-note" maxlength="1000" placeholder="可选：漏了哪篇、误救了什么"><button class="btn primary small" id="observation-feedback-save">保存反馈</button></div>`;document.getElementById("observation-verdict").value=x.feedback_verdict||"uncertain";document.getElementById("observation-note").value=x.feedback_note||"";document.getElementById("observation-feedback-save").onclick=saveObservationFeedback;box.scrollIntoView({behavior:"smooth",block:"nearest"})}
+async function saveObservationFeedback(){const x=S.observation;if(!x)return;await post("/api/access/observation_feedback",{request_id:x.request_id,verdict:document.getElementById("observation-verdict").value,note:document.getElementById("observation-note").value});toast("评测反馈已保存");await loadObservations();await openObservation(x.request_id)}
+async function exportAnalysis(){const btn=document.getElementById("export-analysis");btn.disabled=true;try{const d=await post("/api/access/export",{});toast("分析包已生成 · "+num(d.counts&&d.counts.observations)+" 条");window.location.href="/api/access/export/download?file="+encodeURIComponent(d.file)}catch(e){toast(e.message)}finally{btn.disabled=false}}
+let observationTimer;document.getElementById("observation-search").oninput=()=>{clearTimeout(observationTimer);observationTimer=setTimeout(loadObservations,260)};document.getElementById("observation-changed").onchange=loadObservations;document.getElementById("observation-rescued").onchange=loadObservations;document.getElementById("observation-refresh").onclick=loadObservations;document.getElementById("export-analysis").onclick=exportAnalysis;S.observations=[];S.observation=null;loadObservations().catch(e=>toast(e.message));
+
+const GATE_LABELS={G1:"保护记忆保留",G2:"日期+事件 Top3",G3:"完整原话 Top1",G4:"无关不误救",G5:"同主题不误合",G6:"旧日记可检索",G7:"延迟 P95",G8:"异常回落"};
+const GATE_KEYS=["G1","G2","G3","G4","G5","G6","G7","G8"];
+function gradeTag(g){const k=String(g||"D").toLowerCase();return `<span class="grade ${esc(k)}">${esc(String(g||"D"))}</span>`}
+function renderGates(g,meta){
+  g=g||{};meta=meta||{};
+  const el=document.getElementById("eval-gates");
+  const has=g&&Object.keys(g).length>0;
+  el.innerHTML=GATE_KEYS.map(k=>{
+    const gate=(g||{})[k]||{};
+    const known=has&&typeof gate.passed==="boolean";
+    const cls=!known?"idle":(gate.passed?"pass":"fail");
+    const verdict=!known?"未评测":(gate.passed?"通过":"未通过");
+    let val="—";
+    if(known){val=k==="G7"?(Number(gate.p95_ms||0).toFixed(1)+" ms / 上限 "+gate.required+" · 样本 "+num(gate.samples))
+      :(num(gate.numerator)+" / "+num(gate.denominator)+"　要求 "+pct(gate.required)+(gate.status==="insufficient_samples"?" · 缺样本":""))}
+    return `<div class="gate ${cls}"><small>${esc(k)}　${esc(GATE_LABELS[k]||"")}</small>`
+      +`<span class="verdict">${esc(verdict)}</span>`
+      +`<span class="val">${esc(val)}</span></div>`}).join("");
+  const m=document.getElementById("eval-meta");
+  if(meta&&meta.cases_total!=null){m.textContent="案例 "+num(meta.cases_passed)+" / "+num(meta.cases_total)+" 达标"}
+  else if(!has){m.textContent="尚未评测"}
+  const note=document.getElementById("eval-note");
+  if(has){const passed=GATE_KEYS.filter(k=>(g[k]||{}).passed).length;
+    if((g.evaluation_scope||"")==="calibration"){
+      note.textContent="自动校准已完成；结果用于评估 ACCESS 排序质量。5.1 Supplement 保留旧主召回，仅由独立 T/A 门槛决定是否补充，并持续记录在线利用度。";
+    }else{
+      note.textContent=passed===GATE_KEYS.length
+        ?"八项回归指标全部通过。它们用于验证调参质量；在线补充仍独立执行 T/A 门槛、份额和断路器。"
+        :"仍有 "+(GATE_KEYS.length-passed)+" 项回归指标未通过。旧主召回保持不变，建议先检查失败样本再调整补充阈值。";
+    }}
+  const c=meta.calibration||g.calibration||{};
+  const sample=g.sample||{};
+  const metrics=[
+    ["自动 Hit@3",pct(c.weighted_hit_at_3||0),"按监督置信度加权"],
+    ["记忆宏平均",pct(c.macro_memory_hit_at_3||0),"每篇记忆等权"],
+    ["MRR",Number(c.weighted_mrr||0).toFixed(3),"正确篇目越靠前越好"],
+    ["难负样本胜率",pct(c.hard_negative_target_win_rate||0),"目标篇目排在所有已知易混淆篇目之前"],
+    ["本轮覆盖记忆",num(c.covered_memories||0),"案例 "+num(sample.selected_cases||0)+" / 可用 "+num(sample.available_cases||0)+"，多次运行轮换覆盖"],
+    ["原文线索救援",num(c.source_link_rescue_cases||0),"日记未保留细节时沿精确 turn 链接找回"]
+  ];
+  document.getElementById("eval-calibration").innerHTML=metrics.map(x=>`<div class="gate idle"><small>${esc(x[0])}</small><span class="verdict">${esc(x[1])}</span><span class="val">${esc(x[2])}</span></div>`).join("");
+}
+function renderEvalCases(){
+  const rows=document.getElementById("eval-rows");
+  const list=S.evalCases||[];
+  const shown=S.evalType?list.filter(c=>c.case_type===S.evalType):list;
+  rows.innerHTML=shown.map(c=>{
+    const res=(S.evalResults||{})[c.case_id]||null;
+    const actual=res?gradeTag(res.detail&&res.detail.actual_grade):"<span class='val'>—</span>";
+    const hit=res?(res.found?("第 "+res.rank+" 位"):"未命中"):"—";
+    const expected=c.expected_memo||c.memo_name||"";
+    const confirmed=Boolean(String(c.confirmed_by||"").trim());
+    const level=confirmed?"human":String(c.supervision_level||"heuristic");
+    const levelName={human:"人工纠正",source_verified:"原文可验证",structural_verified:"结构可验证",heuristic:"仅诊断"}[level]||level;
+    return `<tr><td><span class="pill">${esc(c.case_type)}</span></td>`
+      +`<td><div class="scene">${esc(c.query)}</div>`
+      +`<div class="mono">${esc(c.memo_name||"无目标篇")}</div></td>`
+      +`<td><input class="case-target" data-target="${esc(c.case_id)}" value="${esc(expected)}"></td><td>${actual}</td>`
+      +`<td class="val">${esc(hit)}</td>`
+      +`<td class="${level==="heuristic"?"unconfirmed":"confirmed"}">${esc(levelName)} · ${pct(c.supervision_confidence||0)}</td>`
+      +`<td><div class="case-actions"><button class="btn small case-confirm" data-case="${esc(c.case_id)}">纠正目标</button><button class="btn small case-toggle" data-case="${esc(c.case_id)}" data-enabled="${c.enabled?"1":"0"}">${c.enabled?"停用":"启用"}</button></div></td></tr>`}).join("")
+    ||"<tr><td colspan='7'><div class='empty'>暂无案例，先从现有记忆自动生成</div></td></tr>";
+  const bar=document.getElementById("eval-type-filters");
+  const types=[...new Set(list.map(c=>c.case_type))].sort();
+  bar.innerHTML=types.length?[`<span class="chip ${S.evalType?"":"on"}" data-t="">全部 ${list.length}</span>`]
+    .concat(types.map(t=>{const n=list.filter(c=>c.case_type===t).length;
+      return `<span class="chip ${S.evalType===t?"on":""}" data-t="${esc(t)}">${esc(t)} ${n}</span>`})).join(""):"";
+  bar.querySelectorAll(".chip").forEach(el=>el.onclick=()=>{S.evalType=el.dataset.t||"";renderEvalCases()});
+  rows.querySelectorAll(".case-confirm").forEach(el=>el.onclick=()=>confirmEvalCase(el.dataset.case));
+  rows.querySelectorAll(".case-toggle").forEach(el=>el.onclick=()=>toggleEvalCase(el.dataset.case,el.dataset.enabled!=="1"));
+}
+async function loadEvalCases(){
+  const d=await api("/api/access/eval_cases");S.evalCases=d.cases||[];renderEvalCases();
+}
+async function generateEvalCases(){
+  const btn=document.getElementById("eval-generate");btn.disabled=true;
+  try{const d=await post("/api/access/eval_cases/generate",{replace:false});
+    toast("已生成 "+num(d.generated)+" 条案例");await loadEvalCases()}
+  catch(e){toast(e.message)}finally{btn.disabled=false}
+}
+async function confirmEvalCase(caseId){const input=document.querySelector(`[data-target="${CSS.escape(caseId)}"]`),expected=(input&&input.value||"").trim();if(!expected)return toast("请填写期望篇目");try{await post("/api/access/eval_cases/confirm",{case_id:caseId,expected_memo:expected,confirmed_by:"webui"});toast("案例已确认");await loadEvalCases()}catch(e){toast(e.message)}}
+async function toggleEvalCase(caseId,enabled){try{await post("/api/access/eval_cases/enabled",{case_id:caseId,enabled:enabled});await loadEvalCases()}catch(e){toast(e.message)}}
+async function runEval(){
+  const btn=document.getElementById("eval-run");btn.disabled=true;
+  const scope=document.getElementById("eval-scope").value||"calibration";
+  try{const d=await post("/api/access/eval_run",{scope:scope});
+    renderGates(d.gates||{},d);
+    S.evalResults={};
+    try{const rr=await post("/api/access/eval_run_results",{run_id:d.run_id});
+      (rr.results||[]).forEach(r=>{S.evalResults[r.case_id]=r})}catch(_){}
+    renderEvalCases();
+    const c=d.calibration||{};
+    toast("评测完成 "+num(d.cases_total)+" 条 · Hit@3 "+pct(c.weighted_hit_at_3||0)+" · 真实召回 "+num(d.real_recall_cases))
+    await loadTakeoverStatus()}
+  catch(e){toast(e.message)}finally{btn.disabled=false}
+}
+function renderTakeoverStatus(d){
+  const p=d.prerequisites||{},conditions=p.conditions||[],breaker=d.breaker||{},recent=d.recent||[],audit=d.audit||{};
+  document.getElementById("takeover-meta").textContent=p.eligible?"补充支路在线":"补充支路暂停";
+  document.getElementById("takeover-conditions").innerHTML=conditions.map(c=>`<div class="condition ${c.passed?"pass":""}"><b>${esc(c.key)} · ${c.passed?"通过":"未通过"}</b><span>${esc(c.reason||"")}</span></div>`).join("")||"<div class='empty'>暂无评测</div>";
+  document.getElementById("takeover-meta").textContent=p.eligible
+    ?`T ${num(audit.slots&&audit.slots.T)} / A ${num(audit.slots&&audit.slots.A)} · 已评估采用率 ${pct(audit.use_rate||0)}`
+    :`路由未开启或断路器已触发 · 旧主召回仍正常`;
+  const box=document.getElementById("breaker-box");box.classList.toggle("tripped",Boolean(breaker.tripped));
+  document.getElementById("breaker-text").textContent=breaker.tripped?"已触发，仅停止 T/A 补充；需手动重置":"正常 · 连续未使用 "+num(breaker.consecutive_unused)+" / "+num(breaker.threshold);
+  document.getElementById("takeover-rows").innerHTML=recent.map(x=>{
+    const breakerRow=Number(x.breaker_trip)===1,used=Number(x.response_used);
+    const useText=breakerRow?(used===0?"熔断中":"已重置"):(used<0?"待回复":used?"已使用":"未使用");
+    const cls=used<0?"use-pending":used?"use-yes":"use-no";
+    const dt=x.created_ts?new Date(Number(x.created_ts)*1000).toLocaleString():"-";
+    return `<tr><td class="mono">${esc(dt)}</td><td>${esc(breakerRow?"补充断路器":(x.memo_name||"-"))}</td><td>${esc(x.slot||x.cue_grade||"-")}</td><td>${x.append_rank>0?num(x.append_rank):"-"}</td><td>${esc(x.reason||"")}</td><td class="${cls}">${esc(useText)}</td></tr>`
+  }).join("")||"<tr><td colspan='6'><div class='empty'>暂无 T/A 补充记录</div></td></tr>";
+}
+async function loadTakeoverStatus(){try{renderTakeoverStatus(await api("/api/access/takeover_status"))}catch(e){document.getElementById("takeover-meta").textContent=e.message}}
+async function resetBreaker(){if(!confirm("确定重置补充支路断路器？"))return;try{await post("/api/access/takeover_reset",{});toast("补充断路器已重置");await loadTakeoverStatus()}catch(e){toast(e.message)}}
+S.evalCases=[];S.evalResults={};S.evalType="";
+document.getElementById("eval-generate").onclick=generateEvalCases;
+document.getElementById("eval-run").onclick=runEval;
+document.getElementById("breaker-reset").onclick=resetBreaker;
+renderGates(null,null);
+api("/api/access/eval_run_latest").then(d=>{const run=(d||{}).run||null;if(run)renderGates(run.gates||{},run)}).catch(()=>{});
+loadEvalCases().catch(()=>{});
+loadTakeoverStatus();
 </script>
 </body></html>

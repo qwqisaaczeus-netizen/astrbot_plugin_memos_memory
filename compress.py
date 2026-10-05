@@ -223,12 +223,13 @@ DIARY_RENDER_PROMPT = """【角色】你是 {character_name} 的私人日记写�
 【写作规则】
 1. 每个 episode_key 输出且只输出一次，不合并不同情景，不新增情景。
 2. content 必须是 {character_name} 第一人称的沉浸式私密日记，而不是聊天实录；禁止使用“User:”或“Assistant:”标签，也禁止逐轮复述对话。
-3. evidence 中 tier=must_write 的事实必须 100% 写入；tier=supporting 的事实整体至少写入 50%，用于保住氛围和因果；tier=archive_only 的事实必须省略。
+3. evidence 中 tier=must_write 的事实必须 100% 写入；tier=supporting 只选择约 25%-50% 最能维持因果、关系转折和场景质感的代表性线索；tier=archive_only 必须省略。不要为了提高覆盖率把每条 supporting 都改写一遍。
 4. 完整保留人物主体、关键原话/动作/物件、情绪转折、关系因果、结果和未解决部分，并写清这段经历对我的 effect（影响）以及事后仍延续的 afterglow（余韵）。
 5. 可以组织语言和描写体验，但不得增加情景模型没有支持的事实、动作、称呼、承诺或结果。
 6. 不写“根据对话”“记忆模型”“证据显示”等分析口吻。它应当像 {character_name} 真正写给自己的私密日记，而不是摘要、资料卡或条目列表。
-7. 文学性来自具体感受、动作之间的停顿和真实因果，不来自空泛抒情、重复感叹或擅自扩写。
-8. 不设硬字数上限。较长场景要写清完整过程；较短日常不必注水。
+7. 先确定这一篇的情景弧：用少量具体感官或动作落笔，围绕最重要的关系/情绪变化展开，最后留下真实余韵。文学性来自选择与组织，不来自空泛抒情、重复感叹或擅自扩写。
+8. 禁止“一轮对话对应一句日记”、连续使用“他说/我说/然后/接着”搬运流程，也禁止把括号舞台动作依次抄进正文。相邻动作应融合成体验，原话只保留最有辨识度的一两处。
+9. 每个情景可能带有 render_length_hint。它是防止流水账和过长单篇的软目标；must_write 较多时可以适度超过，但不得用截断来满足长度。
 
 【情景模型】
 {episodes_json}
@@ -238,7 +239,7 @@ DIARY_RENDER_PROMPT = """【角色】你是 {character_name} 的私人日记写�
 
 【输出】严格 JSON 数组，不要 markdown：
 [
-  {{"episode_key":"e1","content":"第一人称完整日记正文"}}
+  {{"episode_key":"{example_episode_key}","content":"第一人称完整日记正文"}}
 ]
 """
 
@@ -260,8 +261,9 @@ def build_episode_extraction_prompt(
     range_cap = max(1, int(diary_cap)) if diary_cap else requested_count
     if diary_cap:
         count_instruction = (
-            f"动态提取 1..{range_cap} 个连续情景，最多不超过 {range_cap} 个情景；"
-            "数量由有效候选范围和长期价值决定。"
+            f"目标提取约 {requested_count} 个连续情景，允许 1..{range_cap} 个，"
+            f"最多不超过 {range_cap} 个情景。目标数是默认收口点：只有跨日期、长时间停顿，"
+            "或确有不可合并的地点、目标、关系阶段变化时才增加；信息不足或同一情感弧连续时可以少于目标。"
         )
     elif exact_count:
         count_instruction = (
@@ -274,8 +276,9 @@ def build_episode_extraction_prompt(
     candidates = [item for item in (scene_candidates or []) if isinstance(item, dict)]
     if candidates:
         candidate_instruction = (
-            "本地场景边界候选是硬边界：每个情景的 scene_start_turn..scene_end_turn 必须完整位于同一个候选范围内，"
-            "不得跨候选拼接；无有效证据的候选可以不用。"
+            "候选理由中的 date_change、time_gap 是硬时间边界，不能跨越；"
+            "topic_shift、relation_turn、arc_end 只是召回型软提示，可能是同一连续场景里的语气或话题变化。"
+            "软候选可以合并，绝不能为了候选数量切碎同一情感弧；无长期价值的候选可以不用。"
         )
     else:
         candidate_instruction = (
@@ -294,17 +297,127 @@ def build_episode_extraction_prompt(
     )
 
 
+EPISODE_COMPACT_RECOVERY_PROMPT = """【紧凑恢复任务】上一轮情景抽取超时或结构无效。
+你是 {character_name} 的记忆证据整理器。不要写日记，只从带 [turn:N] 的原始对话提取最多 {max_episodes} 个可核验情景。
+
+规则：
+1. 每个情景必须是连续 turn 区间。date_change、time_gap 是不能跨越的硬时间边界；topic_shift、relation_turn、arc_end 只是软提示，同一情感弧应合并。没有长期价值的寒暄可以忽略。
+2. 每项 evidence 必须指向真实 turn_indexes。quote 只能逐字摘录；actor 只能是 user、assistant 或双方。
+3. 承诺、边界、关系决定和关键事实用 must_write；因果与氛围用 supporting；重复寒暄用 archive_only。
+4. 不得虚构心理。state_change、long_effect、trigger_hint 无可靠依据时留空。
+5. 时间以逐轮记录为准；明确剧情日期用 explicit_dialogue，记录时间用 conversation_now，无法判断用 unknown。
+
+本地候选：
+{scene_candidates_json}
+
+输出严格 JSON 数组，不要 markdown。每项只使用这些字段：
+{{"episode_key":"e1","event_date":"YYYY-MM-DD或空","time_label":"时段或空","time_basis":"explicit_dialogue/conversation_now/unknown","scene_anchor":"辨识锚点","scene_start_turn":0,"scene_end_turn":1,"reasons":["边界理由"],"memory_type":"plot_fact/relationship_shift/emotional_anchor/behavior_bias/promise_or_rule/daily_texture","evidence":[{{"kind":"dialogue/action/fact/object/commitment/boundary/body/setting","actor":"user/assistant/双方","detail":"忠实事实","quote":"可为空的逐字原话","turn_indexes":[0],"tier":"must_write/supporting/archive_only","confidence":0.0}}],"state_change":"可为空","long_effect":"可为空","trigger_hint":"可为空","retrieval_key":"高密度检索句","entities":[],"unresolved":[],"tags":[],"importance":3}}
+
+{message_time_context}
+
+原始对话：
+{messages}
+
+只输出 JSON 数组。"""
+
+
+def build_episode_compact_recovery_prompt(
+    character_name: str,
+    messages_text: str,
+    max_episodes: int,
+    *,
+    message_time_context: str = "",
+    scene_candidates: list[dict] | None = None,
+) -> str:
+    import json
+
+    return EPISODE_COMPACT_RECOVERY_PROMPT.format(
+        character_name=character_name,
+        max_episodes=max(1, int(max_episodes or 1)),
+        scene_candidates_json=json.dumps(
+            [item for item in (scene_candidates or []) if isinstance(item, dict)],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        message_time_context=message_time_context or "【逐轮时间】以每个 [对话记录时间] 为准。",
+        messages=messages_text,
+    )
+
+
 def build_diary_render_prompt(
     character_name: str,
     messages_text: str,
     episodes: list[dict],
+    length_hints: dict[str, str] | None = None,
 ) -> str:
     import json
 
+    example_episode_key = str(
+        (episodes[0] if episodes else {}).get("episode_key") or "e1"
+    ).strip()
+    local_recovery = bool(episodes) and all(
+        str(item.get("_episode_extraction_mode") or "") == "local_grounded_recovery"
+        for item in episodes
+    )
+    if local_recovery:
+        # Local evidence already contains the archived turns in `detail`.
+        # Repeating those turns and their duplicate quotes made large EOD
+        # prompts several times longer without adding a single fact.
+        render_episodes = []
+        for episode in episodes:
+            item = dict(episode)
+            item.pop("_episode_extraction_mode", None)
+            hint = str((length_hints or {}).get(str(episode.get("episode_key") or "")) or "")
+            if hint:
+                item["render_length_hint"] = hint
+            item["evidence"] = [
+                {key: value for key, value in evidence.items() if key != "quote"}
+                for evidence in (episode.get("evidence") or [])
+                if isinstance(evidence, dict)
+            ]
+            render_episodes.append(item)
+        episodes_json = json.dumps(render_episodes, ensure_ascii=False, separators=(",", ":"))
+        messages_text = "（完整逐轮原文另存于独立档案；上面的 evidence 是有来源的日记线索，不是逐轮转录清单。）"
+        if any(
+            int(item.get("scene_end_turn") or 0) - int(item.get("scene_start_turn") or 0) + 1 >= 24
+            for item in episodes
+        ):
+            messages_text += (
+                "\n【长情景写法】把这些线索融合成一篇连贯的第一人称私密日记，"
+                "写出关键关系变化、承诺、真实感受和少量能唤起场景的细节；"
+                "不要按 evidence 或原始轮次逐项复述动作，也不要用括号写舞台指令。"
+                "通常约 1000 至 1500 字即可讲清，但不是硬上限；"
+                "重要事实确实多时可以更长，不能因此删去 must_write 或虚构内容。"
+            )
+    else:
+        # The transcript below supplies the original wording. The render model
+        # needs the grounded facts, not retrieval metadata or duplicated JSON
+        # formatting from the extraction stage.
+        render_fields = (
+            "episode_key", "event_date", "time_label", "time_basis",
+            "scene_anchor", "scene_start_turn", "scene_end_turn",
+                "memory_type", "state_change", "long_effect", "unresolved",
+                "render_length_hint",
+        )
+        evidence_fields = ("kind", "actor", "detail", "quote", "turn_indexes", "tier")
+        render_episodes = []
+        for episode in episodes:
+            item = {key: episode[key] for key in render_fields if key in episode}
+            hint = str((length_hints or {}).get(str(episode.get("episode_key") or "")) or "")
+            if hint:
+                item["render_length_hint"] = hint
+            item["evidence"] = [
+                {key: evidence[key] for key in evidence_fields if key in evidence}
+                for evidence in episode.get("evidence") or []
+                if isinstance(evidence, dict)
+            ]
+            render_episodes.append(item)
+        episodes_json = json.dumps(render_episodes, ensure_ascii=False, separators=(",", ":"))
     return DIARY_RENDER_PROMPT.format(
         character_name=character_name,
-        episodes_json=json.dumps(episodes, ensure_ascii=False, indent=2),
+        episodes_json=episodes_json,
         messages=messages_text,
+        example_episode_key=example_episode_key,
     )
 
 

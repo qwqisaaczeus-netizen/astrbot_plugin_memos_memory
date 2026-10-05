@@ -85,7 +85,7 @@ class IntegratedTimeInsightService:
         self.query_lookup_timeout = _bounded_float(config.get("query_lookup_timeout", 0.8), 0.1, 5, 0.8)
         self.llm_refine_enable = bool(config.get("llm_refine_enable", True))
         self.llm_provider_id = str(config.get("llm_provider_id", "") or "").strip()
-        self.llm_timeout = _bounded_float(config.get("llm_timeout", 45), 5, 180, 45)
+        self.llm_timeout = _bounded_float(config.get("llm_timeout", 60), 5, 180, 60)
         self.llm_min_confidence = _bounded_float(
             config.get("llm_min_confidence", 0.72), 0.5, 0.95, 0.72
         )
@@ -128,6 +128,7 @@ class IntegratedTimeInsightService:
         self._update_lock = asyncio.Lock()
         self._last_umo = ""
         self._last_schedule_check = 0.0
+        self._llm_retry_after = 0.0
         self._stopping = False
         self.repeat_cooldown_minutes = _bounded_int(
             config.get("repeat_cooldown_minutes", 180), 0, 1440, 180
@@ -178,7 +179,7 @@ class IntegratedTimeInsightService:
             "query_lookup_timeout": value("query_lookup_timeout", 0.8),
             "llm_refine_enable": value("llm_refine_enable", True),
             "llm_provider_id": value("llm_provider_id", ""),
-            "llm_timeout": value("llm_timeout", 45),
+            "llm_timeout": value("llm_timeout", 60),
             "llm_min_confidence": value("llm_min_confidence", 0.72),
             "diagnostic_log": value("diagnostic_log", True),
             "repeat_cooldown_minutes": value("repeat_cooldown_minutes", 180),
@@ -427,6 +428,9 @@ class IntegratedTimeInsightService:
             conn.close()
 
     def _provider(self, umo: str):
+        resolver = getattr(self.host, "_resolve_chat_provider", None)
+        if callable(resolver):
+            return resolver(self.llm_provider_id, umo)
         try:
             if self.llm_provider_id:
                 return self.context.get_provider_by_id(self.llm_provider_id)
@@ -529,14 +533,26 @@ class IntegratedTimeInsightService:
 5. 不输出 Markdown、推理过程或额外说明。
 6. source_recoverable=true 表示可回原始对话取证；它提高证据可信度，但不能改变 evidence 中明确写出的历史日期。
 """
-        response = await asyncio.wait_for(
-            provider.text_chat(
+        caller = getattr(self.host, "_plugin_llm_text_chat", None)
+        if callable(caller):
+            response = await caller(
+                provider,
                 prompt=prompt,
                 contexts=[],
                 system_prompt="你是证据约束的时间记忆审校器，只输出一个合法 JSON 对象。",
-            ),
-            timeout=self.llm_timeout,
-        )
+                timeout=self.llm_timeout,
+                label="time_insight_refine",
+                optional=True,
+            )
+        else:
+            response = await asyncio.wait_for(
+                provider.text_chat(
+                    prompt=prompt,
+                    contexts=[],
+                    system_prompt="你是证据约束的时间记忆审校器，只输出一个合法 JSON 对象。",
+                ),
+                timeout=self.llm_timeout,
+            )
         parsed = self._parse_json(getattr(response, "completion_text", "") or "")
         if not parsed or not isinstance(parsed.get("insights"), list):
             raise ValueError("LLM 返回缺少 insights JSON 数组")
@@ -695,17 +711,26 @@ class IntegratedTimeInsightService:
                 )
                 llm_status = "disabled"
                 llm_applied = 0
-                if self.llm_refine_enable and candidates:
+                if (self.llm_refine_enable and candidates
+                        and time.monotonic() < self._llm_retry_after):
+                    llm_status = "provider_cooldown_fallback"
+                elif self.llm_refine_enable and candidates:
                     try:
                         refinements = await self._refine_candidates(candidates, umo, now=now)
                         llm_applied = self._apply_refinements(candidates, refinements)
+                        self._llm_retry_after = 0.0
                         llm_status = "refined" if llm_applied else (
                             "no_provider" if self._provider(umo) is None else "no_valid_refinement"
                         )
                     except asyncio.TimeoutError:
                         llm_status = "timeout_fallback"
+                        self._llm_retry_after = time.monotonic() + 600.0
                     except Exception as exc:
                         llm_status = "invalid_fallback"
+                        self._llm_retry_after = time.monotonic() + (
+                            1800.0 if "500" in str(exc) or "InternalServerError" in type(exc).__name__
+                            else 600.0
+                        )
                         logger.warning(
                             "[memos-insight] LLM 精炼失败，保留确定性洞察: %s", exc
                         )

@@ -230,7 +230,7 @@ class VectorGeneration:
             if total_source:
                 probe = [0.0] * dim
                 con.execute(
-                    f"SELECT rowid FROM {_table_name('source', gen)} WHERE embedding MATCH ? AND k=1 LIMIT 1",
+                    f"SELECT rowid FROM {_table_name('source', gen)} WHERE embedding MATCH ? AND k=1",
                     (serialize_f32(probe),),
                 ).fetchone()
             return True

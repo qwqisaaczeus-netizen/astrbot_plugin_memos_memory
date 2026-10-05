@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import tempfile
 import unittest
 import json
 import time
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
+from unittest.mock import patch
 
 from astrbot_plugin_memos_memory.episodic_store import EpisodicStore
 from astrbot_plugin_memos_memory.main import MemosMemoryPlugin
+from astrbot_plugin_memos_memory.diary_pipeline import DiaryGenerationDeferred
+from astrbot_plugin_memos_memory.llm_runtime import (
+    LLMEmptyFinalError, LLMRouteExhaustedError,
+)
+from astrbot_plugin_memos_memory.episode_recovery import (
+    build_local_grounded_episodes, project_grounded_evidence_for_render,
+)
+from astrbot_plugin_memos_memory.scene_splitter import SceneSplitter
 
 
 class EpisodicStoreTests(unittest.IsolatedAsyncioTestCase):
@@ -264,6 +276,217 @@ class EpisodicStoreTests(unittest.IsolatedAsyncioTestCase):
             ["memos/rain", "memos/roof"],
         )
 
+    async def test_semantic_state_queue_isolated_by_character_scope(self):
+        batch_a = self.store.archive_batch(
+            "scope-a", [{"role": "user", "content": "A 的变化"}], "auto",
+        )
+        batch_b = self.store.archive_batch(
+            "scope-b", [{"role": "user", "content": "B 的变化"}], "auto",
+        )
+        self.store.enqueue_state_update(batch_a, "character:A", ["ep-a"])
+        self.store.enqueue_state_update(batch_b, "character:B", ["ep-b"])
+
+        pending_a = self.store.pending_state_updates(scope_id="character:A")
+        pending_b = self.store.pending_state_updates(scope_id="character:B")
+        self.assertEqual([item["batch_id"] for item in pending_a], [batch_a])
+        self.assertEqual([item["batch_id"] for item in pending_b], [batch_b])
+        self.assertEqual(self.store.pending_state_update_count("character:A"), 1)
+        self.assertEqual(self.store.pending_state_update_count("character:B"), 1)
+        self.assertEqual(self.store.pending_state_update_count(), 2)
+
+        changed = self.store.supersede_pending_state_updates(
+            "rebuild-a", scope_id="character:A",
+        )
+        self.assertEqual(changed, 1)
+        self.assertFalse(self.store.pending_state_updates(scope_id="character:A"))
+        self.assertEqual(
+            [item["batch_id"] for item in self.store.pending_state_updates(scope_id="character:B")],
+            [batch_b],
+        )
+
+    async def test_completed_state_queue_is_not_reopened_by_duplicate_enqueue(self):
+        batch_id = self.store.archive_batch(
+            "duplicate", [{"role": "user", "content": "同一批次"}], "auto",
+        )
+        scope = "character:爱莉"
+        self.store.enqueue_state_update(batch_id, scope, ["ep-one"])
+        self.store.mark_state_update(batch_id, "done")
+        self.store.enqueue_state_update(batch_id, scope, ["ep-one"])
+        self.assertFalse(self.store.pending_state_updates(scope_id=scope))
+
+    async def test_orphan_state_queue_does_not_block_valid_batch(self):
+        scope = "character:爱莉"
+        self.store.upsert_semantic_state(
+            scope, {"relationship_position": "旧状态"}, reason="bootstrap",
+        )
+        orphan = self.store.archive_batch(
+            "orphan", [{"role": "user", "content": "没有 Episode"}], "auto",
+        )
+        valid = self.store.archive_batch(
+            "valid", [{"role": "user", "content": "确认重要承诺"}], "auto",
+        )
+        episode = {
+            **self._episode(),
+            "memory_type": "promise_or_rule",
+            "importance": 5,
+            "scene_anchor": "确认重要承诺",
+            "state_change": "双方答应不会失约",
+        }
+        saved_episode = self.store.upsert_episode(
+            memo_name="memos/valid", episode=episode,
+            card_text="确认重要承诺", embedding=[1.0, 0.0, 0.0],
+            source_batch_id=valid, evidence_quality="source_grounded",
+        )
+        self.store.enqueue_state_update(orphan, scope, [])
+        self.store.enqueue_state_update(valid, scope, [saved_episode])
+
+        plugin = object.__new__(MemosMemoryPlugin)
+        plugin._episodes = self.store
+        plugin.character_name = "爱莉"
+        plugin.semantic_state_enable = True
+        plugin.semantic_state_update_policy = "adaptive"
+        plugin.semantic_state_batch_threshold = 3
+        plugin.semantic_state_max_wait_hours = 72
+        plugin.semantic_state_significance_threshold = 0.72
+        plugin.semantic_state_merge_max_batches = 6
+        plugin.semantic_state_target_chars = 1800
+        plugin.semantic_state_provider_id = ""
+        plugin.semantic_state_timeout = 30
+        plugin.enable_affiliate_profile = False
+        plugin._semantic_state_lock = asyncio.Lock()
+        plugin._semantic_state_last_defer_key = ""
+        plugin._log_event = lambda *_args, **_kwargs: None
+
+        async def call(_prompt, **_kwargs):
+            return json.dumps({
+                "relationship_position": "新状态",
+                "commitments_boundaries": "不会失约",
+                "behavior_tendencies": "主动兑现",
+                "emotional_baseline": "坚定",
+                "open_loops": "",
+            }, ensure_ascii=False)
+
+        plugin._call_memory_generation_llm = call
+        result = await plugin._drain_semantic_state_queue(limit=6)
+        self.assertEqual(result["updated"], 1)
+        self.assertFalse(self.store.pending_state_updates(scope_id=scope))
+        row = self.store._connect().execute(
+            "SELECT status,last_error FROM semantic_state_queue WHERE batch_id=?",
+            (orphan,),
+        ).fetchone()
+        self.assertEqual(row["status"], "superseded")
+        self.assertEqual(row["last_error"], "episode_view_missing")
+
+    async def test_state_batch_arriving_during_merge_is_checked_immediately_afterward(self):
+        first = self.store.archive_batch(
+            "during-merge-a", [{"role": "user", "content": "第一批"}], "auto",
+        )
+        second = self.store.archive_batch(
+            "during-merge-b", [{"role": "user", "content": "第二批"}], "auto",
+        )
+        plugin = object.__new__(MemosMemoryPlugin)
+        plugin._episodes = self.store
+        plugin.character_name = "爱莉"
+        plugin.semantic_state_enable = True
+        plugin._semantic_state_pending_tasks = set()
+        plugin._semantic_state_reschedule_needed = False
+        plugin._terminating = False
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = []
+
+        async def drain():
+            calls.append(len(calls) + 1)
+            if len(calls) == 1:
+                started.set()
+                await release.wait()
+            return {"updated": 0, "reason": "test"}
+
+        plugin._drain_semantic_state_queue = drain
+        episodes = [{"episode_id": "ep", "scene_anchor": "变化"}]
+        plugin._schedule_semantic_state_update(
+            episodes, source_batch_id=first, reason="test",
+        )
+        await started.wait()
+        plugin._schedule_semantic_state_update(
+            episodes, source_batch_id=second, reason="test",
+        )
+        self.assertTrue(plugin._semantic_state_reschedule_needed)
+        release.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if len(calls) >= 2 and not plugin._semantic_state_pending_tasks:
+                break
+        self.assertEqual(calls, [1, 2])
+        self.assertFalse(plugin._semantic_state_reschedule_needed)
+        self.assertFalse(plugin._semantic_state_pending_tasks)
+
+    async def test_semantic_state_drain_does_not_consume_another_character_queue(self):
+        scope_a = "character:A"
+        scope_b = "character:B"
+        self.store.upsert_semantic_state(
+            scope_a, {"relationship_position": "A 的旧状态"}, reason="bootstrap",
+        )
+        for scope, label in ((scope_a, "A"), (scope_b, "B")):
+            batch_id = self.store.archive_batch(
+                f"scope-{label}",
+                [{"role": "user", "content": f"{label} 的重大约定"}],
+                "auto",
+            )
+            episode = {
+                **self._episode(),
+                "episode_id": f"ep-{label}",
+                "memory_type": "promise_or_rule",
+                "importance": 5,
+                "scene_anchor": f"{label} 的重大约定",
+                "retrieval_key": f"{label} 承诺",
+                "state_change": "双方确认了不会失约的承诺",
+            }
+            self.store.upsert_episode(
+                memo_name=f"memos/scope-{label}", episode=episode,
+                card_text=f"{label} 的重大约定", embedding=[1.0, 0.0, 0.0],
+                source_batch_id=batch_id, evidence_quality="source_grounded",
+            )
+            self.store.enqueue_state_update(batch_id, scope, [f"ep-{label}"])
+
+        plugin = object.__new__(MemosMemoryPlugin)
+        plugin._episodes = self.store
+        plugin.character_name = "A"
+        plugin.semantic_state_enable = True
+        plugin.semantic_state_update_policy = "adaptive"
+        plugin.semantic_state_batch_threshold = 3
+        plugin.semantic_state_max_wait_hours = 72
+        plugin.semantic_state_significance_threshold = 0.72
+        plugin.semantic_state_merge_max_batches = 6
+        plugin.semantic_state_target_chars = 1800
+        plugin.semantic_state_provider_id = ""
+        plugin.semantic_state_timeout = 30
+        plugin.semantic_state_replace_profile = True
+        plugin.enable_affiliate_profile = False
+        plugin._semantic_state_lock = asyncio.Lock()
+        plugin._semantic_state_last_defer_key = ""
+        plugin._log_event = lambda *_args, **_kwargs: None
+
+        async def call(prompt, **_kwargs):
+            self.assertIn("A 的重大约定", prompt)
+            self.assertNotIn("B 的重大约定", prompt)
+            return json.dumps({
+                "relationship_position": "A 的新状态",
+                "commitments_boundaries": "不会失约",
+                "behavior_tendencies": "主动兑现",
+                "emotional_baseline": "坚定",
+                "open_loops": "",
+            }, ensure_ascii=False)
+
+        plugin._call_memory_generation_llm = call
+        result = await plugin._drain_semantic_state_queue(limit=6)
+        self.assertEqual(result["updated"], 1)
+        self.assertEqual(self.store.pending_state_update_count(scope_a), 0)
+        self.assertEqual(self.store.pending_state_update_count(scope_b), 1)
+        status = plugin._semantic_state_status()
+        self.assertEqual(status["pending"], 0)
+        self.assertIn("A 的新状态", status["state"]["rendered_text"])
+
     async def test_adaptive_state_cadence_defers_daily_batches_but_never_decisive_change(self):
         scope = "character:爱莉"
         self.store.upsert_semantic_state(
@@ -283,7 +506,7 @@ class EpisodicStoreTests(unittest.IsolatedAsyncioTestCase):
         one = [{"batch_id": "b1", "status": "pending", "created_ts": time.time()}]
         decision = plugin._semantic_state_update_decision(one, ordinary)
         self.assertFalse(decision["update"])
-        self.assertEqual(decision["reason"], "deferred")
+        self.assertEqual(decision["reason"], "minimum_interval")
         casual_agreement = [{
             "memory_type": "daily_texture", "importance": 3,
             "scene_anchor": "早饭时约定晚点一起去买菜",
@@ -299,11 +522,11 @@ class EpisodicStoreTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(
             plugin._semantic_state_update_decision(three, ordinary)["reason"],
-            "batch_threshold",
+            "minimum_interval",
         )
         decisive = plugin._semantic_state_update_decision(one, [self._episode()])
         self.assertTrue(decisive["update"])
-        self.assertEqual(decisive["reason"], "significant_change")
+        self.assertEqual(decisive["reason"], "hard_change")
         self.assertTrue(decisive["signal"]["hard"])
 
     async def test_adaptive_state_cadence_uses_max_wait_and_marks_merged_batches(self):
@@ -311,6 +534,11 @@ class EpisodicStoreTests(unittest.IsolatedAsyncioTestCase):
         self.store.upsert_semantic_state(
             scope, {"relationship_position": "关系稳定"}, reason="bootstrap",
         )
+        old_ts = time.time() - 200 * 3600
+        self.store._connect().execute(
+            "UPDATE semantic_states SET updated_ts=? WHERE scope_id=?", (old_ts, scope),
+        )
+        self.store._connect().commit()
         plugin = object.__new__(MemosMemoryPlugin)
         plugin._episodes = self.store
         plugin.character_name = "爱莉"
@@ -322,10 +550,13 @@ class EpisodicStoreTests(unittest.IsolatedAsyncioTestCase):
             "batch_id": "old", "status": "pending",
             "created_ts": time.time() - 73 * 3600,
         }]
-        ordinary = [{"memory_type": "daily_texture", "importance": 2, "evidence": []}]
+        ordinary = [{
+            "memory_type": "behavior_bias", "importance": 4,
+            "state_change": "逐渐更愿意主动分享", "evidence": [],
+        }]
         self.assertEqual(
             plugin._semantic_state_update_decision(old, ordinary)["reason"],
-            "max_wait",
+            "max_wait_meaningful",
         )
 
         batch_ids = [
@@ -385,7 +616,7 @@ class EpisodicStoreTests(unittest.IsolatedAsyncioTestCase):
         before = self.store.pending_state_updates()
         preview = plugin._semantic_state_pending_preview()
         after = self.store.pending_state_updates()
-        self.assertEqual(preview["reason"], "deferred")
+        self.assertEqual(preview["reason"], "minimum_interval")
         self.assertFalse(preview["update"])
         self.assertEqual(preview["pending_batches"], 1)
         self.assertEqual(before, after)
@@ -403,7 +634,7 @@ class EpisodicStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(diagnostics["reason"], "diagnostic_only")
         self.assertEqual(diagnostics["folded"], 0)
 
-    async def test_adaptive_state_drain_merges_three_ordinary_batches_into_one_version(self):
+    async def test_adaptive_state_drain_does_not_rewrite_for_three_ordinary_batches(self):
         scope = "character:爱莉"
         self.store.upsert_semantic_state(
             scope, {"relationship_position": "关系稳定"}, reason="bootstrap",
@@ -464,11 +695,91 @@ class EpisodicStoreTests(unittest.IsolatedAsyncioTestCase):
 
         plugin._call_memory_generation_llm = call
         result = await plugin._drain_semantic_state_queue(limit=6)
-        self.assertEqual(result["updated"], 1)
-        self.assertEqual(result["merged_batches"], 3)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(self.store.get_semantic_state(scope)["version"], 2)
-        self.assertFalse(self.store.pending_state_updates())
+        self.assertEqual(result["updated"], 0)
+        self.assertEqual(result["reason"], "minimum_interval")
+        self.assertEqual(len(calls), 0)
+        self.assertEqual(self.store.get_semantic_state(scope)["version"], 1)
+        self.assertEqual(len(self.store.pending_state_updates()), 3)
+
+    async def test_adaptive_state_updates_after_four_distinct_meaningful_axes(self):
+        scope = "character:爱莉"
+        self.store.upsert_semantic_state(
+            scope, {"relationship_position": "关系稳定"}, reason="bootstrap",
+        )
+        self.store._connect().execute(
+            "UPDATE semantic_states SET updated_ts=? WHERE scope_id=?",
+            (time.time() - 100 * 3600, scope),
+        )
+        self.store._connect().commit()
+        episodes = [
+            {"memory_type": "behavior_bias", "importance": 4, "state_change": "更愿意主动分享"},
+            {"memory_type": "emotional_anchor", "importance": 4, "long_effect": "安心感延续"},
+            {"memory_type": "plot_fact", "importance": 4, "unresolved": ["仍要兑现一件事"]},
+            {"memory_type": "plot_fact", "importance": 5, "state_change": "关系理解变得更坚定"},
+        ]
+        pending = [{
+            "batch_id": "meaningful", "status": "pending",
+            "created_ts": time.time() - 80 * 3600,
+        }]
+        plugin = object.__new__(MemosMemoryPlugin)
+        plugin._episodes = self.store
+        plugin.character_name = "爱莉"
+        plugin.semantic_state_update_policy = "adaptive"
+        plugin.semantic_state_batch_threshold = 4
+        plugin.semantic_state_max_wait_hours = 168
+        plugin.semantic_state_min_interval_hours = 72
+        plugin.semantic_state_significance_threshold = 0.95
+        decision = plugin._semantic_state_update_decision(pending, episodes)
+        self.assertTrue(decision["update"])
+        self.assertEqual(decision["reason"], "meaningful_delta_threshold")
+        self.assertEqual(decision["delta"]["cluster_count"], 4)
+
+    async def test_semantic_state_noop_does_not_create_another_version(self):
+        scope = "character:爱莉"
+        state = {
+            "relationship_position": "关系稳定",
+            "commitments_boundaries": "离开前会说明",
+            "behavior_tendencies": "愿意主动确认",
+            "emotional_baseline": "平静亲近",
+            "open_loops": "等待一次共同出行",
+        }
+        self.store.upsert_semantic_state(scope, state, reason="bootstrap")
+        plugin = object.__new__(MemosMemoryPlugin)
+        plugin._episodes = self.store
+        plugin.character_name = "爱莉"
+        plugin.semantic_state_enable = True
+        plugin.semantic_state_target_chars = 1200
+        plugin.semantic_state_provider_id = ""
+        plugin.semantic_state_timeout = 30
+        plugin.semantic_state_noop_similarity = 0.94
+        plugin._semantic_state_lock = asyncio.Lock()
+        plugin._log_event = lambda *_args, **_kwargs: None
+
+        async def call(_prompt, **_kwargs):
+            return json.dumps(state, ensure_ascii=False)
+
+        plugin._call_memory_generation_llm = call
+        result = await plugin._update_semantic_state([
+            {"episode_id": "same", "memory_type": "behavior_bias", "importance": 4},
+        ], reason="test_noop")
+        self.assertFalse(result["updated"])
+        self.assertEqual(result["reason"], "no_material_change")
+        self.assertEqual(self.store.get_semantic_state(scope)["version"], 1)
+
+    def test_identity_core_is_compact_and_separate_from_current_state(self):
+        plugin = object.__new__(MemosMemoryPlugin)
+        plugin.enable_affiliate_profile = True
+        plugin.identity_core_inject_chars = 520
+        plugin._affiliate_profile_status = lambda: {
+            "connected": True,
+            "fresh": True,
+            "profile": "她重视承诺，也会在不安时先观察。" * 30,
+            "profile_facts": "- 不喜欢突然失联\n- 会认真回应明确约定\n" * 10,
+        }
+        block = plugin._identity_core_injection_block()
+        self.assertIn("LongTermIdentityCore", block)
+        self.assertIn("不是近期情绪", block)
+        self.assertLess(len(block), 850)
 
     async def test_forced_state_rebuild_does_not_seed_from_deleted_current_state(self):
         self.store.upsert_semantic_state(
@@ -767,9 +1078,249 @@ class EvidenceFirstGenerationTests(unittest.IsolatedAsyncioTestCase):
         plugin.rp_time_timezone = "Asia/Shanghai"
         plugin.episode_extraction_provider_id = ""
         plugin.episode_extraction_timeout = 30.0
+        plugin.time_insight_llm_provider_id = ""
         plugin.diary_render_provider_id = ""
         plugin.diary_render_timeout = 30.0
         return plugin
+
+    def test_short_scene_length_hint_stays_below_publication_ratio(self):
+        lower, upper, hint = MemosMemoryPlugin._diary_length_hint(443)
+        self.assertGreaterEqual(lower, 120)
+        self.assertLess(upper, int(443 * 0.82))
+        self.assertIn(f"必须不超过{upper}字", hint)
+
+    async def test_runtime_config_initializes_compensation_fast_provider(self):
+        class Context:
+            def get_provider_by_id(self, _provider_id):
+                return None
+
+            def get_using_provider(self, _umo=None):
+                return None
+
+            def get_all_providers(self):
+                return []
+
+        with tempfile.TemporaryDirectory() as temp:
+            plugin = MemosMemoryPlugin(Context(), {
+                "vec_db_path": str(Path(temp) / "memories.db"),
+                "episodic_db_path": str(Path(temp) / "episodes.db"),
+                "webui_enable": False,
+                "enable_auto_compress": False,
+                "episode_extraction_provider_id": "slow-pro",
+                "time_insight_llm_provider_id": "fast-structured",
+            })
+            self.assertEqual(
+                plugin.time_insight_llm_provider_id, "fast-structured"
+            )
+
+    async def test_long_eod_reserves_budget_for_compact_recovery(self):
+        plugin = self.make_plugin()
+        plugin.episode_extraction_timeout = 150.0
+        plugin._resolve_chat_provider = lambda _id: None
+        calls = []
+
+        async def fail(_prompt, *, provider_id, timeout, label):
+            calls.append((label, timeout))
+            raise asyncio.TimeoutError()
+
+        plugin._call_memory_generation_llm = fail
+        messages = [
+            {"role": "user" if index % 2 == 0 else "assistant",
+             "content": (
+                 "今晚谈到私塾与家里的开销。" if index < 16
+                 else "后来回屋休息，也想起旧事与约定。"
+             ) * 12,
+             "event_ts": 1790160000 + index * 60,
+             "event_timezone": "Asia/Shanghai"}
+            for index in range(30)
+        ]
+        episodes, mode, errors, _timing = await plugin._extract_episode_blueprints_resilient(
+            messages,
+            "\n".join(f"[turn:{i}] {item['content']}" for i, item in enumerate(messages)),
+            2, 3, SceneSplitter(max_scenes=6).detect(messages),
+            exact_count=False, source_kind="eod",
+        )
+        self.assertEqual(calls[0], ("episode_extract", 90.0))
+        self.assertEqual(calls[1][0], "episode_extract_compact_retry")
+        self.assertGreater(calls[1][1], 40.0)
+        self.assertEqual(mode, "local_grounded_recovery")
+        self.assertEqual(len(episodes), 2)
+        self.assertEqual(len(errors), 2)
+
+    async def test_compensation_shard_prefers_fast_structured_provider(self):
+        plugin = self.make_plugin()
+        plugin.episode_extraction_provider_id = "slow-pro"
+        plugin.time_insight_llm_provider_id = "fast-structured"
+        calls = []
+
+        async def complete(_prompt, *, provider_id, timeout, label):
+            calls.append((provider_id, timeout, label))
+            return json.dumps([{
+                "episode_key": "e1",
+                "event_date": "2026-09-27",
+                "time_basis": "conversation_now",
+                "scene_anchor": "院子里的一次完整问答",
+                "scene_start_turn": 0,
+                "scene_end_turn": 1,
+                "memory_type": "daily_life",
+                "evidence": [{
+                    "actor": "assistant",
+                    "detail": "我认真回应了他",
+                    "turn_indexes": [1],
+                    "confidence": 0.95,
+                }],
+                "importance": 3,
+            }], ensure_ascii=False)
+
+        plugin._call_memory_generation_llm = complete
+        messages = [
+            {"role": "user", "content": "你还记得吗？"},
+            {"role": "assistant", "content": "我记得，也会认真回应。"},
+        ]
+        episodes, mode, errors, _timing = (
+            await plugin._extract_episode_blueprints_resilient(
+                messages, "[turn:0] 你还记得吗？\n[turn:1] 我记得。",
+                1, 2, [], exact_count=False,
+                source_kind="compensation_shard",
+            )
+        )
+        self.assertEqual(mode, "llm_primary")
+        self.assertTrue(episodes)
+        self.assertFalse(errors)
+        self.assertEqual(calls, [(
+            "fast-structured", 180.0, "episode_extract",
+        )])
+
+    async def test_transport_routes_exhausted_skips_same_route_compact_retry(self):
+        plugin = self.make_plugin()
+        plugin._resolve_chat_provider = lambda _id: None
+        calls = []
+
+        async def fail(_prompt, *, provider_id, timeout, label):
+            calls.append(label)
+            raise LLMRouteExhaustedError(
+                "transport exhausted", failure_kind="transport", record_id="llm_test",
+            )
+
+        plugin._call_memory_generation_llm = fail
+        messages = [
+            {"role": "user" if index % 2 == 0 else "assistant",
+             "content": f"第{index}轮仍在同一个院子里谈那封信。",
+             "event_ts": 1789308000.0 + index * 30}
+            for index in range(20)
+        ]
+        episodes, mode, errors, timing = await plugin._extract_episode_blueprints_resilient(
+            messages,
+            "\n".join(f"[turn:{i}] {item['content']}" for i, item in enumerate(messages)),
+            1, 3, [], exact_count=False, source_kind="eod",
+        )
+        self.assertEqual(calls, ["episode_extract"])
+        self.assertEqual(mode, "local_grounded_recovery")
+        self.assertTrue(episodes)
+        self.assertIn("compact:skipped_after_transport_routes_exhausted", errors)
+        self.assertEqual(timing["stage_ms"]["compact_recovery"], 0)
+
+    def test_local_recovery_avoids_tiny_first_diary(self):
+        from astrbot_plugin_memos_memory.episode_recovery import _scene_ranges
+
+        messages = [
+            {"role": "user" if index % 2 == 0 else "assistant",
+             "content": "记住这一段真实的夜间对话。" * (2 if index % 2 == 0 else 12)}
+            for index in range(30)
+        ]
+        starts = [0, 3, 5, 7, 19, 25]
+        candidates = [
+            {"start_turn": start,
+             "end_turn": (starts[pos + 1] - 1 if pos + 1 < len(starts) else 29),
+             "reasons": ["topic_shift"]}
+            for pos, start in enumerate(starts)
+        ]
+        ranges = _scene_ranges(messages, candidates, 2)
+        self.assertEqual(len(ranges), 2)
+        self.assertEqual(ranges[0][0], 0)
+        self.assertEqual(ranges[-1][1], 29)
+        self.assertEqual(ranges[0][1] + 1, ranges[1][0])
+        self.assertEqual(messages[ranges[1][0]]["role"], "user")
+        total = sum(len(item["content"]) for item in messages)
+        self.assertTrue(all(
+            sum(len(messages[index]["content"]) for index in range(start, end + 1))
+            >= total * 0.25
+            for start, end, _reasons in ranges
+        ))
+
+    async def test_recent_heavy_provider_timeout_skips_repeat_full_extraction(self):
+        plugin = self.make_plugin()
+        prompt = "相同来源的证据抽取" * 800
+        fingerprint = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:24]
+
+        class Provider:
+            provider_id = "same-provider"
+
+        plugin._resolve_chat_provider = lambda _id: Provider()
+        plugin._llm_call_events = [{
+            "task": "episode_extract", "provider": "same-provider",
+            "prompt_chars": len(prompt), "prompt_fingerprint": fingerprint,
+            "outcome": "timeout", "ts": time.time(),
+        }]
+        messages = [{
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"第{index}轮我们在院子里说到明日的约定和彼此的心情。",
+            "event_ts": 1789308000.0 + index * 30,
+        } for index in range(26)]
+
+        async def forbidden(*_args, **_kwargs):
+            self.fail("same heavy model request should have cooled down")
+
+        plugin._call_memory_generation_llm = forbidden
+        with patch("astrbot_plugin_memos_memory.main.build_episode_extraction_prompt", return_value=prompt):
+            episodes, mode, errors, timing = await plugin._extract_episode_blueprints_resilient(
+                messages, "[turn:0] " + "院子里的对话" * 800,
+                1, 3, [], exact_count=False,
+            )
+        self.assertEqual(mode, "local_grounded_recovery")
+        self.assertTrue(episodes)
+        self.assertIn("primary:recent_heavy_failure_cooldown", errors)
+        self.assertEqual(timing["stage_ms"]["primary"], 0)
+
+    async def test_recent_heavy_failure_never_skips_a_different_or_stale_prompt(self):
+        prompt = "另一次对话的证据抽取" * 800
+        fingerprint = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:24]
+        messages = [{
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"第{index}轮我们在院子里说话。",
+            "event_ts": 1789308000.0 + index * 30,
+        } for index in range(26)]
+
+        class Provider:
+            provider_id = "same-provider"
+
+        for sample in (
+            {"task": "episode_extract", "provider": "same-provider",
+             "prompt_fingerprint": "other-prompt", "outcome": "timeout", "ts": time.time()},
+            {"task": "episode_extract", "provider": "same-provider",
+             "prompt_fingerprint": fingerprint, "outcome": "timeout", "ts": time.time() - 1900},
+            {"task": "episode_extract", "provider": "different-provider",
+             "prompt_fingerprint": fingerprint, "outcome": "timeout", "ts": time.time()},
+            {"task": "episode_extract", "provider": "same-provider",
+             "prompt_fingerprint": fingerprint, "outcome": "timeout", "ts": "invalid"},
+        ):
+            with self.subTest(sample=sample):
+                plugin = self.make_plugin()
+                plugin._resolve_chat_provider = lambda _id: Provider()
+                plugin._llm_call_events = [None, sample]
+                calls = []
+
+                async def unavailable(*_args, **kwargs):
+                    calls.append(kwargs.get("label"))
+                    raise RuntimeError("simulated model failure")
+
+                plugin._call_memory_generation_llm = unavailable
+                with patch("astrbot_plugin_memos_memory.main.build_episode_extraction_prompt", return_value=prompt):
+                    await plugin._extract_episode_blueprints_resilient(
+                        messages, "[turn:0] " + "院子里的对话" * 800,
+                        1, 3, [], exact_count=False,
+                    )
+                self.assertIn("episode_extract", calls)
 
     async def test_two_stage_generation_keeps_traceable_evidence(self):
         plugin = self.make_plugin()
@@ -817,6 +1368,452 @@ class EvidenceFirstGenerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(diaries[0]["_evidence_quality"], "source_grounded")
         self.assertGreaterEqual(diaries[0]["_render_coverage"], 0.5)
         self.assertTrue(all(item["grounded"] for item in diaries[0]["evidence"]))
+
+    async def test_extraction_timeout_uses_compact_grounded_recovery(self):
+        plugin = self.make_plugin()
+        messages = [
+            {"role": "user", "content": "我害怕你不告而别。"},
+            {"role": "assistant", "content": "我答应离开前一定告诉你。"},
+        ]
+        extraction = [{
+            "episode_key": "e1", "event_date": "2026-08-11",
+            "scene_anchor": "离开前说明的约定", "memory_type": "promise_or_rule",
+            "evidence": [{
+                "kind": "commitment", "actor": "assistant",
+                "detail": "我答应离开前一定告诉他", "quote": "我答应离开前一定告诉你。",
+                "turn_indexes": [1], "tier": "must_write", "confidence": 0.99,
+            }],
+            "retrieval_key": "离开前说明 约定", "importance": 5,
+        }]
+        rendered = [{
+            "episode_key": "e1",
+            "content": "我答应过他，离开前一定告诉他；这份约定会被我认真记住。",
+        }]
+        calls = []
+
+        async def call(_prompt, *, provider_id, timeout, label):
+            calls.append((label, timeout))
+            if label == "episode_extract":
+                raise asyncio.TimeoutError()
+            if label == "episode_extract_compact_retry":
+                return json.dumps(extraction, ensure_ascii=False)
+            return json.dumps(rendered, ensure_ascii=False)
+
+        plugin._call_memory_generation_llm = call
+        diaries = await plugin._generate_evidence_first_diaries(
+            messages,
+            "\n".join(f"[turn:{i}] {item['content']}" for i, item in enumerate(messages)),
+            1,
+        )
+        self.assertEqual([item[0] for item in calls], [
+            "episode_extract", "episode_extract_compact_retry", "diary_render",
+        ])
+        self.assertEqual(calls[1][1], 30.0)
+        self.assertEqual(diaries[0]["_episode_extraction_mode"], "llm_compact_recovery")
+        self.assertEqual(diaries[0]["_evidence_quality"], "source_grounded")
+
+    async def test_double_extraction_failure_keeps_local_source_links(self):
+        plugin = self.make_plugin()
+        messages = [
+            {"role": "user", "content": "离开前一定要告诉我。", "event_ts": 1786462200},
+            {"role": "assistant", "content": "我答应离开前一定告诉你。", "event_ts": 1786462260},
+        ]
+        calls = []
+
+        async def call(_prompt, *, provider_id, timeout, label):
+            calls.append(label)
+            if label.startswith("episode_extract"):
+                raise asyncio.TimeoutError()
+            return json.dumps([
+                {
+                    "episode_key": "recovery_e1",
+                    "content": "他要我离开前一定告诉他，我把这句话认真记住了。",
+                },
+                {
+                    "episode_key": "recovery_e2",
+                    "content": "我答应离开前一定告诉他，这份约定我会守住。",
+                },
+            ], ensure_ascii=False)
+
+        plugin._call_memory_generation_llm = call
+        diaries = await plugin._generate_evidence_first_diaries(
+            messages,
+            "\n".join(f"[turn:{i}] {item['content']}" for i, item in enumerate(messages)),
+            1,
+        )
+        self.assertEqual(calls, [
+            "episode_extract", "episode_extract_compact_retry", "diary_render",
+        ])
+        self.assertTrue(all(
+            item["_episode_extraction_mode"] == "local_grounded_recovery" for item in diaries
+        ))
+        self.assertTrue(all(item["event_date"] == "2026-08-11" for item in diaries))
+        self.assertEqual(
+            {
+                index for diary in diaries for item in diary["evidence"]
+                for index in item["turn_indexes"]
+            },
+            {0, 1},
+        )
+        self.assertTrue(all(
+            item["grounded"] for diary in diaries for item in diary["evidence"]
+        ))
+
+    async def test_eod_double_failure_uses_target_not_soft_cap(self):
+        plugin = self.make_plugin()
+        start = 1789308000.0
+        messages = []
+        for index in range(13):
+            messages.extend([
+                {
+                    "role": "user",
+                    "content": f"同一场景里的连续问题{index}",
+                    "event_ts": start + index * 150,
+                    "event_timezone": "Asia/Shanghai",
+                },
+                {
+                    "role": "assistant",
+                    "content": f"我仍在同一处回应这件事{index}",
+                    "event_ts": start + index * 150 + 30,
+                    "event_timezone": "Asia/Shanghai",
+                },
+            ])
+
+        async def call(_prompt, *, provider_id, timeout, label):
+            if label.startswith("episode_extract"):
+                raise asyncio.TimeoutError()
+            return json.dumps([{
+                "episode_key": "recovery_e1",
+                "content": "我把这段连续的谈话完整记了下来。",
+            }], ensure_ascii=False)
+
+        plugin._call_memory_generation_llm = call
+        diaries = await plugin._generate_evidence_first_diaries(
+            messages,
+            "\n".join(f"[turn:{i}] {item['content']}" for i, item in enumerate(messages)),
+            1,
+            diary_cap=3,
+            source_kind="eod",
+        )
+        self.assertEqual(len(diaries), 1)
+        self.assertEqual(diaries[0]["scene_start_turn"], 0)
+        self.assertEqual(diaries[0]["scene_end_turn"], 25)
+        self.assertEqual(diaries[0]["_episode_extraction_mode"], "local_grounded_recovery")
+        cited = {index for item in diaries[0]["evidence"] for index in item["turn_indexes"]}
+        self.assertLessEqual(len(cited), 10)
+        self.assertEqual(len({min(2, index * 3 // 26) for index in cited}), 3)
+
+    async def test_long_local_recovery_rejects_failed_literary_render(self):
+        plugin = self.make_plugin()
+        plugin.episode_extraction_timeout = 0.01
+        messages = [
+            {"role": "user" if index % 2 == 0 else "assistant",
+             "content": f"连续情景中的第{index}条对话和动作",
+             "event_ts": 1789308000.0 + index * 30}
+            for index in range(46)
+        ]
+        calls = []
+
+        async def call(_prompt, *, provider_id, timeout, label):
+            calls.append((label, timeout, _prompt))
+            if label == "episode_extract":
+                await asyncio.sleep(0.03)
+            raise asyncio.TimeoutError()
+
+        plugin._call_memory_generation_llm = call
+        with self.assertRaises(DiaryGenerationDeferred) as caught:
+            await plugin._generate_evidence_first_diaries(
+                messages,
+                "\n".join(f"[turn:{index}] {item['content']}"
+                          for index, item in enumerate(messages)),
+                1, diary_cap=4, source_kind="eod",
+            )
+        self.assertEqual(caught.exception.diagnostics["stage"], "diary_render")
+        self.assertEqual([item[0] for item in calls], [
+            "episode_extract", "episode_extract_compact_retry", "diary_render_grounded",
+            "diary_render_timeout_retry",
+        ])
+        self.assertEqual(calls[1][1], 60.0)
+        self.assertIn("最多 3 个", calls[1][2])
+        self.assertLess(calls[2][2].count("连续情景中的第"), len(messages))
+
+    async def test_long_recovery_keeps_soft_scene_whole_and_projects_evidence(self):
+        messages = [
+            {"role": "user" if index % 2 == 0 else "assistant",
+             "content": f"我在院里聊起第{index}件日常小事，也记得那阵风。",
+             "event_ts": 1789308000.0 + index * 30,
+             "event_timezone": "Asia/Shanghai"}
+            for index in range(46)
+        ]
+        messages[17]["content"] = "我答应明天把那封信带过来。"
+        splitter = SceneSplitter(max_scenes=6)
+        episodes = build_local_grounded_episodes(
+            messages, splitter.detect(messages), 1, "Asia/Shanghai",
+        )
+        self.assertEqual(len(episodes), 1)
+        self.assertEqual((episodes[0]["scene_start_turn"], episodes[0]["scene_end_turn"]), (0, 45))
+        cited = {index for item in episodes[0]["evidence"] for index in item["turn_indexes"]}
+        self.assertIn(17, cited)
+        self.assertLessEqual(len(cited), 20)
+        self.assertEqual(len({min(2, index * 3 // 46) for index in cited}), 3)
+
+    async def test_medium_render_projection_preserves_persisted_evidence(self):
+        messages = [{
+            "role": "assistant",
+            "content": ("我答应明日再见。" if index < 7 else "我记得院里的风声。")
+                       + f"第{index}轮 " + "细节" * 90,
+            "event_ts": 1789308000.0 + index * 30,
+        } for index in range(26)]
+        episodes = build_local_grounded_episodes(messages, [], 1)
+        original = episodes[0]["evidence"]
+        projected = project_grounded_evidence_for_render(original)
+        self.assertEqual(len(original), 11)
+        self.assertLessEqual(len(projected), 12)
+        self.assertEqual(
+            {item["turn_indexes"][0] for item in projected if item["tier"] == "must_write"},
+            set(range(7)),
+        )
+        self.assertGreaterEqual(
+            sum(item["tier"] == "supporting" for item in projected), 4,
+        )
+        self.assertTrue(all(len(item["detail"]) <= 162 for item in projected))
+        self.assertEqual(len(episodes[0]["evidence"]), 11)
+
+    async def test_long_recovery_never_merges_across_recorded_date(self):
+        start = datetime(2026, 9, 13, 14, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()
+        messages = [
+            {"role": "assistant", "content": f"我记得第{index}件事。",
+             "event_ts": start + index * 90 + (86400 if index >= 23 else 0),
+             "event_timezone": "Asia/Shanghai"}
+            for index in range(46)
+        ]
+        episodes = build_local_grounded_episodes(
+            messages, SceneSplitter(max_scenes=6).detect(messages),
+            1, "Asia/Shanghai",
+        )
+        self.assertEqual(len(episodes), 2)
+        self.assertEqual(
+            [(item["scene_start_turn"], item["scene_end_turn"]) for item in episodes],
+            [(0, 22), (23, 45)],
+        )
+        self.assertNotEqual(episodes[0]["event_date"], episodes[1]["event_date"])
+
+    async def test_long_batch_does_not_publish_after_hard_boundary_clamps_range(self):
+        plugin = self.make_plugin()
+        start = datetime(2026, 9, 13, 14, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp()
+        messages = [
+            {"role": "assistant", "content": f"我记得那一天第{index}件日常事情。",
+             "event_ts": start + index * 90 + (86400 if index >= 20 else 0),
+             "event_timezone": "Asia/Shanghai"}
+            for index in range(40)
+        ]
+        prebuilt = [{
+            "episode_key": "recovery_e1", "scene_start_turn": 0, "scene_end_turn": 39,
+            "event_date": "2026-09-13", "time_basis": "conversation_now",
+            "evidence": [{"detail": messages[0]["content"], "quote": messages[0]["content"],
+                          "turn_indexes": [0], "grounded": True, "tier": "supporting"}],
+        }]
+        with self.assertRaises(DiaryGenerationDeferred) as caught:
+            await plugin._generate_evidence_first_diaries(
+                messages, "原文只用于校验", 1, diary_cap=4,
+                source_kind="eod", prebuilt_episodes=prebuilt,
+            )
+        self.assertEqual(caught.exception.diagnostics["stage"], "episode_coverage")
+        self.assertIn(20, caught.exception.diagnostics["uncovered_turns"])
+
+    async def test_long_recovery_rejects_dense_paraphrase(self):
+        plugin = self.make_plugin()
+        messages = [
+            {"role": "user" if index % 2 == 0 else "assistant",
+             "content": "我坐在院里，聊起那年写给彼此的信，也说了各自的心情。" * 5,
+             "event_ts": 1789308000.0 + index * 30}
+            for index in range(46)
+        ]
+
+        async def call(_prompt, *, provider_id, timeout, label):
+            if label.startswith("episode_extract"):
+                raise asyncio.TimeoutError()
+            return json.dumps([{
+                "episode_key": "recovery_e1",
+                "content": "我想起院里那封信，心里仍有一些舍不得。" * 120,
+            }], ensure_ascii=False)
+
+        plugin._call_memory_generation_llm = call
+        with self.assertRaises(DiaryGenerationDeferred) as caught:
+            await plugin._generate_evidence_first_diaries(
+                messages,
+                "\n".join(f"[turn:{index}] {item['content']}"
+                          for index, item in enumerate(messages)),
+                1, diary_cap=4, source_kind="eod",
+            )
+        self.assertEqual(caught.exception.diagnostics["stage"], "diary_render")
+        self.assertIn(
+            "single_diary_too_long",
+            caught.exception.diagnostics["reasons"]["recovery_e1"],
+        )
+
+    async def test_long_recovery_retries_timed_out_render_once(self):
+        plugin = self.make_plugin()
+        messages = [
+            {"role": "user" if index % 2 == 0 else "assistant",
+             "content": "我在院里等他，听见风吹过树叶，也想起那封信。",
+             "event_ts": 1789308000.0 + index * 30}
+            for index in range(46)
+        ]
+        labels = []
+
+        async def call(_prompt, *, provider_id, timeout, label):
+            labels.append(label)
+            if label.startswith("episode_extract") or label == "diary_render_grounded":
+                raise asyncio.TimeoutError()
+            return json.dumps([{
+                "episode_key": "recovery_e1",
+                "content": "我在院里等他，风吹过树叶时又想起那封信。"
+                           "那些细碎的等待没有改变这一天的走向，却留在了我心里。",
+            }], ensure_ascii=False)
+
+        plugin._call_memory_generation_llm = call
+        diaries = await plugin._generate_evidence_first_diaries(
+            messages,
+            "\n".join(f"[turn:{index}] {item['content']}"
+                      for index, item in enumerate(messages)),
+            1, diary_cap=4, source_kind="eod",
+        )
+        self.assertEqual(len(diaries), 1)
+        self.assertEqual(labels.count("diary_render_timeout_retry"), 1)
+        self.assertEqual(diaries[0]["scene_end_turn"], 45)
+
+    async def test_short_batch_also_retries_transient_render_timeout(self):
+        plugin = self.make_plugin()
+        messages = [
+            {"role": "user", "content": "明天还去院子里看花吗？", "event_ts": 1789308000.0},
+            {"role": "assistant", "content": "我答应明天陪你去看花。", "event_ts": 1789308030.0},
+        ]
+        labels = []
+
+        async def call(_prompt, *, provider_id, timeout, label):
+            labels.append(label)
+            if label == "diary_render":
+                raise asyncio.TimeoutError()
+            return json.dumps([{
+                "episode_key": "recovery_e1",
+                "content": "我答应明天陪他去院子里看花，也记住了这份约定。",
+            }], ensure_ascii=False)
+
+        plugin._call_memory_generation_llm = call
+        prebuilt = build_local_grounded_episodes(messages, [], 1)
+        diaries = await plugin._generate_evidence_first_diaries(
+            messages, "原文只用于校验", 1, prebuilt_episodes=prebuilt,
+        )
+        self.assertEqual(len(diaries), 1)
+        self.assertEqual(labels, ["diary_render", "diary_render_timeout_retry"])
+
+    async def test_reasoning_only_render_uses_quality_retry_not_short_timeout_retry(self):
+        plugin = self.make_plugin()
+        messages = [
+            {"role": "user", "content": "明天还去院子里看花吗？", "event_ts": 1789308000.0},
+            {"role": "assistant", "content": "我答应明天陪你去看花。", "event_ts": 1789308030.0},
+        ]
+        labels = []
+
+        async def call(_prompt, *, provider_id, timeout, label):
+            labels.append(label)
+            if label == "diary_render":
+                raise LLMEmptyFinalError("provider returned no final text")
+            return json.dumps([{
+                "episode_key": "recovery_e1",
+                "content": "我答应明天陪他去院子里看花，也记住了这份约定。",
+            }], ensure_ascii=False)
+
+        plugin._call_memory_generation_llm = call
+        prebuilt = build_local_grounded_episodes(messages, [], 1)
+        diaries = await plugin._generate_evidence_first_diaries(
+            messages, "原文只用于校验", 1, prebuilt_episodes=prebuilt,
+        )
+        self.assertEqual(len(diaries), 1)
+        self.assertEqual(labels, ["diary_render", "diary_render_retry"])
+
+    async def test_local_recovery_ignores_render_keys_beyond_planned_target(self):
+        plugin = self.make_plugin()
+        plugin.episode_extraction_timeout = 120.0
+        messages = [
+            {"role": "user", "content": "离开前一定要告诉我。", "event_ts": 1786462200},
+            {"role": "assistant", "content": "我答应离开前一定告诉你。", "event_ts": 1786462260},
+        ]
+        calls = []
+
+        async def call(_prompt, *, provider_id, timeout, label):
+            calls.append((label, timeout))
+            if label.startswith("episode_extract"):
+                raise asyncio.TimeoutError()
+            return json.dumps([
+                {
+                    # Some models follow the generic eN example even when the
+                    # source-grounded recovery episode is named recovery_eN.
+                    "episode_key": "e1",
+                    "content": "他要我离开前一定告诉他，我认真记住了这句话。",
+                },
+                {
+                    "episode_key": "e2",
+                    "content": "我答应离开前一定告诉他，也会认真守住这份约定。",
+                },
+            ], ensure_ascii=False)
+
+        plugin._call_memory_generation_llm = call
+        diaries = await plugin._generate_evidence_first_diaries(
+            messages,
+            "\n".join(f"[turn:{i}] {item['content']}" for i, item in enumerate(messages)),
+            1,
+        )
+
+        self.assertEqual([item[0] for item in calls], [
+            "episode_extract", "episode_extract_compact_retry", "diary_render",
+        ])
+        self.assertEqual(calls[1][1], 60.0)
+        self.assertEqual(len(diaries), 1)
+        self.assertEqual(
+            [item["episode_key"] for item in diaries],
+            ["recovery_e1"],
+        )
+        self.assertTrue(all(not item["_render_fallback"] for item in diaries))
+        self.assertTrue(all(
+            "missing_episode_key" not in item["_render_retry_reason"] for item in diaries
+        ))
+
+    async def test_render_timeout_stays_inside_evidence_first_pipeline(self):
+        plugin = self.make_plugin()
+        messages = [
+            {"role": "user", "content": "离开前告诉我。"},
+            {"role": "assistant", "content": "我答应离开前一定告诉你。"},
+        ]
+        extraction = [{
+            "episode_key": "e1", "scene_anchor": "离开前说明的约定",
+            "memory_type": "promise_or_rule",
+            "evidence": [{
+                "kind": "commitment", "actor": "assistant",
+                "detail": "我答应离开前一定告诉他", "quote": "我答应离开前一定告诉你。",
+                "turn_indexes": [1], "tier": "must_write", "confidence": 1.0,
+            }],
+        }]
+        calls = []
+
+        async def call(_prompt, *, provider_id, timeout, label):
+            calls.append(label)
+            if label == "episode_extract":
+                return json.dumps(extraction, ensure_ascii=False)
+            raise asyncio.TimeoutError()
+
+        plugin._call_memory_generation_llm = call
+        with self.assertRaises(DiaryGenerationDeferred) as deferred:
+            await plugin._generate_evidence_first_diaries(
+                messages,
+                "\n".join(f"[turn:{i}] {item['content']}" for i, item in enumerate(messages)),
+                1,
+            )
+        self.assertEqual(calls, [
+            "episode_extract", "diary_render", "diary_render_timeout_retry",
+        ])
+        self.assertIn("render_call_failed:TimeoutError", str(deferred.exception.diagnostics["reasons"]))
 
     async def test_eod_capacity_does_not_force_split_one_grounded_scene(self):
         plugin = self.make_plugin()
@@ -928,16 +1925,13 @@ class EvidenceFirstGenerationTests(unittest.IsolatedAsyncioTestCase):
             return "[]"
 
         plugin._call_memory_generation_llm = call
-        diaries = await plugin._generate_evidence_first_diaries(
-            messages,
-            "\n".join(f"[turn:{i}] {item['content']}" for i, item in enumerate(messages)),
-            1,
-        )
-        self.assertEqual(len(diaries), 1)
-        self.assertTrue(diaries[0]["_render_fallback"])
-        self.assertEqual(diaries[0]["_evidence_quality"], "source_grounded")
-        self.assertEqual(diaries[0]["_render_coverage"], 1.0)
-        self.assertIn("离开前一定告诉", diaries[0]["content"])
+        with self.assertRaises(DiaryGenerationDeferred) as deferred:
+            await plugin._generate_evidence_first_diaries(
+                messages,
+                "\n".join(f"[turn:{i}] {item['content']}" for i, item in enumerate(messages)),
+                1,
+            )
+        self.assertIn("missing_key_fallback", str(deferred.exception.diagnostics["reasons"]))
 
     async def test_persistently_invalid_render_uses_grounded_fallback(self):
         plugin = self.make_plugin()
@@ -964,18 +1958,16 @@ class EvidenceFirstGenerationTests(unittest.IsolatedAsyncioTestCase):
             return json.dumps(invalid, ensure_ascii=False)
 
         plugin._call_memory_generation_llm = call
-        diaries = await plugin._generate_evidence_first_diaries(
-            messages,
-            "\n".join(f"[turn:{i}] {item['content']}" for i, item in enumerate(messages)),
-            1,
-        )
+        with self.assertRaises(DiaryGenerationDeferred) as deferred:
+            await plugin._generate_evidence_first_diaries(
+                messages,
+                "\n".join(f"[turn:{i}] {item['content']}" for i, item in enumerate(messages)),
+                1,
+            )
         self.assertEqual(calls, ["episode_extract", "diary_render", "diary_render_retry"])
-        self.assertTrue(diaries[0]["_render_fallback"])
-        self.assertTrue(diaries[0]["_render_retry_reason"].startswith("grounded_fallback_after:"))
-        self.assertIn("银色钥匙", diaries[0]["content"])
-        self.assertIn("我", diaries[0]["content"])
+        self.assertIn("grounded_fallback_after:", str(deferred.exception.diagnostics["reasons"]))
 
-    async def test_two_stage_failure_falls_back_without_losing_raw_batch(self):
+    async def test_two_stage_failure_keeps_raw_batch_without_legacy_publication(self):
         class Context:
             def get_provider_by_id(self, _provider_id):
                 return None
@@ -1035,12 +2027,14 @@ class EvidenceFirstGenerationTests(unittest.IsolatedAsyncioTestCase):
             plugin._persist_episode_for_diary = persist
             try:
                 result = await plugin._compress_and_store("session-a", messages, diary_count=1)
-                self.assertEqual(result, 1)
-                self.assertEqual(calls, ["legacy"])
-                self.assertEqual(len(persisted), 1)
+                self.assertEqual(result, 0)
+                self.assertEqual(calls, [])
+                self.assertEqual(len(persisted), 0)
                 batches = store.batch_status(5)
-                self.assertEqual(batches[0]["status"], "committed")
+                self.assertEqual(batches[0]["status"], "generation_failed")
+                self.assertEqual(batches[0]["attempts"], 1)
                 self.assertEqual(batches[0]["message_count"], 8)
+                self.assertEqual(len(store.source_turns(batches[0]["batch_id"])), 8)
             finally:
                 await plugin._xinchao.terminate()
                 store.close()

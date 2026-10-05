@@ -21,6 +21,9 @@ from typing import Any, Optional
 from .archive_guard import ArchiveGuard
 from .episode_repo import EpisodeRepo, SUPPORTED_TIERS, normalize_tier
 from .memory_access import MemoryAccessRepository
+from .thread_store import ThreadStore
+from .consistency_guard import evaluate as evaluate_consistency
+from .consistency_service import ConsistencyService
 from .preview_store import PreviewStore
 from .source_archive import SourceArchive
 from .store_utils import (
@@ -47,12 +50,23 @@ class EpisodicStore:
     orthogonal to the layering and stable since 4.5.4.
     """
 
-    SCHEMA_VERSION = 7
+    SCHEMA_VERSION = 15
 
-    def __init__(self, db_path: str, emb_dim: Optional[int], emb_model_id: Optional[str]):
+    def __init__(self, db_path: str, emb_dim: Optional[int], emb_model_id: Optional[str],
+                 *, consistency_mode: str = "shadow", consistency_queue_capacity: int = 64,
+                 consistency_timeout: float = 0.25, consistency_ttl: float = 900.0,
+                 consistency_llm_enable: bool = False, consistency_llm=None,
+                 consistency_loop=None):
         self.db_path = db_path
         self.emb_dim = int(emb_dim) if emb_dim else None
         self.emb_model_id = str(emb_model_id or "unknown")
+        self.consistency_mode = str(consistency_mode or "shadow")
+        self.consistency_queue_capacity = int(consistency_queue_capacity or 64)
+        self.consistency_timeout = float(consistency_timeout or 0.25)
+        self.consistency_ttl = float(consistency_ttl or 900.0)
+        self.consistency_llm_enable = bool(consistency_llm_enable)
+        self.consistency_llm = consistency_llm
+        self.consistency_loop = consistency_loop
         self._conn: sqlite3.Connection | None = None
         self._vec_ok = False
         self._lock = threading.RLock()
@@ -62,6 +76,8 @@ class EpisodicStore:
         self._guard: ArchiveGuard | None = None
         self._previews: PreviewStore | None = None
         self._access: MemoryAccessRepository | None = None
+        self._threads: ThreadStore | None = None
+        self.consistency_service: ConsistencyService | None = None
         self._snapshot_keep = 3
         self._preview_keep = 20
 
@@ -71,6 +87,7 @@ class EpisodicStore:
     def _connect(self) -> sqlite3.Connection:
         if self._conn is not None:
             return self._conn
+        self._closing = False
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
@@ -96,10 +113,22 @@ class EpisodicStore:
                                     snapshot_keep=self._snapshot_keep)
         self._previews = PreviewStore(self._connect, self._lock, keep=self._preview_keep)
         self._access = MemoryAccessRepository(self._connect, self._lock)
+        self._threads = ThreadStore(self._connect, self._lock)
         # Capture an older schema before any Repository CREATE/ALTER statement.
         pre_migration = self._guard.capture_pre_migration(conn, self.SCHEMA_VERSION)
         self._init_schema(conn, pre_migration=pre_migration)
         self._ensure_embedding_contract(conn)
+        self.consistency_service = ConsistencyService(
+            self,
+            evaluator=evaluate_consistency,
+            capacity=self.consistency_queue_capacity,
+            timeout=self.consistency_timeout,
+            mode=self.consistency_mode,
+            ttl=self.consistency_ttl,
+            llm_enable=self.consistency_llm_enable,
+            llm_callback=self.consistency_llm,
+            loop=self.consistency_loop,
+        )
         return conn
 
     def _init_schema(self, conn: sqlite3.Connection,
@@ -111,6 +140,8 @@ class EpisodicStore:
         self._eps.init_schema(conn)
         assert self._access is not None
         self._access.init_schema(conn)
+        assert self._threads is not None
+        self._threads.init_schema(conn)
         assert self._previews is not None
         self._previews.init_schema(conn)
         conn.execute(
@@ -157,6 +188,10 @@ class EpisodicStore:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_state_versions_scope ON semantic_state_versions(scope_id, version DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_state_queue_status ON semantic_state_queue(status, updated_ts)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_state_queue_scope_status "
+            "ON semantic_state_queue(scope_id, status, created_ts)"
+        )
         # 8.3.A: identity; 8.3.B: register the backup captured before Repository DDL.
         assert self._guard is not None
         self._guard.ensure_identity(conn, self.SCHEMA_VERSION)
@@ -189,9 +224,23 @@ class EpisodicStore:
         assert self._src is not None
         return self._src.archive_batch(session_id, messages, source_kind)
 
-    def mark_batch(self, batch_id: str, status: str) -> None:
+    def mark_batch(
+        self,
+        batch_id: str,
+        status: str,
+        *,
+        error: str = "",
+        retry_after: float = 0.0,
+        increment_attempt: bool = False,
+    ) -> None:
         assert self._src is not None
-        self._src.mark_batch(batch_id, status)
+        self._src.mark_batch(
+            batch_id,
+            status,
+            error=error,
+            retry_after=retry_after,
+            increment_attempt=increment_attempt,
+        )
 
     def source_turns(self, batch_id: str) -> list[dict[str, Any]]:
         assert self._src is not None
@@ -346,6 +395,331 @@ class EpisodicStore:
         assert self._access is not None
         return self._access.list_events(**kwargs)
 
+    def memory_access_observation_summary(self, **kwargs: Any) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.memory_access_observation_summary(**kwargs)
+
+    def list_memory_access_observations(self, **kwargs: Any) -> list[dict[str, Any]]:
+        assert self._access is not None
+        return self._access.list_memory_access_observations(**kwargs)
+
+    def memory_access_observation_detail(self, request_id: str) -> dict[str, Any] | None:
+        assert self._access is not None
+        return self._access.memory_access_observation_detail(request_id)
+
+    def record_memory_access_observation_feedback(self, **kwargs: Any) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.record_memory_access_observation_feedback(**kwargs)
+
+    def memory_access_export_payload(self, **kwargs: Any) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.memory_access_export_payload(**kwargs)
+
+    def record_memory_access_feedback(self, **kwargs: Any) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.record_manual_feedback(**kwargs)
+
+    # ---- eligibility / disambiguation / evaluation -------
+
+    def classify_memory_query_cues(self, query: str, **kwargs: Any) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.classify_query_cues(query, **kwargs)
+
+    def disambiguate_same_day_memories(self, query: str, memo_names: list[str],
+                                       **kwargs: Any) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.disambiguate_same_day(query, memo_names, **kwargs)
+
+    def sync_memory_interference_incremental(self, memo_name: str, **kwargs: Any) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.sync_interference_incremental(memo_name, **kwargs)
+
+    def sync_memory_interference_batch(self, memo_names: list[str], **kwargs: Any) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.sync_interference_batch(memo_names, **kwargs)
+
+    def mark_memory_interference_dirty(self, memo_names: list[str]) -> int:
+        assert self._access is not None
+        return self._access.mark_interference_dirty(memo_names)
+
+    def pop_memory_interference_dirty(self, limit: int = 50) -> list[str]:
+        assert self._access is not None
+        return self._access.pop_interference_dirty(limit)
+
+    def memory_access_index_meta(self) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.index_meta()
+
+    def generate_memory_eval_cases(self, **kwargs: Any) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.generate_eval_cases(**kwargs)
+
+    def list_memory_eval_cases(self, **kwargs: Any) -> list[dict[str, Any]]:
+        assert self._access is not None
+        return self._access.list_eval_cases(**kwargs)
+
+    def set_memory_eval_case_enabled(self, case_id: str, enabled: bool) -> bool:
+        assert self._access is not None
+        return self._access.set_eval_case_enabled(case_id, enabled)
+
+    def run_memory_eval(self, **kwargs: Any) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.run_eval(**kwargs)
+
+    def latest_memory_eval_run(self) -> dict[str, Any] | None:
+        assert self._access is not None
+        return self._access.latest_eval_run()
+
+    def memory_eval_run_results(self, run_id: str, **kwargs: Any) -> list[dict[str, Any]]:
+        assert self._access is not None
+        return self._access.eval_run_results(run_id, **kwargs)
+
+    def memory_access_safety_gates(self) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.safety_gates()
+
+    # ---- guarded takeover forwards ----
+
+    def memory_access_takeover_prerequisites(self, **kwargs: Any) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.takeover_prerequisites(**kwargs)
+
+    def memory_access_breaker_status(self, **kwargs: Any) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.breaker_status(**kwargs)
+
+    def memory_access_trip_breaker(self, **kwargs: Any) -> None:
+        assert self._access is not None
+        self._access.trip_breaker(**kwargs)
+
+    def memory_access_reset_breaker(self) -> bool:
+        assert self._access is not None
+        return self._access.reset_breaker()
+
+    def compute_memory_takeover_appends(self, evaluation: dict[str, Any], **kwargs: Any) -> list[dict[str, Any]]:
+        assert self._access is not None
+        return self._access.compute_takeover_appends(evaluation, **kwargs)
+
+    def compute_memory_supplement_appends(self, evaluation: dict[str, Any], **kwargs: Any) -> list[dict[str, Any]]:
+        assert self._access is not None
+        return self._access.compute_supplement_appends(evaluation, **kwargs)
+
+    def log_memory_takeover_append(self, **kwargs: Any) -> None:
+        assert self._access is not None
+        self._access.log_takeover_append(**kwargs)
+
+    def list_memory_takeover_log(self, **kwargs: Any) -> list[dict[str, Any]]:
+        assert self._access is not None
+        return self._access.list_takeover_log(**kwargs)
+
+    def evaluate_memory_takeover_response_use(self, **kwargs: Any) -> dict[str, Any]:
+        assert self._access is not None
+        return self._access.evaluate_takeover_response_use(**kwargs)
+
+    def confirm_memory_eval_case(self, case_id: str, **kwargs: Any) -> bool:
+        assert self._access is not None
+        return self._access.confirm_eval_case(case_id, **kwargs)
+
+    # ---- 6.0 thread-layer forwards ----
+
+    def thread_enqueue(self, scope_id: str, episode_id: str) -> bool:
+        assert self._threads is not None
+        return self._threads.enqueue(scope_id, episode_id)
+
+    def thread_queue_counts(self) -> dict:
+        assert self._threads is not None
+        return self._threads.queue_counts()
+
+    def thread_status(self) -> dict:
+        assert self._threads is not None
+        return self._threads.status()
+
+    def thread_set_paused(self, paused: bool) -> None:
+        assert self._threads is not None
+        self._threads.set_paused(paused)
+
+    def thread_is_paused(self) -> bool:
+        assert self._threads is not None
+        return self._threads.is_paused()
+
+    def thread_source_grade_counts(self) -> dict:
+        assert self._threads is not None
+        return self._threads.source_grade_counts()
+
+    def thread_restore_running_to_pending(self) -> int:
+        assert self._threads is not None
+        return self._threads.restore_running_to_pending()
+
+    def thread_take_pending_batch(self, limit: int = 10) -> list:
+        assert self._threads is not None
+        return self._threads.take_pending_batch(limit=limit)
+
+    def thread_mark_completed(self, queue_id: int, **kwargs) -> None:
+        assert self._threads is not None
+        self._threads.mark_completed(queue_id, **kwargs)
+
+    def thread_list_edges(self, **kwargs) -> list:
+        assert self._threads is not None
+        return self._threads.list_edges(**kwargs)
+
+    def thread_edge_counts(self) -> dict:
+        assert self._threads is not None
+        return self._threads.edge_counts()
+
+    def thread_list_ambiguity_queue(self, **kwargs) -> list:
+        assert self._threads is not None
+        return self._threads.list_ambiguity_queue(**kwargs)
+
+    def thread_insert_edge(self, edge: dict) -> bool:
+        assert self._threads is not None
+        return self._threads.insert_edge(edge)
+
+    def thread_list_threads(self, **kwargs) -> list:
+        assert self._threads is not None
+        return self._threads.list_threads(**kwargs)
+
+    def thread_detail(self, thread_id: str) -> dict | None:
+        assert self._threads is not None
+        return self._threads.thread_detail(thread_id)
+
+    def thread_manual_edge_decision(self, edge_id: int, decision: dict, **kwargs) -> dict:
+        assert self._threads is not None
+        return self._threads.manual_edge_decision(edge_id, decision, **kwargs)
+
+    def thread_merge_preview(self, thread_ids: list[str]) -> dict:
+        assert self._threads is not None
+        return self._threads.merge_preview(thread_ids)
+
+    def thread_apply_merge(self, thread_ids: list[str], **kwargs) -> dict:
+        assert self._threads is not None
+        return self._threads.apply_merge(thread_ids, **kwargs)
+
+    def thread_split_preview(self, thread_id: str, episode_ids: list[str]) -> dict:
+        assert self._threads is not None
+        return self._threads.split_preview(thread_id, episode_ids)
+
+    def thread_apply_split(self, thread_id: str, episode_ids: list[str], **kwargs) -> dict:
+        assert self._threads is not None
+        return self._threads.apply_split(thread_id, episode_ids, **kwargs)
+
+    def thread_list_operations(self, **kwargs) -> list:
+        assert self._threads is not None
+        return self._threads.list_operations(**kwargs)
+
+    def thread_revert_operation(self, operation_id: str) -> dict:
+        assert self._threads is not None
+        return self._threads.revert_operation(operation_id)
+
+    def thread_list_claims(self, **kwargs) -> list:
+        assert self._threads is not None
+        return self._threads.list_claims(**kwargs)
+
+    def thread_list_claim_slots(self, **kwargs) -> list:
+        assert self._threads is not None
+        return self._threads.list_claim_slots(**kwargs)
+
+    def thread_list_claim_transitions(self, **kwargs) -> list:
+        assert self._threads is not None
+        return self._threads.list_claim_transitions(**kwargs)
+
+    def thread_claim_manual_status(self, claim_id: str, status: str, **kwargs) -> dict:
+        assert self._threads is not None
+        return self._threads.claim_manual_status(claim_id, status, **kwargs)
+
+    def thread_view(self, thread_id: str) -> dict | None:
+        assert self._threads is not None
+        return self._threads.thread_view(thread_id)
+
+    def thread_view_history(self, thread_id: str, limit: int = 30) -> list:
+        assert self._threads is not None
+        return self._threads.thread_view_history(thread_id, limit=limit)
+
+    def thread_list_prospective(self, **kwargs) -> list:
+        assert self._threads is not None
+        return self._threads.list_prospective(**kwargs)
+
+    def thread_prospective_manual_status(self, item_id: str, status: str, **kwargs) -> dict:
+        assert self._threads is not None
+        return self._threads.prospective_manual_status(item_id, status, **kwargs)
+
+    def thread_reserve_prospective_surface(self, item_id: str, **kwargs) -> dict:
+        assert self._threads is not None
+        return self._threads.reserve_prospective_surface(item_id, **kwargs)
+
+    def thread_commit_prospective_surface(self, item_id: str, reservation: str, **kwargs) -> dict:
+        assert self._threads is not None
+        return self._threads.commit_prospective_surface(
+            item_id, reservation, **kwargs
+        )
+
+    def thread_release_prospective_surface(self, item_id: str, reservation: str) -> bool:
+        assert self._threads is not None
+        return self._threads.release_prospective_surface(
+            item_id, reservation
+        )
+
+    def thread_record_prospective_surface(self, item_id: str, **kwargs) -> dict:
+        assert self._threads is not None
+        return self._threads.record_prospective_surface(item_id, **kwargs)
+
+    def thread_query_observations(self, **kwargs) -> list:
+        assert self._threads is not None
+        return self._threads.list_thread_query_observations(**kwargs)
+
+    def thread_record_request_observation(self, request_id: str, **fields: Any) -> None:
+        assert self._threads is not None
+        self._threads.record_request_observation(request_id, **fields)
+
+    def thread_request_observation(self, request_id: str) -> dict[str, Any] | None:
+        assert self._threads is not None
+        return self._threads.request_observation(request_id)
+
+    def thread_list_request_observations(self, **kwargs: Any) -> list[dict[str, Any]]:
+        assert self._threads is not None
+        return self._threads.list_request_observations(**kwargs)
+
+    def thread_consistency_request_overview(self, **kwargs: Any) -> dict[str, Any]:
+        assert self._threads is not None
+        return self._threads.consistency_request_overview(**kwargs)
+
+    def thread_consistency_detail(self, request_id: str) -> dict[str, Any]:
+        assert self._threads is not None
+        return self._threads.consistency_detail(request_id)
+
+    def thread_record_consistency_result(self, request_id: str,
+                                         observations: list[dict[str, Any]], **kwargs: Any) -> int:
+        assert self._threads is not None
+        return self._threads.record_consistency_result(request_id, observations, **kwargs)
+
+    def thread_record_consistency_observations(self, request_id: str,
+                                               observations: list[dict[str, Any]], **kwargs: Any) -> int:
+        assert self._threads is not None
+        return self._threads.record_thread_consistency_observations(request_id, observations, **kwargs)
+
+    def thread_list_consistency_observations(self, **kwargs: Any) -> list[dict[str, Any]]:
+        assert self._threads is not None
+        return self._threads.list_thread_consistency_observations(**kwargs)
+
+    def thread_record_consistency_feedback(self, request_id: str, label: str, **kwargs: Any) -> int:
+        assert self._threads is not None
+        return self._threads.record_consistency_feedback(request_id, label, **kwargs)
+
+    def thread_list_consistency_feedback(self, request_id: str = "", **kwargs: Any) -> list[dict[str, Any]]:
+        assert self._threads is not None
+        return self._threads.list_consistency_feedback(request_id, **kwargs)
+
+    def thread_eval_cases(self, **kwargs) -> list:
+        assert self._threads is not None
+        return self._threads.list_thread_eval_cases(**kwargs)
+
+    def thread_record_manual_feedback(self, **kwargs) -> int:
+        assert self._threads is not None
+        return self._threads.record_manual_feedback(**kwargs)
+
+    def thread_list_manual_feedback(self, **kwargs) -> list:
+        assert self._threads is not None
+        return self._threads.list_manual_feedback(**kwargs)
+
     def memo_names(self) -> set[str]:
         assert self._eps is not None
         return self._eps.memo_names()
@@ -371,6 +745,18 @@ class EpisodicStore:
         assert self._eps is not None
         return self._eps.episodes_for_batch(batch_id)
 
+    def fallback_repair_candidates(self, limit: int = 100) -> list[dict[str, Any]]:
+        assert self._eps is not None
+        return self._eps.fallback_repair_candidates(limit)
+
+    def episode_snapshot(self, memo_name: str) -> dict[str, Any] | None:
+        assert self._eps is not None
+        return self._eps.episode_snapshot(memo_name)
+
+    def restore_episode_snapshot(self, snapshot: dict[str, Any]) -> bool:
+        assert self._eps is not None
+        return self._eps.restore_episode_snapshot(snapshot)
+
     def evidence_for_memo(self, memo_name: str, query: str = "", limit: int = 3) -> list[dict[str, Any]]:
         assert self._eps is not None
         return self._eps.evidence_for_memo(memo_name, query, limit)
@@ -380,6 +766,30 @@ class EpisodicStore:
         assert self._eps is not None
         return self._eps.record_rollback(old_memo_name=old_memo_name, episode_id=episode_id,
                                         new_memo_names=new_memo_names, note=note)
+
+    def record_content_rollback(
+        self,
+        *,
+        memo_name: str,
+        episode_id: str,
+        old_content: str,
+        new_content: str,
+        old_episode: dict[str, Any] | None = None,
+        note: str = "",
+    ) -> int:
+        assert self._eps is not None
+        return self._eps.record_content_rollback(
+            memo_name=memo_name,
+            episode_id=episode_id,
+            old_content=old_content,
+            new_content=new_content,
+            old_episode=old_episode,
+            note=note,
+        )
+
+    def rollback_by_id(self, rollback_id: int) -> dict[str, Any] | None:
+        assert self._eps is not None
+        return self._eps.rollback_by_id(rollback_id)
 
     def record_diary_rollback_atomic(self, *, old_memo_name: str, episode_id: str,
                                      new_memo_names: list[str], note: str = "") -> int:
@@ -439,6 +849,14 @@ class EpisodicStore:
                                     confirmed: bool = False) -> bool:
         assert self._previews is not None
         return self._previews.update_status(preview_id, status, confirmed)
+
+    def record_inplace_preview_success(
+        self, preview_id: str, memo_name: str, rollback_id: int,
+    ) -> bool:
+        assert self._previews is not None
+        return self._previews.record_inplace_success(
+            preview_id, memo_name, rollback_id,
+        )
 
     def discard_diary_preview(self, preview_id: str) -> bool:
         assert self._previews is not None
@@ -639,6 +1057,28 @@ class EpisodicStore:
         return compute_traceability(self._src, self._eps, self.stats())
 
     def close(self) -> None:
+        # Drain/stop the consistency worker before SQLite becomes unavailable.
+        with self._lock:
+            if getattr(self, "_closing", False):
+                return
+            self._closing = True
+        service = self.consistency_service
+        self.consistency_service = None
+        if service is not None:
+            try:
+                if not service.close():
+                    logger.warning("[memos-memory][consistency] drain incomplete; SQLite close deferred")
+                    def finish_close():
+                        service._worker.join()
+                        self._close_storage()
+                    threading.Thread(target=finish_close, name="memos-consistency-close", daemon=True).start()
+                    return
+            except Exception:
+                logger.exception("[memos-memory][consistency] close failed; SQLite retained")
+                return
+        self._close_storage()
+
+    def _close_storage(self) -> None:
         with self._lock:
             if self._conn is not None:
                 self._conn.close()
@@ -653,11 +1093,15 @@ class EpisodicStore:
     def batch_status(self, limit: int = 30) -> list[dict[str, Any]]:
         rows = self._connect().execute(
             """SELECT batch_id,session_id,source_kind,message_count,first_event_ts,last_event_ts,
-                      status,created_ts,updated_ts
+                      status,attempts,last_error,next_retry_ts,created_ts,updated_ts
                FROM source_batches ORDER BY updated_ts DESC LIMIT ?""",
             (max(1, min(500, int(limit))),),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def batch_info(self, batch_id: str) -> dict[str, Any] | None:
+        assert self._src is not None
+        return self._src.batch_info(batch_id)
 
     @staticmethod
     def _render_semantic_state(state: dict[str, Any]) -> str:
@@ -787,18 +1231,30 @@ class EpisodicStore:
                    (batch_id,scope_id,episode_ids_json,status,attempts,last_error,created_ts,updated_ts)
                    VALUES (?,?,?,'pending',0,'',?,?)
                    ON CONFLICT(batch_id) DO UPDATE SET scope_id=excluded.scope_id,
-                    episode_ids_json=excluded.episode_ids_json,status='pending',last_error='',updated_ts=excluded.updated_ts""",
+                    episode_ids_json=excluded.episode_ids_json,status='pending',last_error='',updated_ts=excluded.updated_ts
+                    WHERE semantic_state_queue.status IN ('pending','failed')""",
                 (batch_id, str(scope_id), json.dumps(episode_ids, ensure_ascii=False), now, now),
             )
             conn.commit()
 
-    def pending_state_updates(self, limit: int = 10) -> list[dict[str, Any]]:
+    def pending_state_updates(
+        self,
+        limit: int = 10,
+        scope_id: str = "",
+    ) -> list[dict[str, Any]]:
+        scope = str(scope_id or "").strip()
+        where = "status IN ('pending','failed')"
+        params: list[Any] = []
+        if scope:
+            where += " AND scope_id=?"
+            params.append(scope)
+        params.append(max(1, min(100, int(limit))))
         with self._lock:
             rows = self._connect().execute(
-                """SELECT batch_id,scope_id,episode_ids_json,status,attempts,last_error,created_ts,updated_ts
-                   FROM semantic_state_queue WHERE status IN ('pending','failed')
-                   ORDER BY created_ts LIMIT ?""",
-                (max(1, min(100, int(limit))),),
+                f"""SELECT batch_id,scope_id,episode_ids_json,status,attempts,last_error,created_ts,updated_ts
+                    FROM semantic_state_queue WHERE {where}
+                    ORDER BY created_ts LIMIT ?""",
+                tuple(params),
             ).fetchall()
         out = []
         for row in rows:
@@ -806,6 +1262,51 @@ class EpisodicStore:
             item["episode_ids"] = _json_list(item.pop("episode_ids_json", "[]"))
             out.append(item)
         return out
+
+    def pending_state_update_count(self, scope_id: str = "") -> int:
+        scope = str(scope_id or "").strip()
+        where = "status IN ('pending','failed')"
+        params: tuple[Any, ...] = ()
+        if scope:
+            where += " AND scope_id=?"
+            params = (scope,)
+        with self._lock:
+            row = self._connect().execute(
+                f"SELECT COUNT(*) AS n FROM semantic_state_queue WHERE {where}",
+                params,
+            ).fetchone()
+        return int(row["n"] or 0) if row else 0
+
+    def semantic_state_queue_summary(self, scope_id: str = "") -> dict[str, Any]:
+        scope = str(scope_id or "").strip()
+        where = "1=1"
+        params: list[Any] = []
+        if scope:
+            where += " AND scope_id=?"
+            params.append(scope)
+        with self._lock:
+            conn = self._connect()
+            rows = conn.execute(
+                f"""SELECT status,COUNT(*) AS n FROM semantic_state_queue
+                    WHERE {where} GROUP BY status""",
+                tuple(params),
+            ).fetchall()
+            reasons = conn.execute(
+                f"""SELECT last_error,COUNT(*) AS n FROM semantic_state_queue
+                    WHERE {where} AND status='superseded' AND last_error<>''
+                    GROUP BY last_error ORDER BY n DESC LIMIT 12""",
+                tuple(params),
+            ).fetchall()
+        counts = {str(row["status"] or "unknown"): int(row["n"] or 0) for row in rows}
+        return {
+            "counts": counts,
+            "suppressed_reasons": {
+                str(row["last_error"] or "unknown"): int(row["n"] or 0)
+                for row in reasons
+            },
+            "pending": counts.get("pending", 0) + counts.get("failed", 0),
+            "total": sum(counts.values()),
+        }
 
     def mark_state_update(self, batch_id: str, status: str, error: str = "") -> None:
         with self._lock:
@@ -833,13 +1334,23 @@ class EpisodicStore:
             conn.commit()
             return int(cur.rowcount or 0)
 
-    def supersede_pending_state_updates(self, reason: str = "full_rebuild") -> int:
+    def supersede_pending_state_updates(
+        self,
+        reason: str = "full_rebuild",
+        scope_id: str = "",
+    ) -> int:
+        scope = str(scope_id or "").strip()
+        where = "status IN ('pending','failed')"
+        params: list[Any] = [str(reason or "full_rebuild")[:1000], time.time()]
+        if scope:
+            where += " AND scope_id=?"
+            params.append(scope)
         with self._lock:
             conn = self._connect()
             cur = conn.execute(
-                """UPDATE semantic_state_queue SET status='superseded',last_error=?,updated_ts=?
-                   WHERE status IN ('pending','failed')""",
-                (str(reason or "full_rebuild")[:1000], time.time()),
+                f"""UPDATE semantic_state_queue SET status='superseded',last_error=?,updated_ts=?
+                    WHERE {where}""",
+                tuple(params),
             )
             conn.commit()
             return int(cur.rowcount or 0)

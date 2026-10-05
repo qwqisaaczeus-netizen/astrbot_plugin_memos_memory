@@ -42,7 +42,7 @@ class ProductionWebTests(unittest.IsolatedAsyncioTestCase):
             # A user-edited Episode is still recoverable when its exact links survive.
             evidence_quality="mixed_user_edited",
             diary_content_hash="web-hash",
-            diary_render_version="4.6.2",
+            diary_render_version="4.6.3",
             must_coverage=1.0,
             support_coverage=0.75,
             transcript_risk=0.1,
@@ -71,7 +71,11 @@ class ProductionWebTests(unittest.IsolatedAsyncioTestCase):
         )
 
         async def preview(_episode_id):
-            return {"preview_id": "p-web", "status": "pending"}
+            return {"preview_id": "p-web", "status": "pending", "payload": {
+                "mode": "inplace_fallback_repair", "old_memo_content": "private old diary",
+                "old_episode": {"embedding": "private vector"},
+                "new_diaries": [{"content": "文学日记", "episode_key": "scene"}],
+            }}
         async def confirm(_preview_id):
             return {"status": "confirmed", "ok": True}
         async def rollback(**_kwargs):
@@ -86,7 +90,7 @@ class ProductionWebTests(unittest.IsolatedAsyncioTestCase):
             _episodes=self.store,
             _emb_dim=4,
             _emb_model_id="model-b",
-            _PLUGIN_VERSION="5.0.0-test0",
+            _PLUGIN_VERSION="6.1.0-rc5",
             _log_events=[],
             _last_injection_stats=[],
             _long_diaries_list=lambda: [{"episode_id": "ep-web-one", "memo_name": "memos/web-one",
@@ -94,6 +98,9 @@ class ProductionWebTests(unittest.IsolatedAsyncioTestCase):
                                           "source_turns": 1, "must_coverage": 1.0,
                                           "transcript_risk": 0.1}],
             _create_diary_rewrite_preview=preview,
+            _create_fallback_repair_preview=preview,
+            _confirm_fallback_repair=confirm,
+            _fallback_repair_candidates=lambda limit=100: [],
             _confirm_diary_rewrite=confirm,
             _rollback_diary_rewrite=rollback,
             _discard_diary_preview=discard,
@@ -141,6 +148,7 @@ class ProductionWebTests(unittest.IsolatedAsyncioTestCase):
             ("/api/production/long_diaries", "long_diaries"),
             ("/api/production/rollbacks", "rollbacks"),
             ("/api/production/previews", "previews"),
+            ("/api/production/fallback_repairs", "items"),
         ):
             response = await self._get_json(path)
             self.assertTrue(response["ok"], (path, response))
@@ -175,12 +183,45 @@ class ProductionWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.stats()["active_generation"],
                          self.store._gen.runtime_generation("model-a", 3))
 
+    async def test_v2_migration_preview_is_real_and_idempotent(self):
+        self.plugin.runtime_state_dir=Path(self.temp.name)/'v2'
+        before=(await self._get_json('/api/production/v2'))['data']
+        self.assertFalse(before['available'])
+        self.assertFalse(self.plugin.runtime_state_dir.exists())
+        first=await self._post_json('/api/production/v2/migrate_preview',{})
+        second=await self._post_json('/api/production/v2/migrate_preview',{})
+        self.assertEqual(first,second)
+        self.assertEqual(first['data']['model_calls'],0)
+        state=(await self._get_json('/api/production/v2'))['data']
+        self.assertTrue(state['available'])
+        self.assertFalse(state['enabled'])
+        self.assertEqual(len(state['upgrades']),1)
+        self.assertEqual(self.store.list_episodes()[0]['memo_name'],'memos/web-one')
+
+    async def test_v2_migration_rejects_cross_origin(self):
+        self.plugin.runtime_state_dir=Path(self.temp.name)/'v2'
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            await self._post_json('/api/production/v2/migrate_preview',{},origin='https://untrusted.example')
+        self.assertEqual(caught.exception.code,403)
+
     async def test_preview_confirm_discard_and_rollback_posts(self):
         preview = await self._post_json(
             "/api/production/long_diary_preview", {"episode_id": "ep-web-one"}
         )
         self.assertTrue(preview["ok"], preview)
         self.assertEqual(preview["data"]["preview_id"], "p-web")
+        self.assertEqual(preview["data"]["new_diaries"][0]["content"], "文学日记")
+        self.assertNotIn("old_memo_content", json.dumps(preview["data"]))
+        repair = await self._post_json(
+            "/api/production/fallback_repair_preview", {"episode_id": "ep-web-one"}
+        )
+        self.assertTrue(repair["ok"], repair)
+        self.assertEqual(repair["data"]["mode"], "inplace_fallback_repair")
+        self.assertNotIn("private vector", json.dumps(repair["data"]))
+        repaired = await self._post_json(
+            "/api/production/fallback_repair_confirm", {"preview_id": "p-web"}
+        )
+        self.assertTrue(repaired["ok"], repaired)
         confirmed = await self._post_json(
             "/api/production/long_diary_confirm", {"preview_id": "p-web"}
         )

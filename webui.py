@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import time
 import asyncio
 import calendar
@@ -85,6 +86,15 @@ def _html_response(handler: BaseHTTPRequestHandler, html: str) -> None:
     handler.wfile.write(body)
 
 
+def _binary_response(handler: BaseHTTPRequestHandler, body: bytes, content_type: str) -> None:
+    handler.send_response(200)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Cache-Control", "public, max-age=86400")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
 def _make_handler(
     plugin: Any,
     dashboard_html: str,
@@ -92,10 +102,16 @@ def _make_handler(
     xinchao_html: str,
     production_html: str,
     access_html: str,
+    forgetting_html: str,
+    models_html: str,
+    house_html: str = "<h1>house.html missing</h1>",
+    house_assets: dict[str, bytes] | None = None,
+    compensation_html: str = "<h1>compensation.html missing</h1>",
 ):
     """Create a request handler class bound to the plugin instance."""
 
-    settings_lock = threading.RLock()
+    from .thread_policy import LOCK as settings_lock
+    house_assets = house_assets or {}
 
     setting_groups = {
         "基础与连接": {
@@ -122,11 +138,13 @@ def _make_handler(
             "semantic_state_enable", "semantic_state_provider_id", "semantic_state_timeout",
             "semantic_state_target_chars", "semantic_state_update_policy",
             "semantic_state_batch_threshold", "semantic_state_max_wait_hours",
+            "semantic_state_min_interval_hours", "semantic_state_suppress_after_hours",
+            "semantic_state_noop_similarity",
             "semantic_state_significance_threshold", "semantic_state_merge_max_batches",
             "semantic_state_auto_bootstrap",
             "semantic_state_bootstrap_episode_limit", "semantic_state_replace_profile",
         },
-        "4.x 当前精简召回": {
+        "融合召回": {
             "enable_auto_recall", "lean_recall_enable", "lean_recall_candidate_k",
             "lean_event_index_enable", "lean_source_evidence_enable", "lean_coverage_selection_enable",
             "lean_adaptive_evidence_enable", "passage_vector_auto_migrate",
@@ -167,11 +185,12 @@ def _make_handler(
             "recall_cluster_similarity", "recall_cluster_base_per_group",
             "recall_cluster_allow_protected",
         },
-        "历史画像兼容与洞察": {
+        "长期人格与画像": {
             "enable_affiliate_profile", "affiliate_profile_max_age_days", "profile_provider_id",
             "profile_auto_update_days", "profile_recent_persona_limit", "profile_anchor_limit",
             "profile_manual_limit", "profile_feedback_limit", "profile_llm_timeout",
-            "profile_target_chars", "profile_facts_target_count",
+            "profile_target_chars", "profile_facts_target_count", "profile_min_new_evidence",
+            "identity_core_inject_chars",
         },
         "上下文治理": {
             "context_governance_enable", "context_exclude_command_turns", "context_keep_recent_messages",
@@ -186,17 +205,41 @@ def _make_handler(
         "运行与维护": {
             "data_backup_enable", "data_backup_interval_days",
             "data_backup_keep", "data_backup_dir",
+            "llm_runtime_provider_concurrency", "llm_runtime_external_concurrency",
+            "llm_runtime_interactive_queue_timeout",
+            "llm_runtime_foreground_lease_seconds", "llm_runtime_defer_background",
         },
-        "5.0 记忆可达性（test0）": {
-            "memory_forgetting_enable", "memory_forgetting_shadow_mode",
+        "记忆可达性与补充支路": {
+            "memory_forgetting_enable", "memory_access_route_mode",
             "memory_access_decay_enable", "memory_access_deep_rescue_enable",
+            "memory_access_independent_cue_rescue", "memory_access_rescue_candidate_limit",
             "memory_interference_enable", "memory_reconsolidation_enable",
             "memory_psychological_bias_enable", "memory_psychological_bias_strength",
             "memory_access_vivid_threshold", "memory_access_deep_threshold",
             "memory_access_decay_days", "memory_access_exact_cue_relief",
             "memory_access_max_neighbors", "memory_access_maintenance_hours",
-            "memory_access_event_keep",
+            "memory_access_event_keep", "memory_access_observation_keep",
+            "memory_access_observation_query_max_chars", "memory_access_export_keep",
+            "memory_access_export_dir",
+            "memory_access_cue_grade_b_rarity_min", "memory_access_same_day_gap_threshold",
+            "memory_access_state_confirmation_runs", "memory_access_source_proxy_weight",
+            "memory_access_supplement_max", "memory_access_supplement_temporal_max",
+            "memory_access_supplement_rescue_max",
+            "memory_access_supplement_temporal_threshold",
+            "memory_access_supplement_rescue_threshold",
+            "memory_access_supplement_source_bonus",
+            "memory_access_supplement_allow_diary_derived",
+            "memory_access_supplement_holdout_percent",
+            "memory_access_supplement_breaker_threshold",
+            "memory_access_eval_max_age_days",
+            "memory_access_auto_eval_case_limit",
         },
+        "6.1 生产交接": set(),
+        "记忆脉络与一致性": set(),
+        "数据备份": set(),
+        "同步与网络": set(),
+        "检索运行": set(),
+        "界面与诊断": set(),
         "重要性规则": {
             "imp_tier5_keywords", "imp_tier4_keywords", "imp_tier3_keywords", "imp_low_keywords",
         },
@@ -233,6 +276,15 @@ def _make_handler(
         "semantic_state_update_policy": "adaptive",
         "semantic_state_auto_bootstrap": True,
         "semantic_state_replace_profile": True,
+        "semantic_state_min_interval_hours": 72,
+        "semantic_state_suppress_after_hours": 168,
+        "semantic_state_noop_similarity": 0.94,
+        "enable_affiliate_profile": True,
+        "profile_auto_update_days": 30,
+        "profile_min_new_evidence": 8,
+        "identity_core_inject_chars": 1000,
+        "profile_target_chars": 1000,
+        "profile_facts_target_count": 20,
         "enable_auto_recall": True,
         "lean_recall_enable": True,
         "lean_event_index_enable": True,
@@ -240,9 +292,13 @@ def _make_handler(
         "lean_coverage_selection_enable": True,
         "lean_adaptive_evidence_enable": True,
         "memory_forgetting_enable": True,
-        "memory_forgetting_shadow_mode": True,
+        "memory_forgetting_shadow_mode": False,
+        "memory_access_route_mode": "supplement",
         "memory_access_decay_enable": True,
         "memory_access_deep_rescue_enable": True,
+        "memory_access_observation_keep": 5000,
+        "memory_access_observation_query_max_chars": 2000,
+        "memory_access_export_keep": 10,
         "memory_interference_enable": True,
         "memory_reconsolidation_enable": True,
         "memory_psychological_bias_enable": True,
@@ -272,6 +328,11 @@ def _make_handler(
         "time_insight_diagnostic_log": True,
         "data_backup_enable": True,
         "data_backup_interval_days": 14,
+        "llm_runtime_provider_concurrency": 2,
+        "llm_runtime_external_concurrency": 3,
+        "llm_runtime_interactive_queue_timeout": 0.75,
+        "llm_runtime_foreground_lease_seconds": 240,
+        "llm_runtime_defer_background": True,
     }
 
     preset_definitions = {
@@ -283,13 +344,15 @@ def _make_handler(
                 **preset_common_values,
                 "compress_every_n_turns": 30, "diary_count": 2, "compress_batch_max_messages": 60,
                 "eod_checkpoint_enable": True, "eod_checkpoint_min_turns": 1,
-                "eod_checkpoint_max_diaries": 6,
+                "eod_checkpoint_max_diaries": 3,
                 "evidence_first_generation_enable": True, "raw_evidence_archive_enable": True,
                 "diary_must_coverage_threshold": 0.94, "diary_rewrite_preview_min_chars": 2800,
-                "semantic_state_enable": True, "semantic_state_target_chars": 2400,
+                "semantic_state_enable": True, "semantic_state_target_chars": 1500,
                 "semantic_state_update_policy": "adaptive", "semantic_state_batch_threshold": 4,
-                "semantic_state_max_wait_hours": 96, "semantic_state_significance_threshold": 0.70,
-                "semantic_state_merge_max_batches": 8,
+                "semantic_state_max_wait_hours": 168, "semantic_state_min_interval_hours": 72,
+                "semantic_state_suppress_after_hours": 168,
+                "semantic_state_significance_threshold": 0.70,
+                "semantic_state_merge_max_batches": 12,
                 "semantic_state_auto_bootstrap": True, "semantic_state_replace_profile": True,
                 "lean_recall_enable": True, "lean_recall_candidate_k": 80,
                 "lean_event_index_enable": True, "lean_source_evidence_enable": True,
@@ -317,6 +380,15 @@ def _make_handler(
                 "time_insight_llm_refine_enable": True, "time_insight_llm_min_confidence": 0.68,
                 "context_keep_recent_messages": 60, "context_min_messages_before_trim": 120,
                 "data_backup_keep": 8,
+                "memory_access_supplement_max": 2,
+                "memory_access_supplement_temporal_max": 1,
+                "memory_access_supplement_rescue_max": 1,
+                "memory_access_supplement_temporal_threshold": 0.50,
+                "memory_access_supplement_rescue_threshold": 0.56,
+                "memory_access_supplement_source_bonus": 0.10,
+                "memory_access_supplement_allow_diary_derived": True,
+                "memory_access_supplement_holdout_percent": 0,
+                "memory_access_supplement_breaker_threshold": 4,
             },
         },
         "quality": {
@@ -327,13 +399,15 @@ def _make_handler(
                 **preset_common_values,
                 "compress_every_n_turns": 30, "diary_count": 2, "compress_batch_max_messages": 60,
                 "eod_checkpoint_enable": True, "eod_checkpoint_min_turns": 1,
-                "eod_checkpoint_max_diaries": 6,
+                "eod_checkpoint_max_diaries": 3,
                 "evidence_first_generation_enable": True, "raw_evidence_archive_enable": True,
                 "diary_must_coverage_threshold": 0.92, "diary_rewrite_preview_min_chars": 2400,
-                "semantic_state_enable": True, "semantic_state_target_chars": 2100,
+                "semantic_state_enable": True, "semantic_state_target_chars": 1200,
                 "semantic_state_update_policy": "adaptive", "semantic_state_batch_threshold": 4,
-                "semantic_state_max_wait_hours": 96, "semantic_state_significance_threshold": 0.72,
-                "semantic_state_merge_max_batches": 6,
+                "semantic_state_max_wait_hours": 168, "semantic_state_min_interval_hours": 72,
+                "semantic_state_suppress_after_hours": 168,
+                "semantic_state_significance_threshold": 0.72,
+                "semantic_state_merge_max_batches": 12,
                 "semantic_state_auto_bootstrap": True, "semantic_state_replace_profile": True,
                 "lean_recall_enable": True, "lean_recall_candidate_k": 70,
                 "lean_event_index_enable": True, "lean_source_evidence_enable": True,
@@ -361,23 +435,34 @@ def _make_handler(
                 "time_insight_llm_refine_enable": True, "time_insight_llm_min_confidence": 0.70,
                 "context_keep_recent_messages": 48, "context_min_messages_before_trim": 96,
                 "data_backup_keep": 8,
+                "memory_access_supplement_max": 2,
+                "memory_access_supplement_temporal_max": 1,
+                "memory_access_supplement_rescue_max": 1,
+                "memory_access_supplement_temporal_threshold": 0.54,
+                "memory_access_supplement_rescue_threshold": 0.60,
+                "memory_access_supplement_source_bonus": 0.08,
+                "memory_access_supplement_allow_diary_derived": True,
+                "memory_access_supplement_holdout_percent": 0,
+                "memory_access_supplement_breaker_threshold": 3,
             },
         },
         "balanced": {
             "name": "均衡推荐",
-            "summary": "保留 4.6 全部核心机制，以默认规模平衡长期效果、延迟和调用成本。",
+            "summary": "保留 5.1 完整记忆链路，以默认规模平衡长期效果、延迟和调用成本。",
             "cost": "中等",
             "values": {
                 **preset_common_values,
                 "compress_every_n_turns": 30, "diary_count": 2, "compress_batch_max_messages": 60,
                 "eod_checkpoint_enable": True, "eod_checkpoint_min_turns": 1,
-                "eod_checkpoint_max_diaries": 6,
+                "eod_checkpoint_max_diaries": 3,
                 "evidence_first_generation_enable": True, "raw_evidence_archive_enable": True,
                 "diary_must_coverage_threshold": 0.90, "diary_rewrite_preview_min_chars": 2200,
-                "semantic_state_enable": True, "semantic_state_target_chars": 1800,
-                "semantic_state_update_policy": "adaptive", "semantic_state_batch_threshold": 5,
-                "semantic_state_max_wait_hours": 120, "semantic_state_significance_threshold": 0.74,
-                "semantic_state_merge_max_batches": 8,
+                "semantic_state_enable": True, "semantic_state_target_chars": 1000,
+                "semantic_state_update_policy": "adaptive", "semantic_state_batch_threshold": 4,
+                "semantic_state_max_wait_hours": 240, "semantic_state_min_interval_hours": 96,
+                "semantic_state_suppress_after_hours": 240,
+                "semantic_state_significance_threshold": 0.74,
+                "semantic_state_merge_max_batches": 12,
                 "semantic_state_auto_bootstrap": True, "semantic_state_replace_profile": True,
                 "lean_recall_enable": True, "lean_recall_candidate_k": 50,
                 "lean_event_index_enable": True, "lean_source_evidence_enable": True,
@@ -405,6 +490,15 @@ def _make_handler(
                 "time_insight_llm_refine_enable": True, "time_insight_llm_min_confidence": 0.72,
                 "context_keep_recent_messages": 40, "context_min_messages_before_trim": 80,
                 "data_backup_keep": 6,
+                "memory_access_supplement_max": 2,
+                "memory_access_supplement_temporal_max": 1,
+                "memory_access_supplement_rescue_max": 1,
+                "memory_access_supplement_temporal_threshold": 0.58,
+                "memory_access_supplement_rescue_threshold": 0.64,
+                "memory_access_supplement_source_bonus": 0.07,
+                "memory_access_supplement_allow_diary_derived": True,
+                "memory_access_supplement_holdout_percent": 0,
+                "memory_access_supplement_breaker_threshold": 3,
             },
         },
         "economy": {
@@ -415,13 +509,15 @@ def _make_handler(
                 **preset_common_values,
                 "compress_every_n_turns": 45, "diary_count": 2, "compress_batch_max_messages": 90,
                 "eod_checkpoint_enable": True, "eod_checkpoint_min_turns": 1,
-                "eod_checkpoint_max_diaries": 4,
+                "eod_checkpoint_max_diaries": 3,
                 "evidence_first_generation_enable": True, "raw_evidence_archive_enable": True,
                 "diary_must_coverage_threshold": 0.88, "diary_rewrite_preview_min_chars": 1800,
-                "semantic_state_enable": True, "semantic_state_target_chars": 1300,
-                "semantic_state_update_policy": "adaptive", "semantic_state_batch_threshold": 6,
-                "semantic_state_max_wait_hours": 168, "semantic_state_significance_threshold": 0.80,
-                "semantic_state_merge_max_batches": 10,
+                "semantic_state_enable": True, "semantic_state_target_chars": 800,
+                "semantic_state_update_policy": "adaptive", "semantic_state_batch_threshold": 5,
+                "semantic_state_max_wait_hours": 336, "semantic_state_min_interval_hours": 168,
+                "semantic_state_suppress_after_hours": 336,
+                "semantic_state_significance_threshold": 0.80,
+                "semantic_state_merge_max_batches": 16,
                 "semantic_state_auto_bootstrap": True, "semantic_state_replace_profile": True,
                 "lean_recall_enable": True, "lean_recall_candidate_k": 40,
                 "lean_event_index_enable": True, "lean_source_evidence_enable": True,
@@ -449,6 +545,15 @@ def _make_handler(
                 "time_insight_llm_refine_enable": False, "time_insight_llm_min_confidence": 0.76,
                 "context_keep_recent_messages": 32, "context_min_messages_before_trim": 72,
                 "data_backup_keep": 4,
+                "memory_access_supplement_max": 1,
+                "memory_access_supplement_temporal_max": 1,
+                "memory_access_supplement_rescue_max": 1,
+                "memory_access_supplement_temporal_threshold": 0.64,
+                "memory_access_supplement_rescue_threshold": 0.70,
+                "memory_access_supplement_source_bonus": 0.05,
+                "memory_access_supplement_allow_diary_derived": True,
+                "memory_access_supplement_holdout_percent": 0,
+                "memory_access_supplement_breaker_threshold": 4,
             },
         },
     }
@@ -533,7 +638,151 @@ def _make_handler(
         },
     }
 
+    # Dedicated 5.0 forgetting presets. They intentionally mirror the four
+    # global modes, but touch only bounded ACCESS booleans/numbers. In
+    # particular, no preset can enable the online source canary takeover.
+    forgetting_preset_definitions = {
+        "deep_roleplay": {
+            "name": "长线灵魂塑形",
+            "summary": "最慢自然淡出、最强精确线索穿透与更宽干扰建模，适合年月级连续 RP。",
+            "cost": "维护较高",
+            "values": {
+                "memory_forgetting_enable": True, "memory_access_route_mode": "supplement",
+                "memory_access_decay_enable": True, "memory_access_deep_rescue_enable": True,
+                "memory_access_independent_cue_rescue": True,
+                "memory_access_rescue_candidate_limit": 20,
+                "memory_interference_enable": True, "memory_reconsolidation_enable": True,
+                "memory_psychological_bias_enable": True,
+                "memory_psychological_bias_strength": 0.10,
+                "memory_access_vivid_threshold": 0.64, "memory_access_deep_threshold": 0.24,
+                "memory_access_decay_days": 120.0, "memory_access_exact_cue_relief": 0.94,
+                "memory_access_max_neighbors": 16, "memory_access_maintenance_hours": 24,
+                "memory_access_event_keep": 10000,
+                "memory_access_observation_keep": 12000,
+                "memory_access_cue_grade_b_rarity_min": 0.30,
+                "memory_access_same_day_gap_threshold": 0.18,
+                "memory_access_state_confirmation_runs": 3,
+                "memory_access_source_proxy_weight": 0.30,
+                "memory_access_supplement_max": 2,
+                "memory_access_supplement_temporal_max": 1,
+                "memory_access_supplement_rescue_max": 1,
+                "memory_access_supplement_temporal_threshold": 0.50,
+                "memory_access_supplement_rescue_threshold": 0.56,
+                "memory_access_supplement_source_bonus": 0.10,
+                "memory_access_supplement_allow_diary_derived": True,
+                "memory_access_supplement_holdout_percent": 0,
+                "memory_access_supplement_breaker_threshold": 4,
+                "memory_access_eval_max_age_days": 7,
+                "memory_access_auto_eval_case_limit": 120,
+            },
+        },
+        "quality": {
+            "name": "全维效果优先（推荐）",
+            "summary": "长期保留、精确救援、干扰抑制和再巩固之间的高质量默认平衡。",
+            "cost": "中高",
+            "values": {
+                "memory_forgetting_enable": True, "memory_access_route_mode": "supplement",
+                "memory_access_decay_enable": True, "memory_access_deep_rescue_enable": True,
+                "memory_access_independent_cue_rescue": True,
+                "memory_access_rescue_candidate_limit": 16,
+                "memory_interference_enable": True, "memory_reconsolidation_enable": True,
+                "memory_psychological_bias_enable": True,
+                "memory_psychological_bias_strength": 0.08,
+                "memory_access_vivid_threshold": 0.66, "memory_access_deep_threshold": 0.28,
+                "memory_access_decay_days": 90.0, "memory_access_exact_cue_relief": 0.92,
+                "memory_access_max_neighbors": 14, "memory_access_maintenance_hours": 24,
+                "memory_access_event_keep": 8000,
+                "memory_access_observation_keep": 9000,
+                "memory_access_cue_grade_b_rarity_min": 0.32,
+                "memory_access_same_day_gap_threshold": 0.16,
+                "memory_access_state_confirmation_runs": 2,
+                "memory_access_source_proxy_weight": 0.35,
+                "memory_access_supplement_max": 2,
+                "memory_access_supplement_temporal_max": 1,
+                "memory_access_supplement_rescue_max": 1,
+                "memory_access_supplement_temporal_threshold": 0.54,
+                "memory_access_supplement_rescue_threshold": 0.60,
+                "memory_access_supplement_source_bonus": 0.08,
+                "memory_access_supplement_allow_diary_derived": True,
+                "memory_access_supplement_holdout_percent": 0,
+                "memory_access_supplement_breaker_threshold": 3,
+                "memory_access_eval_max_age_days": 7,
+                "memory_access_auto_eval_case_limit": 100,
+            },
+        },
+        "balanced": {
+            "name": "日常均衡",
+            "summary": "保留完整七路机制，以适中的半衰期和维护规模服务长期日常聊天。",
+            "cost": "中等",
+            "values": {
+                "memory_forgetting_enable": True, "memory_access_route_mode": "supplement",
+                "memory_access_decay_enable": True, "memory_access_deep_rescue_enable": True,
+                "memory_access_independent_cue_rescue": True,
+                "memory_access_rescue_candidate_limit": 12,
+                "memory_interference_enable": True, "memory_reconsolidation_enable": True,
+                "memory_psychological_bias_enable": True,
+                "memory_psychological_bias_strength": 0.06,
+                "memory_access_vivid_threshold": 0.68, "memory_access_deep_threshold": 0.32,
+                "memory_access_decay_days": 60.0, "memory_access_exact_cue_relief": 0.90,
+                "memory_access_max_neighbors": 12, "memory_access_maintenance_hours": 24,
+                "memory_access_event_keep": 5000,
+                "memory_access_observation_keep": 6000,
+                "memory_access_cue_grade_b_rarity_min": 0.34,
+                "memory_access_same_day_gap_threshold": 0.15,
+                "memory_access_state_confirmation_runs": 2,
+                "memory_access_source_proxy_weight": 0.40,
+                "memory_access_supplement_max": 2,
+                "memory_access_supplement_temporal_max": 1,
+                "memory_access_supplement_rescue_max": 1,
+                "memory_access_supplement_temporal_threshold": 0.58,
+                "memory_access_supplement_rescue_threshold": 0.64,
+                "memory_access_supplement_source_bonus": 0.07,
+                "memory_access_supplement_allow_diary_derived": True,
+                "memory_access_supplement_holdout_percent": 0,
+                "memory_access_supplement_breaker_threshold": 3,
+                "memory_access_eval_max_age_days": 7,
+                "memory_access_auto_eval_case_limit": 80,
+            },
+        },
+        "economy": {
+            "name": "低成本长记忆",
+            "summary": "减少图规模和维护频率，仍保留精确救援、非破坏存储与事实安全边界。",
+            "cost": "较低",
+            "values": {
+                "memory_forgetting_enable": True, "memory_access_route_mode": "supplement",
+                "memory_access_decay_enable": True, "memory_access_deep_rescue_enable": True,
+                "memory_access_independent_cue_rescue": True,
+                "memory_access_rescue_candidate_limit": 8,
+                "memory_interference_enable": True, "memory_reconsolidation_enable": True,
+                "memory_psychological_bias_enable": False,
+                "memory_psychological_bias_strength": 0.04,
+                "memory_access_vivid_threshold": 0.70, "memory_access_deep_threshold": 0.34,
+                "memory_access_decay_days": 45.0, "memory_access_exact_cue_relief": 0.86,
+                "memory_access_max_neighbors": 8, "memory_access_maintenance_hours": 48,
+                "memory_access_event_keep": 2500,
+                "memory_access_observation_keep": 3000,
+                "memory_access_cue_grade_b_rarity_min": 0.38,
+                "memory_access_same_day_gap_threshold": 0.14,
+                "memory_access_state_confirmation_runs": 2,
+                "memory_access_source_proxy_weight": 0.35,
+                "memory_access_supplement_max": 1,
+                "memory_access_supplement_temporal_max": 1,
+                "memory_access_supplement_rescue_max": 1,
+                "memory_access_supplement_temporal_threshold": 0.64,
+                "memory_access_supplement_rescue_threshold": 0.70,
+                "memory_access_supplement_source_bonus": 0.05,
+                "memory_access_supplement_allow_diary_derived": True,
+                "memory_access_supplement_holdout_percent": 0,
+                "memory_access_supplement_breaker_threshold": 4,
+                "memory_access_eval_max_age_days": 7,
+                "memory_access_auto_eval_case_limit": 60,
+            },
+        },
+    }
+
     class Handler(BaseHTTPRequestHandler):
+        _house_plugin = plugin
+
         def log_message(self, format, *args):
             pass  # suppress default stderr logging
 
@@ -548,16 +797,105 @@ def _make_handler(
             path = parsed.path.rstrip("/") or "/"
             qs = parse_qs(parsed.query)
 
-            if path == "/":
+            if path == "/house":
+                _html_response(self, house_html)
+            elif path.startswith("/assets/"):
+                relative = unquote(path[len("/assets/"):]).replace("\\", "/")
+                if (
+                    not relative
+                    or relative.startswith("/")
+                    or ".." in Path(relative).parts
+                ):
+                    return _json_response(
+                        self, 400, {"ok": False, "error": "Invalid asset path"}
+                    )
+                asset = house_assets.get(relative)
+                if asset is None:
+                    _json_response(self, 404, {"ok": False, "error": "Not found"})
+                else:
+                    content_type = mimetypes.guess_type(relative)[0] or "application/octet-stream"
+                    if content_type in {"text/javascript", "application/javascript", "application/json"}:
+                        content_type += "; charset=utf-8"
+                    _binary_response(self, asset, content_type)
+            elif path.startswith("/api/house/"):
+                from .house_webui import HouseWebUIHandlers
+                if not HouseWebUIHandlers.handle_get(self, path, qs):
+                    _json_response(self, 404, {"ok": False, "error": "Not found"})
+            elif path == "/":
                 _html_response(self, dashboard_html)
             elif path == "/console" or path == "/logs":
                 _html_response(self, console_html)
             elif path == "/xinchao":
                 _html_response(self, xinchao_html)
+            elif path == "/models":
+                _html_response(self, models_html)
+            elif path == "/compensation":
+                _html_response(self, compensation_html)
             elif path == "/production":
                 _html_response(self, production_html)
+            elif path == "/threads":
+                from .thread_webui import ThreadWebUIHandlers
+                ThreadWebUIHandlers()._serve_threads_page(self)
+            elif path == "/api/threads/policy":
+                from .thread_policy import gates, snapshot
+                with settings_lock:
+                    data = gates(plugin)
+                    data.update(snapshot(plugin))
+                    data.pop("rollback_target", None)
+                    data["provider_id"] = getattr(plugin, "thread_llm_provider_id", "")
+                    data["provider_options"] = self._llm_provider_options(data["provider_id"])
+                self._json_ok(data)
+            elif path == "/api/threads/status":
+                from .thread_webui import ThreadWebUIHandlers
+                ThreadWebUIHandlers()._api_threads_status(self, plugin)
+            elif path == "/api/threads/edges":
+                from .thread_webui import ThreadWebUIHandlers
+                ThreadWebUIHandlers()._api_threads_edges(self, plugin, qs)
+            elif path == "/api/threads/ambiguities":
+                from .thread_webui import ThreadWebUIHandlers
+                ThreadWebUIHandlers()._api_threads_ambiguities(self, plugin, qs)
+            elif path == "/api/threads/list":
+                from .thread_webui import ThreadWebUIHandlers
+                ThreadWebUIHandlers()._api_threads_list(self, plugin, qs)
+            elif path == "/api/threads/detail":
+                from .thread_webui import ThreadWebUIHandlers
+                ThreadWebUIHandlers()._api_threads_detail(self, plugin, qs)
+            elif path == "/api/threads/operations":
+                from .thread_webui import ThreadWebUIHandlers
+                ThreadWebUIHandlers()._api_threads_operations(self, plugin, qs)
+            elif path == "/api/threads/claims":
+                from .thread_webui import ThreadWebUIHandlers
+                ThreadWebUIHandlers()._api_threads_claims(self, plugin, qs)
+            elif path == "/api/threads/claim-transitions":
+                from .thread_webui import ThreadWebUIHandlers
+                ThreadWebUIHandlers()._api_threads_claim_transitions(self, plugin, qs)
+            elif path == "/api/threads/view-history":
+                from .thread_webui import ThreadWebUIHandlers
+                ThreadWebUIHandlers()._api_threads_view_history(self, plugin, qs)
+            elif path == "/api/threads/prospective":
+                from .thread_webui import ThreadWebUIHandlers
+                ThreadWebUIHandlers()._api_threads_prospective(self, plugin, qs)
+            elif path == "/api/threads/observations":
+                from .thread_webui import ThreadWebUIHandlers
+                ThreadWebUIHandlers()._api_threads_observations(self, plugin, qs)
+            elif path == "/api/threads/eval-cases":
+                from .thread_webui import ThreadWebUIHandlers
+                ThreadWebUIHandlers()._api_threads_eval_cases(self, plugin, qs)
+            elif path == "/api/threads/feedback":
+                from .thread_webui import ThreadWebUIHandlers
+                ThreadWebUIHandlers()._api_threads_feedback(self, plugin, qs)
+            elif path == "/api/threads/consistency":
+                from .thread_webui import ThreadWebUIHandlers
+                ThreadWebUIHandlers()._api_threads_consistency(self, plugin, qs)
+            elif path.startswith("/api/threads/consistency/detail/"):
+                from .thread_webui import ThreadWebUIHandlers
+                ThreadWebUIHandlers()._api_threads_consistency_detail(
+                    self, plugin, unquote(path[len("/api/threads/consistency/detail/"):])
+                )
             elif path == "/access":
                 _html_response(self, access_html)
+            elif path == "/forgetting":
+                _html_response(self, forgetting_html)
             elif path == "/api/status":
                 self._api_status()
             elif path == "/api/stats":
@@ -568,6 +906,8 @@ def _make_handler(
                 self._api_episodic_status()
             elif path == "/api/production/overview":
                 self._api_production_overview(qs)
+            elif path == "/api/production/v2":
+                self._api_production_v2(False, qs)
             elif path == "/api/access/overview":
                 self._api_access_overview()
             elif path == "/api/access/memories":
@@ -578,12 +918,36 @@ def _make_handler(
                 self._api_access_interference(qs)
             elif path == "/api/access/events":
                 self._api_access_events(qs)
+            elif path == "/api/access/observations":
+                self._api_access_observations(qs)
+            elif path.startswith("/api/access/observation/"):
+                self._api_access_observation_detail(
+                    unquote(path[len("/api/access/observation/"):])
+                )
+            elif path == "/api/access/exports":
+                self._api_access_exports()
+            elif path == "/api/access/export/download":
+                self._api_access_export_download(qs)
+            elif path == "/api/access/eval_cases":
+                self._api_access_eval_cases(qs)
+            elif path == "/api/access/eval_run_latest":
+                self._api_access_eval_run_latest()
+            elif path == "/api/access/safety_gates":
+                self._api_access_safety_gates()
+            elif path == "/api/access/takeover_status":
+                self._api_access_takeover_status()
+            elif path == "/api/forgetting/overview":
+                self._api_forgetting_overview()
+            elif path == "/api/forgetting/presets":
+                self._api_forgetting_presets()
             elif path == "/api/production/episodes":
                 self._api_production_episodes(qs)
             elif path == "/api/production/snapshots":
                 self._api_production_snapshots()
             elif path == "/api/production/long_diaries":
                 self._api_production_long_diaries(qs)
+            elif path == "/api/production/fallback_repairs":
+                self._api_production_fallback_repairs(qs)
             elif path == "/api/production/rollbacks":
                 self._api_production_rollbacks()
             elif path == "/api/production/previews":
@@ -613,6 +977,14 @@ def _make_handler(
                 self._api_eval_observations(qs)
             elif path == "/api/settings":
                 self._api_settings()
+            elif path == "/api/scheduling/settings":
+                self._api_settings(scheduling=True)
+            elif path == "/api/models":
+                self._api_models()
+            elif path == "/api/models/calls":
+                self._api_model_calls()
+            elif path == "/api/compensation":
+                self._api_compensation()
             elif path == "/api/memories":
                 self._api_memories(qs)
             elif path == "/api/timeline":
@@ -685,31 +1057,74 @@ def _make_handler(
             path = parsed.path.rstrip("/") or "/"
             allowed = {
                 "/api/settings/save", "/api/settings/preset",
+                "/api/models/save", "/api/models/test", "/api/models/probe",
+                "/api/compensation/restore", "/api/compensation/dismiss",
                 "/api/feedback/apply",
                 "/api/episodic/rebuild",
                 "/api/state/rebuild", "/api/eval/case", "/api/eval/run",
                 "/api/eval/auto_cases", "/api/eval/preset", "/api/eval/observation_feedback",
-                "/api/xinchao/settings/save", "/api/xinchao/settle",
+                "/api/xinchao/settings/save", "/api/xinchao/settings/test-api",
+                "/api/xinchao/settle",
                 "/api/xinchao/feedback", "/api/xinchao/thought",
                 "/api/xinchao/simulate", "/api/xinchao/reset",
                 "/api/time-insight/settings/save", "/api/time-insight/update",
                 "/api/time-insight/preview",
                 "/api/production/restore_snapshot",
+                "/api/production/v2/migrate_preview",
+                "/api/production/v2/draft",
+                "/api/production/v2/resume_delivery",
+                "/api/production/v2/control",
+                "/api/production/v2/mode",
                 "/api/production/long_diary_preview",
                 "/api/production/long_diary_confirm",
                 "/api/production/long_diary_rollback",
                 "/api/production/long_diary_discard",
+                "/api/production/fallback_repair_preview",
+                "/api/production/fallback_repair_confirm",
                 "/api/production/generation_switch",
                 "/api/production/generation_rollback",
                 "/api/access/rebuild", "/api/access/maintenance", "/api/access/simulate",
+                "/api/threads/pause", "/api/threads/resume", "/api/threads/decide",
+                "/api/threads/merge/preview", "/api/threads/merge/apply",
+                "/api/threads/split/preview", "/api/threads/split/apply",
+                "/api/threads/operation/revert",
+                "/api/threads/claim/status", "/api/threads/prospective/status",
+                "/api/threads/rebuild-derived", "/api/threads/prospective/simulate",
+                "/api/threads/lab", "/api/threads/eval/run", "/api/threads/lab/feedback",
+                "/api/threads/policy", "/api/threads/maintenance",
+                "/api/threads/consistency/export", "/api/threads/consistency/feedback",
+                "/api/access/eval_cases/generate", "/api/access/eval_cases/enabled",
+                "/api/access/eval_run", "/api/access/eval_run_results",
+                "/api/access/eval_cases/confirm",
+                "/api/access/takeover_reset",
+                "/api/access/observation_feedback", "/api/access/export",
+                "/api/forgetting/preset", "/api/forgetting/feedback",
                 "/api/data-backup/run",
                 "/api/data-backup/restore",
                 "/api/data-backup/cancel-restore",
                 "/api/data-backup/delete",
+                "/api/house/settings/save", "/api/house/settings/test",
+                "/api/house/artifact/read", "/api/house/artifact/feedback",
+                "/api/house/artifact/rewrite", "/api/house/artifact/archive",
+                "/api/house/artifact/delete", "/api/house/artifact/send",
+                "/api/house/generate/preview", "/api/house/generate/now",
+                "/api/house/session/settle", "/api/house/character/interact",
             }
             if path not in allowed:
                 return _json_response(self, 404, {"ok": False, "error": "Not found"})
             if not self._same_origin_write_allowed():
+                # Drain a bounded rejected body before closing. Unread POST bytes
+                # can otherwise turn the intended 403 into a TCP reset on Windows.
+                old_timeout = self.connection.gettimeout()
+                try:
+                    rejected_length = int(self.headers.get("Content-Length") or 0)
+                    if 0 < rejected_length <= 1024 * 1024:
+                        self.connection.settimeout(0.25)
+                        self.rfile.read(rejected_length)
+                except (ValueError, OSError):
+                    pass
+                finally:
+                    self.connection.settimeout(old_timeout)
                 return self._json_err("跨来源写入已拒绝", 403)
             try:
                 length = int(self.headers.get("Content-Length") or 0)
@@ -718,8 +1133,20 @@ def _make_handler(
                 body = json.loads(self.rfile.read(length).decode("utf-8"))
                 if not isinstance(body, dict):
                     return self._json_err("请求格式错误", 400)
-                if path == "/api/settings/save":
+                if path.startswith("/api/house/"):
+                    from .house_webui import HouseWebUIHandlers
+                    if not HouseWebUIHandlers.handle_post(self, path, body):
+                        self._json_err("Not found", 404)
+                elif path == "/api/settings/save":
                     self._api_settings_save(body)
+                elif path.startswith("/api/models/"):
+                    self._api_models_write(path, body)
+                elif path.startswith("/api/compensation/"):
+                    self._api_compensation_write(path, body)
+                elif path == "/api/threads/policy":
+                    self._api_threads_policy(body)
+                elif path == "/api/threads/maintenance":
+                    self._api_threads_maintenance(body)
                 elif path == "/api/settings/preset":
                     self._api_settings_preset(body)
                 elif path == "/api/feedback/apply":
@@ -740,6 +1167,16 @@ def _make_handler(
                     self._api_eval_observation_feedback(body)
                 elif path == "/api/production/restore_snapshot":
                     self._api_production_restore_snapshot(body)
+                elif path == "/api/production/v2/migrate_preview":
+                    self._api_production_v2(True)
+                elif path == "/api/production/v2/draft":
+                    self._api_production_v2_draft(body)
+                elif path == "/api/production/v2/resume_delivery":
+                    self._api_production_v2_draft(body, delivery=True)
+                elif path == "/api/production/v2/control":
+                    self._api_production_v2_draft(body, control=True)
+                elif path == "/api/production/v2/mode":
+                    self._api_production_v2_mode(body)
                 elif path == "/api/production/long_diary_preview":
                     self._api_production_long_diary_preview(body)
                 elif path == "/api/production/long_diary_confirm":
@@ -748,6 +1185,10 @@ def _make_handler(
                     self._api_production_long_diary_rollback(body)
                 elif path == "/api/production/long_diary_discard":
                     self._api_production_long_diary_discard(body)
+                elif path == "/api/production/fallback_repair_preview":
+                    self._api_production_fallback_repair_preview(body)
+                elif path == "/api/production/fallback_repair_confirm":
+                    self._api_production_fallback_repair_confirm(body)
                 elif path == "/api/production/generation_switch":
                     self._api_production_generation_switch()
                 elif path == "/api/production/generation_rollback":
@@ -758,6 +1199,77 @@ def _make_handler(
                     self._api_access_maintenance()
                 elif path == "/api/access/simulate":
                     self._api_access_simulate(body)
+                elif path == "/api/threads/pause":
+                    from .thread_webui import ThreadWebUIHandlers
+                    ThreadWebUIHandlers()._api_threads_pause(self, plugin)
+                elif path == "/api/threads/resume":
+                    from .thread_webui import ThreadWebUIHandlers
+                    ThreadWebUIHandlers()._api_threads_resume(self, plugin)
+                elif path == "/api/threads/decide":
+                    from .thread_webui import ThreadWebUIHandlers
+                    ThreadWebUIHandlers()._api_threads_decide(self, plugin, body)
+                elif path == "/api/threads/merge/preview":
+                    from .thread_webui import ThreadWebUIHandlers
+                    ThreadWebUIHandlers()._api_threads_merge_preview(self, plugin, body)
+                elif path == "/api/threads/merge/apply":
+                    from .thread_webui import ThreadWebUIHandlers
+                    ThreadWebUIHandlers()._api_threads_merge_apply(self, plugin, body)
+                elif path == "/api/threads/split/preview":
+                    from .thread_webui import ThreadWebUIHandlers
+                    ThreadWebUIHandlers()._api_threads_split_preview(self, plugin, body)
+                elif path == "/api/threads/split/apply":
+                    from .thread_webui import ThreadWebUIHandlers
+                    ThreadWebUIHandlers()._api_threads_split_apply(self, plugin, body)
+                elif path == "/api/threads/operation/revert":
+                    from .thread_webui import ThreadWebUIHandlers
+                    ThreadWebUIHandlers()._api_threads_revert(self, plugin, body)
+                elif path == "/api/threads/claim/status":
+                    from .thread_webui import ThreadWebUIHandlers
+                    ThreadWebUIHandlers()._api_threads_claim_status(self, plugin, body)
+                elif path == "/api/threads/prospective/status":
+                    from .thread_webui import ThreadWebUIHandlers
+                    ThreadWebUIHandlers()._api_threads_prospective_status(self, plugin, body)
+                elif path == "/api/threads/rebuild-derived":
+                    from .thread_webui import ThreadWebUIHandlers
+                    ThreadWebUIHandlers()._api_threads_rebuild_derived(self, plugin, body)
+                elif path == "/api/threads/prospective/simulate":
+                    from .thread_webui import ThreadWebUIHandlers
+                    ThreadWebUIHandlers()._api_threads_prospective_simulate(self, plugin, body)
+                elif path == "/api/threads/lab":
+                    from .thread_webui import ThreadWebUIHandlers
+                    ThreadWebUIHandlers()._api_threads_lab(self, plugin, body)
+                elif path == "/api/threads/eval/run":
+                    from .thread_webui import ThreadWebUIHandlers
+                    ThreadWebUIHandlers()._api_threads_eval_run(self, plugin, body)
+                elif path == "/api/threads/lab/feedback":
+                    from .thread_webui import ThreadWebUIHandlers
+                    ThreadWebUIHandlers()._api_threads_lab_feedback(self, plugin, body)
+                elif path == "/api/threads/consistency/export":
+                    from .thread_webui import ThreadWebUIHandlers
+                    ThreadWebUIHandlers()._api_threads_consistency_export(self, plugin, body)
+                elif path == "/api/threads/consistency/feedback":
+                    from .thread_webui import ThreadWebUIHandlers
+                    ThreadWebUIHandlers()._api_threads_consistency_feedback(self, plugin, body)
+                elif path == "/api/access/eval_cases/generate":
+                    self._api_access_eval_cases_generate(body)
+                elif path == "/api/access/eval_cases/enabled":
+                    self._api_access_eval_case_enabled(body)
+                elif path == "/api/access/eval_run":
+                    self._api_access_eval_run(body)
+                elif path == "/api/access/eval_run_results":
+                    self._api_access_eval_run_results(body)
+                elif path == "/api/access/eval_cases/confirm":
+                    self._api_access_eval_case_confirm(body)
+                elif path == "/api/access/takeover_reset":
+                    self._api_access_takeover_reset()
+                elif path == "/api/access/observation_feedback":
+                    self._api_access_observation_feedback(body)
+                elif path == "/api/access/export":
+                    self._api_access_export()
+                elif path == "/api/forgetting/preset":
+                    self._api_forgetting_preset(body)
+                elif path == "/api/forgetting/feedback":
+                    self._api_forgetting_feedback(body)
                 elif path == "/api/data-backup/run":
                     self._api_data_backup_run()
                 elif path == "/api/data-backup/restore":
@@ -766,7 +1278,7 @@ def _make_handler(
                     self._api_data_backup_cancel_restore()
                 elif path == "/api/data-backup/delete":
                     self._api_data_backup_delete(body)
-                elif path.startswith("/api/time-insight/"):
+                elif path.startswith("/api/time-insight/"): 
                     self._api_time_insight_write(path, body)
                 else:
                     self._api_xinchao_write(path, body)
@@ -863,7 +1375,7 @@ def _make_handler(
                         "enabled": bool(getattr(plg, "eod_checkpoint_enable", False)),
                         "schedule": "23:45",
                         "min_turns": int(getattr(plg, "eod_checkpoint_min_turns", 1) or 1),
-                        "max_diaries": int(getattr(plg, "eod_checkpoint_max_diaries", 6) or 6),
+                        "max_diaries": int(getattr(plg, "eod_checkpoint_max_diaries", 3) or 3),
                         "last": dict(getattr(plg, "_eod_last_status", {}) or {}),
                     },
                     "data_backup": (
@@ -1079,8 +1591,73 @@ def _make_handler(
         def _production_list(value: Any) -> list[dict[str, Any]]:
             return [dict(item) for item in value if isinstance(item, dict)] if isinstance(value, (list, tuple)) else []
 
+        @staticmethod
+        def _public_production_preview(item: dict[str, Any]) -> dict[str, Any]:
+            payload = item.get("payload") if isinstance(item.get("payload"), dict) else item
+            diaries = payload.get("new_diaries") if isinstance(payload.get("new_diaries"), list) else []
+            return {
+                "preview_id": str(item.get("preview_id") or payload.get("preview_id") or ""),
+                "episode_id": str(item.get("episode_id") or payload.get("episode_id") or ""),
+                "old_memo_name": str(item.get("old_memo_name") or payload.get("old_memo_name") or ""),
+                "mode": str(payload.get("mode") or ""),
+                "status": str(item.get("status") or "pending"),
+                "source_turns": int(payload.get("source_turns") or 0),
+                "new_diaries_count": len(diaries),
+                "new_diaries": [
+                    {
+                        "episode_key": str(d.get("episode_key") or ""),
+                        "content": str(d.get("content") or ""),
+                        "scene_start_turn": d.get("scene_start_turn"),
+                        "scene_end_turn": d.get("scene_end_turn"),
+                        "must_coverage": d.get("must_coverage", d.get("_must_coverage")),
+                    }
+                    for d in diaries if isinstance(d, dict)
+                ],
+            }
+
+        @staticmethod
+        def _public_production_rollback(item: dict[str, Any]) -> dict[str, Any]:
+            return {key: item.get(key) for key in (
+                "id", "memo_name", "episode_id", "note", "created_ts", "reverted_ts",
+            )}
+
         def _production_store(self):
             return getattr(plugin, "_episodes", None)
+
+        def _api_production_v2(self, migrate=False, qs=None):
+            from .generation_v2.workbench import overview, migration_preview
+            try:
+                offset=int((qs or {}).get('offset',['0'])[0])
+                self._json_ok(migration_preview(plugin) if migrate else overview(plugin,offset))
+            except Exception as exc:
+                self._json_err(type(exc).__name__ + ": V2 production operation failed", 409)
+
+        def _api_production_v2_mode(self, body):
+            from .generation_v2.operations import mode_settings, readiness
+            try:
+                values = mode_settings(plugin, body)
+                result = self._save_settings_values(values, "production-mode")
+                result['readiness'] = readiness(plugin)
+                self._json_ok(result)
+            except (ValueError, RuntimeError) as exc:
+                self._json_err(str(exc), 409)
+
+        def _api_production_v2_draft(self, body, delivery=False, control=False):
+            from .generation_v2.plugin_gateway import start_draft
+            from .generation_v2.integration import resume_delivery
+            from .generation_v2.store import ConflictError
+            loop = getattr(getattr(plugin, "_webui", None), "_loop", None)
+            if loop is None or not loop.is_running():
+                return self._json_err("Astr event loop unavailable", 503)
+            from .generation_v2.operations import operate
+            operation = operate if control else resume_delivery if delivery else start_draft
+            future = asyncio.run_coroutine_threadsafe(operation(plugin, body), loop)
+            try:
+                self._json_ok(future.result(timeout=15))
+            except ConflictError as exc:
+                self._json_err("操作未执行：" + str(exc), 409)
+            except Exception as exc:
+                self._json_err(type(exc).__name__ + ": check production progress before retrying", 409)
 
         def _production_helper(self, name: str):
             helper = getattr(plugin, name, None)
@@ -1108,6 +1685,7 @@ def _make_handler(
                     "settings": {
                         "enable": bool(getattr(plugin, "memory_forgetting_enable", True)),
                         "shadow_mode": bool(getattr(plugin, "memory_forgetting_shadow_mode", True)),
+                        "takeover_enable": bool(getattr(plugin, "memory_access_takeover_enable", False)),
                         "decay_days": float(getattr(plugin, "memory_access_decay_days", 45.0)),
                         "vivid_threshold": float(getattr(plugin, "memory_access_vivid_threshold", 0.68)),
                         "deep_threshold": float(getattr(plugin, "memory_access_deep_threshold", 0.32)),
@@ -1116,8 +1694,8 @@ def _make_handler(
                     "contract": {
                         "source_of_truth": "Memos 日记 + 原文档案 + 情景卡",
                         "destructive": False,
-                        "changes_live_recall": False,
-                        "test0_policy": "test0 固定 Shadow，只观察，不改变 4.6.2 注入名单",
+                        "changes_live_recall": bool(getattr(plugin, "memory_access_takeover_enable", False)),
+                        "policy": "默认 Shadow；接管仅在人工确认评测全绿后追加 A/B 级精确命中",
                     },
                 })
                 self._json_ok(overview)
@@ -1179,6 +1757,111 @@ def _make_handler(
                 self._json_ok({"items": items, "count": len(items)})
             except Exception as exc:
                 self._json_err(str(exc), 400)
+
+        def _api_access_observations(self, qs):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            try:
+                limit = max(1, min(500, int((qs.get("limit") or [100])[0])))
+                offset = max(0, int((qs.get("offset") or [0])[0]))
+                changed_only = str((qs.get("changed") or [""])[0]).lower() in {"1", "true", "yes"}
+                rescued_only = str((qs.get("rescued") or [""])[0]).lower() in {"1", "true", "yes"}
+                query = str((qs.get("q") or [""])[0]).strip()
+                self._json_ok({
+                    "items": store.list_memory_access_observations(
+                        limit=limit, offset=offset, changed_only=changed_only,
+                        rescued_only=rescued_only, query=query,
+                    ),
+                    "summary_30d": store.memory_access_observation_summary(days=30),
+                    "summary_all": store.memory_access_observation_summary(days=0),
+                })
+            except (TypeError, ValueError) as exc:
+                self._json_err(str(exc), 400)
+            except Exception as exc:
+                self._json_err(str(exc), 500)
+
+        def _api_access_observation_detail(self, request_id: str):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            try:
+                detail = store.memory_access_observation_detail(request_id)
+                if detail is None:
+                    return self._json_err("评测记录不存在", 404)
+                self._json_ok(detail)
+            except Exception as exc:
+                self._json_err(str(exc), 500)
+
+        def _api_access_observation_feedback(self, body):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            try:
+                result = store.record_memory_access_observation_feedback(
+                    request_id=str(body.get("request_id") or ""),
+                    verdict=str(body.get("verdict") or ""),
+                    note=str(body.get("note") or ""),
+                )
+                self._json_ok(result)
+            except ValueError as exc:
+                self._json_err(str(exc), 400)
+            except Exception as exc:
+                self._json_err(str(exc), 500)
+
+        def _api_access_exports(self):
+            manager = getattr(plugin, "_access_export", None)
+            if manager is None:
+                return self._json_err("ACCESS 导出服务未就绪", 503)
+            try:
+                self._json_ok({"items": manager.list_archives()})
+            except Exception as exc:
+                self._json_err(str(exc), 500)
+
+        def _api_access_export(self):
+            store = self._access_store()
+            manager = getattr(plugin, "_access_export", None)
+            if store is None or manager is None:
+                return self._json_err("ACCESS 导出服务未就绪", 503)
+            try:
+                payload = store.memory_access_export_payload(
+                    observation_limit=int(getattr(plugin, "memory_access_observation_keep", 5000)),
+                )
+                self._json_ok(manager.create(
+                    payload, plugin_version=str(getattr(plugin, "_PLUGIN_VERSION", "?")),
+                ))
+            except Exception as exc:
+                self._json_err(str(exc), 500)
+
+        def _api_access_export_download(self, qs):
+            file_name = str((qs.get("file") or [""])[0]).strip()
+            manager = getattr(plugin, "_access_export", None)
+            if not file_name:
+                return self._json_err("缺少导出文件名", 400)
+            if manager is None:
+                return self._json_err("ACCESS 导出服务未就绪", 503)
+            try:
+                path = manager.archive_path(file_name)
+                self.send_response(200)
+                for key, value in _cors_headers().items():
+                    self.send_header(key, value)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", f'attachment; filename="{path.name}"')
+                self.send_header("Content-Length", str(path.stat().st_size))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                with path.open("rb") as stream:
+                    while True:
+                        chunk = stream.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+            except (ValueError, FileNotFoundError) as exc:
+                self._json_err(str(exc), 404)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as exc:
+                self._json_err(str(exc), 500)
 
         def _api_access_rebuild(self):
             try:
@@ -1245,6 +1928,323 @@ def _make_handler(
             except Exception as exc:
                 self._json_err(str(exc))
 
+        def _api_access_eval_cases(self, qs):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            try:
+                rows = store.list_memory_eval_cases(
+                    case_type=str((qs.get("case_type") or [""])[0]),
+                    enabled_only=str((qs.get("enabled_only") or ["1"])[0]) != "0",
+                    limit=int((qs.get("limit") or ["2000"])[0]),
+                )
+                case_types = {}
+                for row in rows:
+                    ct = str(row.get("case_type") or "general")
+                    case_types[ct] = case_types.get(ct, 0) + 1
+                self._json_ok({"cases": rows, "case_types": case_types, "total": len(rows)})
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_access_eval_run_latest(self):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            try:
+                run = store.latest_memory_eval_run()
+                self._json_ok({"run": run, "available": run is not None})
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_access_safety_gates(self):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            try:
+                gates = store.memory_access_safety_gates()
+                self._json_ok(gates)
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_access_eval_cases_generate(self, body):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            try:
+                result = store.generate_memory_eval_cases(replace=bool(body.get("replace", False)))
+                self._json_ok(result)
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_access_eval_case_enabled(self, body):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            case_id = str(body.get("case_id") or "").strip()
+            if not case_id:
+                return self._json_err("case_id 必填", 400)
+            enabled = bool(body.get("enabled", True))
+            try:
+                ok = store.set_memory_eval_case_enabled(case_id, enabled)
+                self._json_ok({"case_id": case_id, "enabled": enabled, "updated": ok})
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_access_eval_run(self, body):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            try:
+                loop = getattr(getattr(plugin, "_webui", None), "_loop", None)
+                if not loop or not loop.is_running():
+                    return self._json_err("event loop not available", 503)
+
+                def recall_fn(query, _top_k):
+                    future = asyncio.run_coroutine_threadsafe(
+                        plugin._eval_recall_query(str(query), top_k=None), loop,
+                    )
+                    data = future.result(timeout=90)
+                    candidates = list(data.get("hits") or [])
+                    selected = [
+                        str(item.get("memo_name") or "") for item in candidates
+                        if item.get("selected") and str(item.get("memo_name") or "")
+                    ]
+                    return candidates, selected
+
+                result = store.run_memory_eval(
+                    config=plugin._memory_access_config(),
+                    case_type=str(body.get("case_type") or ""),
+                    recall_fn=recall_fn,
+                    recalled_only=bool(body.get("confirmed_only", False)),
+                    scope=str(body.get("scope") or "calibration"),
+                )
+                self._json_ok({
+                    "run_id": result["run_id"],
+                    "cases_total": result["cases_total"],
+                    "cases_passed": result["cases_passed"],
+                    "gates": result["gates"],
+                    "algorithm_version": result["algorithm_version"],
+                    "confirmed_cases": int(result["gates"].get("eligible_cases") or 0),
+                    "real_recall_cases": int(result["gates"].get("real_recall_cases") or 0),
+                    "calibration": result["gates"].get("calibration") or {},
+                    "supervision_counts": result["gates"].get("supervision_counts") or {},
+                })
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_access_eval_run_results(self, body):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            run_id = str(body.get("run_id") or "").strip()
+            if not run_id:
+                return self._json_err("run_id 必填", 400)
+            try:
+                rows = store.memory_eval_run_results(run_id, limit=int(body.get("limit") or 500))
+                self._json_ok({"run_id": run_id, "results": rows})
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_access_eval_case_confirm(self, body):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            case_id = str(body.get("case_id") or "").strip()
+            if not case_id:
+                return self._json_err("case_id 必填", 400)
+            expected_memo = str(body.get("expected_memo") or "")
+            confirmed_by = str(body.get("confirmed_by") or "webui")
+            if not expected_memo.strip():
+                return self._json_err("expected_memo 必填", 400)
+            try:
+                ok = store.confirm_memory_eval_case(
+                    case_id, expected_memo=expected_memo, confirmed_by=confirmed_by,
+                )
+                self._json_ok({"case_id": case_id, "confirmed": ok})
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_access_takeover_reset(self):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            try:
+                ok = store.memory_access_reset_breaker()
+                self._json_ok({"reset": ok})
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_access_takeover_status(self):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            try:
+                access_config = getattr(plugin, "_memory_access_config", lambda: {})()
+                breaker = store.memory_access_breaker_status(
+                    config=access_config,
+                )
+                route_mode = str(getattr(plugin, "memory_access_route_mode", "shadow"))
+                prereq = {
+                    "eligible": route_mode == "supplement" and not bool(breaker.get("tripped")),
+                    "policy": "access_supplement_v1",
+                    "conditions": [
+                        {"key": "route_mode", "passed": route_mode == "supplement",
+                         "reason": f"当前路由 {route_mode}"},
+                        {"key": "breaker_clear", "passed": not bool(breaker.get("tripped")),
+                         "reason": "补充断路器正常" if not breaker.get("tripped") else "补充断路器已触发"},
+                        {"key": "baseline_preserved", "passed": True,
+                         "reason": "旧主召回完整保留，不移除、不替换"},
+                    ],
+                    "max_appends": int(getattr(plugin, "memory_access_supplement_max", 0)),
+                    "slots": {"T": 1, "A": 1},
+                }
+                recent = store.list_memory_takeover_log(limit=30, include_breaker=True)
+                decisions = [item for item in recent if not int(item.get("breaker_trip") or 0)]
+                supplement_decisions = [
+                    item for item in decisions if str(item.get("route_mode") or "") == "supplement"
+                ]
+                evaluated = [item for item in supplement_decisions if int(item.get("response_used", -1)) >= 0]
+                used = [item for item in evaluated if int(item.get("response_used") or 0) == 1]
+                self._json_ok({
+                    "prerequisites": prereq,
+                    "breaker": breaker,
+                    "recent": recent,
+                    "audit": {
+                        "appended": len(supplement_decisions),
+                        "pending": len(supplement_decisions) - len(evaluated),
+                        "evaluated": len(evaluated),
+                        "used": len(used),
+                        "use_rate": round(len(used) / max(1, len(evaluated)), 4),
+                        "slots": {
+                            "T": sum(1 for item in supplement_decisions if item.get("slot") == "T"),
+                            "A": sum(1 for item in supplement_decisions if item.get("slot") == "A"),
+                        },
+                        "policy": "access_supplement_v1",
+                    },
+                })
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        @staticmethod
+        def _forgetting_preset_payload(definitions):
+            return [
+                {
+                    "id": preset_id,
+                    "name": definition["name"],
+                    "summary": definition["summary"],
+                    "cost": definition["cost"],
+                    "values": _safe_preset_values(definition.get("values")),
+                }
+                for preset_id, definition in definitions.items()
+            ]
+
+        def _api_forgetting_presets(self):
+            self._json_ok({
+                "items": self._forgetting_preset_payload(forgetting_preset_definitions),
+                "contract": {
+                    "numeric_and_mode_only": True,
+                    "stage": "supplement",
+                    "baseline_recall_preserved": True,
+                    "protected_fields_untouched": True,
+                },
+            })
+
+        def _api_forgetting_overview(self):
+            store = self._access_store()
+            runtime = dict(getattr(plugin, "_memory_access_state", {}) or {})
+            fail_open = dict(getattr(plugin, "_memory_access_fail_open", {}) or {})
+            llm_runtime = getattr(plugin, "_llm_runtime", None)
+            llm_snapshot = llm_runtime.snapshot() if llm_runtime is not None else {}
+            if store is None:
+                return self._json_ok({
+                    "ready": False,
+                    "version": getattr(plugin, "_PLUGIN_VERSION", "?"),
+                    "reason": "4.6 原文库尚未就绪；正式召回保持可用",
+                    "runtime": runtime,
+                    "llm_runtime": llm_snapshot,
+                    "fail_open": fail_open,
+                    "presets": self._forgetting_preset_payload(forgetting_preset_definitions),
+                })
+            try:
+                overview = dict(store.memory_access_overview() or {})
+                access_config = getattr(plugin, "_memory_access_config", lambda: {})()
+                breaker = store.memory_access_breaker_status(config=access_config)
+                route_mode = str(getattr(plugin, "memory_access_route_mode", "shadow"))
+                takeover = {
+                    "prerequisites": {
+                        "eligible": route_mode == "supplement" and not bool(breaker.get("tripped")),
+                        "policy": "access_supplement_v1",
+                        "route_mode": route_mode,
+                        "max_appends": int(getattr(plugin, "memory_access_supplement_max", 0)),
+                    },
+                    "breaker": breaker,
+                }
+                recent_events = store.list_memory_access_events(limit=80)
+                overview.update({
+                    "ready": True,
+                    "version": getattr(plugin, "_PLUGIN_VERSION", "?"),
+                    "runtime": runtime,
+                    "llm_runtime": llm_snapshot,
+                    "fail_open": fail_open,
+                    "takeover": takeover,
+                    "recent_events": recent_events,
+                    "presets": self._forgetting_preset_payload(forgetting_preset_definitions),
+                    "settings": {
+                        key: getattr(plugin, key, None)
+                        for key in sorted(next(
+                            values for name, values in setting_groups.items()
+                            if name == "记忆可达性与补充支路"
+                        ))
+                    },
+                    "contract": {
+                        "destructive": False,
+                        "source_of_truth_unchanged": True,
+                        "baseline_recall_preserved": True,
+                        "route_mode": route_mode,
+                        "online_supplement": route_mode == "supplement",
+                        "max_online_append": int(getattr(plugin, "memory_access_supplement_max", 0)),
+                        "slots": {"T": 1, "A": 1},
+                    },
+                })
+                self._json_ok(overview)
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_forgetting_preset(self, body):
+            preset_id = str(body.get("preset") or "").strip()
+            preset = forgetting_preset_definitions.get(preset_id)
+            if not preset:
+                return self._json_err("未知遗忘预设", 400)
+            try:
+                values = _safe_preset_values(preset.get("values"))
+                result = self._save_settings_values(values, f"forgetting_preset:{preset_id}")
+                result["preset"] = {"id": preset_id, "name": preset["name"]}
+                result["route_mode"] = values.get("memory_access_route_mode", "supplement")
+                self._json_ok(result)
+            except ValueError as exc:
+                self._json_err(str(exc), 400)
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_forgetting_feedback(self, body):
+            store = self._access_store()
+            if store is None:
+                return self._json_err("情景记忆库未就绪", 503)
+            memo_name = str(body.get("memo_name") or "").strip()
+            action = str(body.get("action") or "").strip()
+            if not memo_name or not action:
+                return self._json_err("memo_name 与 action 必填", 400)
+            try:
+                result = store.record_memory_access_feedback(
+                    memo_name=memo_name, action=action,
+                    note=str(body.get("note") or ""),
+                )
+                self._json_ok(result)
+            except ValueError as exc:
+                self._json_err(str(exc), 400)
+            except Exception as exc:
+                self._json_err(str(exc))
+
         def _api_production_overview(self, qs):
             """Return one coherent production snapshot for the dedicated dashboard tab."""
             store = self._production_store()
@@ -1270,14 +2270,18 @@ def _make_handler(
                 snapshots = self._production_list(
                     store.list_snapshots(limit=10) if callable(getattr(store, "list_snapshots", None)) else []
                 )
-                rollbacks = self._production_list(
+                rollbacks = [self._public_production_rollback(item) for item in self._production_list(
                     store.rollback_history(limit=30) if callable(getattr(store, "rollback_history", None)) else []
-                )
-                previews = self._production_list(
+                )]
+                previews = [self._public_production_preview(item) for item in self._production_list(
                     store.list_diary_previews(limit=30) if callable(getattr(store, "list_diary_previews", None)) else []
-                )
+                )]
                 long_helper = getattr(plugin, "_long_diaries_list", None)
                 long_diaries = self._production_list(long_helper() if callable(long_helper) else [])
+                repair_helper = getattr(plugin, "_fallback_repair_candidates", None)
+                fallback_repairs = self._production_list(
+                    repair_helper() if callable(repair_helper) else []
+                )
 
                 totals = {
                     "batches": int(stats.get("source_batches") or 0),
@@ -1414,6 +2418,8 @@ def _make_handler(
                     "snapshot_count": len(snapshots),
                     "long_diaries": long_diaries[:50],
                     "long_diaries_count": len(long_diaries),
+                    "fallback_repairs": fallback_repairs[:100],
+                    "fallback_repair_count": len(fallback_repairs),
                     "previews": previews,
                     "rollback_count": int(stats.get("rollbacks") or len(rollbacks)),
                     "rollbacks": rollbacks,
@@ -1510,11 +2516,26 @@ def _make_handler(
             except Exception as exc:
                 self._json_err(str(exc))
 
+        def _api_production_fallback_repairs(self, qs):
+            try:
+                limit = max(1, min(500, int(qs.get("limit", ["100"])[0] or 100)))
+                helper = getattr(plugin, "_fallback_repair_candidates", None)
+                items = helper(limit=limit) if callable(helper) else []
+                self._json_ok({
+                    "items": self._production_list(items),
+                    "total": len(items),
+                    "available": callable(helper),
+                })
+            except (TypeError, ValueError) as exc:
+                self._json_err(str(exc), 400)
+            except Exception as exc:
+                self._json_err(str(exc))
+
         def _api_production_rollbacks(self):
             store = self._production_store()
             try:
                 items = store.rollback_history(limit=50) if store is not None and callable(getattr(store, "rollback_history", None)) else []
-                self._json_ok({"rollbacks": self._production_list(items), "available": store is not None})
+                self._json_ok({"rollbacks": [self._public_production_rollback(item) for item in self._production_list(items)], "available": store is not None})
             except Exception as exc:
                 self._json_err(str(exc))
 
@@ -1522,7 +2543,7 @@ def _make_handler(
             store = self._production_store()
             try:
                 items = store.list_diary_previews(limit=50) if store is not None and callable(getattr(store, "list_diary_previews", None)) else []
-                self._json_ok({"previews": self._production_list(items), "available": store is not None})
+                self._json_ok({"previews": [self._public_production_preview(item) for item in self._production_list(items)], "available": store is not None})
             except Exception as exc:
                 self._json_err(str(exc))
 
@@ -1547,7 +2568,7 @@ def _make_handler(
                 return self._json_err("缺少 episode_id", 400)
             try:
                 result = self._run_plugin_coro(self._production_helper("_create_diary_rewrite_preview")(episode_id), timeout=300)
-                self._json_ok(result)
+                self._json_ok(self._public_production_preview(result))
             except RuntimeError as exc:
                 self._json_err(str(exc), 503)
             except Exception as exc:
@@ -1870,6 +2891,18 @@ def _make_handler(
 
         @staticmethod
         def _setting_group(key: str) -> str:
+            if key.startswith("generation_v2_"):
+                return "6.1 生产交接"
+            if key.startswith(("thread_", "consistency_")):
+                return "记忆脉络与一致性"
+            if key.startswith("data_backup_") or key == "db_snapshot_keep":
+                return "数据备份"
+            if key.startswith(("webui_", "diagnostic_")):
+                return "界面与诊断"
+            if key.startswith(("retry_", "reconcile_", "enable_auto_reconcile")):
+                return "同步与网络"
+            if key in {"emb_cache_size", "recall_embed_timeout", "recall_search_timeout", "rerank_timeout"}:
+                return "检索运行"
             for group, keys in setting_groups.items():
                 if key in keys:
                     return group
@@ -1885,6 +2918,9 @@ def _make_handler(
 
         @staticmethod
         def _llm_provider_options(current: Any = "") -> list[dict[str, str]]:
+            resolver = getattr(plugin, "_chat_provider_options", None)
+            if callable(resolver):
+                return resolver(current)
             options: list[dict[str, str]] = [
                 {"value": "", "label": "跟随当前会话模型"}
             ]
@@ -1931,15 +2967,18 @@ def _make_handler(
             }
             return [{"value": value, "label": label} for value, label in choices.get(key, [])]
 
-        def _api_settings(self):
+        def _api_settings(self, scheduling=False):
             try:
+                from .model_tasks import is_model_setting
                 schema = self._settings_schema()
                 config = getattr(plugin, "config", {})
                 items = []
                 for key, meta in schema.items():
                     if not isinstance(meta, dict):
                         continue
-                    if key in time_insight_setting_keys or key == "time_insight_max_age_days":
+                    if scheduling and not is_model_setting(key):
+                        continue
+                    if not scheduling and (key in time_insight_setting_keys or key == "time_insight_max_age_days"):
                         continue
                     sensitive = self._is_sensitive_setting(key)
                     current = config.get(key, meta.get("default")) if hasattr(config, "get") else meta.get("default")
@@ -1953,6 +2992,7 @@ def _make_handler(
                         "configured": bool(current) if sensitive else True,
                         "sensitive": sensitive,
                         "group": self._setting_group(key),
+                        "scheduling": is_model_setting(key),
                         "options": self._setting_options(key, meta, current),
                         "min": meta.get("min"),
                         "max": meta.get("max"),
@@ -2012,6 +3052,8 @@ def _make_handler(
         def _save_settings_values(self, incoming: dict[str, Any], source: str) -> dict[str, Any]:
             if not isinstance(incoming, dict) or not incoming:
                 raise ValueError("没有需要保存的设置")
+            from .thread_policy import FIELDS, hot_apply, validate
+            validate(incoming, plugin, manual=source == "manual")
             schema = self._settings_schema()
             config = getattr(plugin, "config", None)
             if config is None or not hasattr(config, "get"):
@@ -2046,7 +3088,9 @@ def _make_handler(
                 "webui_enable", "webui_host", "webui_port", "enable_auto_reconcile",
                 "reconcile_interval", "profile_auto_update_days", "context_archive_interval_days",
                 "data_backup_enable", "data_backup_interval_days", "data_backup_keep",
-                "data_backup_dir",
+                "data_backup_dir", "llm_runtime_provider_concurrency",
+                "llm_runtime_external_concurrency", "llm_runtime_interactive_queue_timeout",
+                "llm_runtime_foreground_lease_seconds", "llm_runtime_defer_background",
             }
             restart_prefixes = ("managed_memos_",)
             restart_required = sorted(
@@ -2071,6 +3115,10 @@ def _make_handler(
                     if key not in restart_required and hasattr(plugin, key):
                         setattr(plugin, key, value)
                         hot_applied.append(key)
+                hot_apply(plugin, {key: value for key, value in coerced.items() if key in FIELDS})
+                insight=getattr(plugin,'_time_insight',None)
+                if insight is not None and any(k.startswith('time_insight_') for k in coerced):
+                    insight.apply_settings()
                 if "emb_cache_size" in hot_applied:
                     while len(getattr(plugin, "_emb_cache", {})) > max(0, int(plugin.emb_cache_size)):
                         plugin._emb_cache.popitem(last=False)
@@ -2094,6 +3142,205 @@ def _make_handler(
                 self._json_err(str(e), 400)
             except Exception as e:
                 self._json_err(str(e))
+
+        @staticmethod
+        def _models_registry():
+            registry = getattr(plugin, "_external_models", None)
+            if registry is None:
+                raise RuntimeError("外置模型池未加载")
+            return registry
+
+        def _api_models(self):
+            try:
+                data = self._models_registry().payload()
+                data["plugin_version"] = getattr(plugin, "_PLUGIN_VERSION", "?")
+                data["astr_fallback_active"] = not bool(data.get("enabled"))
+                from .llm_compensation import TASK_OPTIONS
+                from .model_tasks import TASKS
+                data['task_route_options']=[{'value':key,'label':label,'family':family} for key,label,family in TASKS]
+                from .generation_v2.model_probe import provider_options
+                data['probe_provider_options'] = provider_options(plugin)
+                data["followup_task_options"] = [
+                    {"value": key, "label": label} for key, label in TASK_OPTIONS
+                ]
+                data["notice"] = (
+                    "模型池接管与 Astr 故障跟接互相独立；主回复、Embedding 与 rerank 不变。"
+                )
+                self._json_ok(data)
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_model_calls(self):
+            runtime = getattr(plugin, "_llm_runtime", None)
+            from .generation_v2.model_probe import call_records
+            records = list(getattr(plugin, "_llm_call_events", [])[-120:]) + call_records(plugin)
+            self._json_ok({
+                "calls": sorted(records, key=lambda r: float(r.get('ts', 0)))[-120:],
+                "runtime": runtime.snapshot() if runtime is not None else {},
+            })
+
+        def _api_compensation(self):
+            store = getattr(plugin, "_llm_compensation", None)
+            self._json_ok({
+                "items": store.list(150) if store is not None else [],
+                "available": store is not None,
+            })
+
+        def _api_compensation_write(self, path: str, body: dict[str, Any]):
+            store = getattr(plugin, "_llm_compensation", None)
+            if store is None:
+                return self._json_err("补偿队列未就绪", 503)
+            record_id = str((body or {}).get("id") or "").strip()
+            if not record_id or store.get(record_id) is None:
+                return self._json_err("请求不存在", 404)
+            if path == "/api/compensation/dismiss":
+                row = store.get(record_id) or {}
+                if str(row.get("status") or "") == "running":
+                    return self._json_err("后台补偿正在运行，不能忽略", 409)
+                store.update(record_id, "dismissed", increment_attempt=False)
+                return self._json_ok({"id": record_id, "status": "dismissed"})
+            if path == "/api/compensation/restore":
+                try:
+                    result = self._run_plugin_coro(
+                        plugin._start_llm_compensation(record_id), timeout=15,
+                    )
+                    return self._json_ok(result)
+                except Exception as exc:
+                    return self._json_err(str(exc), self._plugin_coro_error_status(exc))
+            return self._json_err("未知补偿操作", 404)
+
+        def _api_production_fallback_repair_preview(self, body):
+            episode_id = str((body or {}).get("episode_id") or "").strip()
+            if not episode_id:
+                return self._json_err("缺少 episode_id", 400)
+            try:
+                helper = self._production_helper("_create_fallback_repair_preview")
+                result = self._run_plugin_coro(helper(episode_id), timeout=420)
+                self._json_ok(self._public_production_preview(result))
+            except RuntimeError as exc:
+                self._json_err(str(exc), 503)
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_production_fallback_repair_confirm(self, body):
+            preview_id = str((body or {}).get("preview_id") or "").strip()
+            if not preview_id:
+                return self._json_err("缺少 preview_id", 400)
+            try:
+                helper = self._production_helper("_confirm_fallback_repair")
+                result = self._run_plugin_coro(helper(preview_id), timeout=420)
+                self._json_ok(result)
+            except RuntimeError as exc:
+                self._json_err(str(exc), 503)
+            except Exception as exc:
+                self._json_err(str(exc))
+
+        def _api_models_write(self, path: str, body: dict[str, Any]):
+            try:
+                registry = self._models_registry()
+                if path == '/api/models/probe':
+                    from .generation_v2.model_probe import probe
+                    return self._json_ok(self._run_plugin_coro(probe(plugin, body), timeout=1840))
+                if path == "/api/models/save":
+                    data = registry.save(body)
+                    if hasattr(plugin, "_log_event"):
+                        plugin._log_event("system", "外置模型池设置已保存", {
+                            "enabled": data.get("enabled"),
+                            "models": len(data.get("models") or []),
+                            "astr_followup_enabled": data.get("astr_followup_enabled"),
+                            "astr_followup_model_id": data.get("astr_followup_model_id"),
+                            "astr_followup_tasks": list(data.get("astr_followup_tasks") or []),
+                            "persisted": data.get("persisted"),
+                        })
+                    return self._json_ok(data)
+                if path == "/api/models/test":
+                    model_id = str(body.get("model_id") or "").strip()
+                    data = self._run_plugin_coro(
+                        registry.test_model(model_id, float(body.get("timeout") or 20)),
+                        timeout=50,
+                    )
+                    return self._json_ok(data)
+                self._json_err("未知模型池操作", 404)
+            except ValueError as exc:
+                self._json_err(str(exc), 400)
+            except Exception as exc:
+                self._json_err(str(exc), self._plugin_coro_error_status(exc))
+
+        def _api_threads_policy(self, body: dict[str, Any]):
+            from .thread_policy import PRESETS, rollback, switch
+            try:
+                action = str(body.get("action") or "switch")
+                confirmed = body.get("confirm") is True
+                revision = body.get("expected_revision")
+                if action == "preset":
+                    name = str(body.get("preset") or "")
+                    if name not in PRESETS:
+                        raise ValueError("unknown preset")
+                    result = switch(
+                        plugin, dict(PRESETS[name]), source="preset:" + name,
+                        manual=confirmed, expected_revision=revision,
+                    )
+                elif action == "rollback":
+                    result = rollback(
+                        plugin, expected_revision=revision, manual=confirmed,
+                    )
+                elif action == "switch":
+                    result = switch(
+                        plugin, body.get("values") or {}, source="manual",
+                        manual=confirmed, expected_revision=revision,
+                    )
+                else:
+                    raise ValueError("unknown action")
+                self._json_ok(result)
+            except ValueError as exc:
+                self._json_err(str(exc), 400)
+            except Exception as exc:
+                self._json_err(str(exc), 503)
+
+        def _api_threads_maintenance(self, body: dict[str, Any]):
+            try:
+                episodes = getattr(plugin, "_episodes", None)
+                if episodes is None or episodes._threads is None:
+                    raise RuntimeError("thread layer unavailable")
+                action = str(body.get("action") or "")
+                scope = str(getattr(plugin, "character_name", "default") or "default")
+                if action == "scan":
+                    from .thread_migration import ThreadMigration
+                    result = ThreadMigration(
+                        episodes._connect, episodes._lock, episodes._threads,
+                    ).run_scan(
+                        scope_id=scope, read_only=True, enqueue_existing=False,
+                        batch_size=100, max_batches=1,
+                    )
+                elif action == "build":
+                    from .thread_builder import ThreadBuilder
+                    if episodes.thread_is_paused():
+                        raise ValueError("resume before building")
+                    result = ThreadBuilder(
+                        episodes._threads, episodes._connect, episodes._lock,
+                    ).process_batch(batch_size=10)
+                elif action == "project":
+                    from .thread_projector import ThreadProjector
+                    ids = body.get("episode_ids")
+                    if (
+                        not isinstance(ids, list)
+                        or not 1 <= len(ids) <= 50
+                        or not all(isinstance(item, str) and item for item in ids)
+                    ):
+                        raise ValueError("select 1..50 episode nodes")
+                    result = ThreadProjector(
+                        episodes._threads,
+                        min_confidence=float(
+                            getattr(plugin, "thread_projection_min_confidence", .84)
+                        ),
+                    ).project(scope_id=scope, episode_ids=ids)
+                else:
+                    raise ValueError("unknown maintenance action")
+                self._json_ok(result)
+            except ValueError as exc:
+                self._json_err(str(exc), 400)
+            except Exception as exc:
+                self._json_err(str(exc), 503)
 
         def _api_settings_preset(self, body: dict[str, Any]):
             preset_id = str(body.get("preset") or "").strip()
@@ -2505,17 +3752,9 @@ def _make_handler(
                     top_k = int(qs.get("top_k", ["0"])[0]) or None
                 except Exception:
                     top_k = None
-                main_loop = getattr(getattr(plugin, "_webui", None), "_loop", None)
-                if main_loop and main_loop.is_running():
-                    future = asyncio.run_coroutine_threadsafe(
-                        plugin._eval_recall_query(query, top_k=top_k),
-                        main_loop,
-                    )
-                    data = future.result(timeout=60)
-                else:
-                    loop = asyncio.new_event_loop()
-                    data = loop.run_until_complete(plugin._eval_recall_query(query, top_k=top_k))
-                    loop.close()
+                data = self._run_plugin_coro(
+                    plugin._eval_recall_query(query, top_k=top_k), timeout=60,
+                )
                 self._json_ok(data)
             except Exception as e:
                 self._json_err(str(e))
@@ -2673,12 +3912,25 @@ def _make_handler(
                     return self._json_err("LLM provider not available", 503)
                 name = getattr(prov, "provider_id", "unknown")
                 t0 = time.time()
-                resp = self._run_plugin_coro(prov.text_chat(prompt="ping", contexts=[], system_prompt=""), timeout=30)
+                caller = getattr(plugin, "_plugin_llm_text_chat", None)
+                if callable(caller):
+                    probe = caller(
+                        prov,
+                        prompt="ping",
+                        contexts=[],
+                        system_prompt="",
+                        timeout=29,
+                        label="webui_llm_probe",
+                        optional=False,
+                    )
+                else:
+                    probe = prov.text_chat(prompt="ping", contexts=[], system_prompt="")
+                resp = self._run_plugin_coro(probe, timeout=30)
                 cost = (time.time() - t0) * 1000
                 text = getattr(resp, "completion_text", "") or ""
                 self._json_ok({"provider": name, "ms": round(cost, 1), "response_len": len(text)})
             except Exception as e:
-                self._json_err(str(e))
+                self._json_err(str(e), self._plugin_coro_error_status(e))
 
         def _api_test_emb(self):
             try:
@@ -2691,7 +3943,7 @@ def _make_handler(
                 cost = (time.time() - t0) * 1000
                 self._json_ok({"provider": name, "ms": round(cost, 1), "dim": len(vec), "first5": [round(x, 4) for x in vec[:5]]})
             except Exception as e:
-                self._json_err(str(e))
+                self._json_err(str(e), self._plugin_coro_error_status(e))
 
         def _api_test_rerank(self):
             try:
@@ -3040,11 +4292,22 @@ def _make_handler(
             if main_loop and main_loop.is_running():
                 future = asyncio.run_coroutine_threadsafe(coro, main_loop)
                 return future.result(timeout=timeout)
-            loop = asyncio.new_event_loop()
             try:
-                return loop.run_until_complete(coro)
-            finally:
-                loop.close()
+                closer = getattr(coro, "close", None)
+                if callable(closer):
+                    closer()
+            except Exception:
+                pass
+            raise RuntimeError("AstrBot 主事件循环不可用，请等待插件初始化或重新加载")
+
+        @staticmethod
+        def _plugin_coro_error_status(exc: BaseException) -> int:
+            text = str(exc).lower()
+            return 503 if (
+                "主事件循环不可用" in str(exc)
+                or "timeout" in text or "timed out" in text
+                or "provider" in text or "circuit" in text
+            ) else 500
 
         def _xinchao_controller(self):
             controller = getattr(plugin, "_xinchao", None)
@@ -3078,7 +4341,7 @@ def _make_handler(
             try:
                 controller = self._xinchao_controller()
                 self._json_ok({
-                    "settings": dict(controller.settings),
+                    "settings": controller.settings_payload(),
                     "providerOptions": controller.provider_options(),
                 })
             except Exception as e:
@@ -3093,8 +4356,15 @@ def _make_handler(
                     if not isinstance(settings, dict):
                         return self._json_err("settings 必须是对象", 400)
                     return self._json_ok({"settings": controller.save_settings(settings)})
+                if path == "/api/xinchao/settings/test-api":
+                    data = self._run_plugin_coro(controller.test_perception_api(), timeout=55)
+                    return self._json_ok(data)
                 if path == "/api/xinchao/settle":
-                    data = self._run_plugin_coro(controller.settle_now(key), timeout=20)
+                    settle_timeout = max(
+                        30.0,
+                        float(controller.settings.get("post_perception_timeout_seconds") or 90) + 15.0,
+                    )
+                    data = self._run_plugin_coro(controller.settle_now(key), timeout=settle_timeout)
                 elif path == "/api/xinchao/feedback":
                     data = self._run_plugin_coro(
                         controller.feedback(key, str(body.get("drive") or ""), float(body.get("delta") or 0)),
@@ -3370,6 +4640,7 @@ def _make_handler(
         def _api_console_stats(self):
             try:
                 keys = ["current_time", "semantic_state", "profile", "time_insight", "diary", "event_core", "evidence", "memory_structure", "xinchao", "enhancer", "context", "other_extra"]
+                overlay_keys = ["access_supplement"]
                 rows = []
                 for source in list(getattr(plugin, "_last_injection_stats", []) or [])[-80:]:
                     row = dict(source) if isinstance(source, dict) else {}
@@ -3379,15 +4650,15 @@ def _make_handler(
                     row["composition"] = composition
                     row["total_est_chars"] = sum(int(composition.get(key) or 0) for key in keys)
                     rows.append(row)
-                totals = {k: 0 for k in keys}
+                totals = {k: 0 for k in keys + overlay_keys}
                 for row in rows:
                     comp = row.get("composition", {}) if isinstance(row, dict) else {}
-                    for k in keys:
+                    for k in keys + overlay_keys:
                         try:
                             totals[k] += int(comp.get(k) or 0)
                         except Exception:
                             pass
-                total_chars = sum(totals.values())
+                total_chars = sum(int(totals.get(key) or 0) for key in keys)
                 events = [
                     event for event in (getattr(plugin, "_log_events", []) or [])
                     if isinstance(event, dict) and event.get("category") != "kb_cache"
@@ -3419,6 +4690,8 @@ def _make_handler(
                         "time_insight": bool(getattr(plugin, "enable_time_insight_affiliate", False)),
                         "xinchao": bool(getattr(getattr(plugin, "_xinchao", None), "settings", {}).get("enable", False)),
                         "managed_memos": getattr(plugin, "memos_mode", "external") == "managed",
+                        "access_supplement": str(getattr(plugin, "memory_access_route_mode", "shadow")) == "supplement",
+                        "llm_runtime": True,
                     },
                     "latest_runtime": {
                         "enhancer": list(rp_stats.values())[-1] if rp_stats else {},
@@ -3432,6 +4705,10 @@ def _make_handler(
                             else {}
                         ),
                         "managed_memos": plugin._managed_memos.as_dict() if hasattr(plugin, "_managed_memos") else {"mode": "external"},
+                        "llm_runtime": (
+                            plugin._llm_runtime.snapshot()
+                            if getattr(plugin, "_llm_runtime", None) is not None else {}
+                        ),
                     },
                     "log_total": len(events),
                     "telemetry": {
@@ -3527,6 +4804,59 @@ class WebUIServer:
                 if (here / "access.html").exists()
                 else "<h1>access.html missing</h1>"
             )
+            forgetting_html = (
+                (here / "forgetting.html").read_text(encoding="utf-8")
+                if (here / "forgetting.html").exists()
+                else "<h1>forgetting.html missing</h1>"
+            )
+            models_html = (
+                (here / "models.html").read_text(encoding="utf-8")
+                if (here / "models.html").exists()
+                else "<h1>models.html missing</h1>"
+            )
+            compensation_html = (
+                (here / "compensation.html").read_text(encoding="utf-8")
+                if (here / "compensation.html").exists()
+                else "<h1>compensation.html missing</h1>"
+            )
+            house_html = (
+                (here / "house.html").read_text(encoding="utf-8")
+                if (here / "house.html").exists()
+                else "<h1>house.html missing</h1>"
+            )
+            house_assets = {}
+            for name in (
+                "house-courtyard.png", "house-courtyard-dawn.png",
+                "house-courtyard-dusk.png", "house-courtyard-night.png",
+                "house-character-atlas-a.png",
+                "house-character-atlas-b.png", "house-character-atlas-c.png",
+                "house-character-atlas-d.png",
+                "house-character-fan.png", "house-character-letter.png",
+                "house-character-tea.png", "house-character-desk.png",
+                "house-character-window.png", "house-character-chest.png",
+                "house-character-playful.png", "house-character-reading.png",
+                "house-character-lantern.png", "house-character-wistful.png",
+                "house-character-flowers.png", "house-character-steps.png",
+                "house-character-yawn.png", "house-character-lean.png",
+                "house-character-book.png", "house-character-cup.png",
+                "house-character-court-smile.png",
+                "house-character-court-surprised.png",
+                "house-character-court-soft.png",
+                "house-character-rig.js",
+                "house-live2d.js",
+                "workbench.css", "workbench.js", "scheduling.js", "lucide.min.js", "atelier.css",
+            ):
+                path = here / "assets" / name
+                if path.exists():
+                    house_assets[name] = path.read_bytes()
+            for folder in ("live2d", "vendor"):
+                root = here / "assets" / folder
+                if not root.exists():
+                    continue
+                for path in root.rglob("*"):
+                    if path.is_file():
+                        relative = path.relative_to(here / "assets").as_posix()
+                        house_assets[relative] = path.read_bytes()
 
             handler_cls = _make_handler(
                 self.plugin,
@@ -3535,12 +4865,23 @@ class WebUIServer:
                 xinchao_html,
                 production_html,
                 access_html,
+                forgetting_html,
+                models_html,
+                house_html,
+                house_assets,
+                compensation_html,
             )
             self._server = ThreadingHTTPServer(
                 (self.plugin.webui_host, self.plugin.webui_port),
                 handler_cls,
             )
             self._loop = asyncio.get_event_loop()
+            # Register before the HTTP thread can accept requests.  The normal
+            # plugin startup path also assigns this field after start(), but
+            # direct starts and hot-reload handoffs need the main-loop bridge
+            # to be available from the very first request.
+            if getattr(self.plugin, "_webui", None) in (None, self):
+                self.plugin._webui = self
             self._thread = threading.Thread(
                 target=self._server.serve_forever,
                 name="MemosMemoryWebUI",
@@ -3567,10 +4908,16 @@ class WebUIServer:
         registry = getattr(builtins, "_astrbot_memos_webui_servers", None)
         if isinstance(registry, dict) and registry.get(self._registry_key) is self:
             registry.pop(self._registry_key, None)
+        if getattr(self.plugin, "_webui", None) is self:
+            self.plugin._webui = None
 
     def _build_console_html(self) -> str:
         ver = getattr(self.plugin, "_PLUGIN_VERSION", "?")
-        return _CONSOLE_HTML_V2.replace("{{VERSION}}", ver)
+        return _CONSOLE_HTML_V2.replace("{{VERSION}}", ver).replace("</head>",
+            '<link rel="stylesheet" href="/assets/workbench.css?v=610blue1">'
+            '<link rel="stylesheet" href="/assets/atelier.css?v=610blue1">'
+            '<script src="/assets/lucide.min.js" defer></script>'
+            '<script src="/assets/workbench.js?v=610blue1" defer></script></head>')
 
 
 _CONSOLE_HTML_V2 = """<!DOCTYPE html>
@@ -3587,8 +4934,8 @@ body{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Microsoft YaHei",mo
 .stats{display:grid;grid-template-columns:repeat(8,minmax(112px,1fr));gap:8px;margin-bottom:12px}.metric{background:rgba(15,23,37,.78);border:1px solid var(--line);border-radius:9px;padding:10px 12px;color:var(--muted)}.metric span{display:block;font-size:21px;line-height:1.1;margin-top:4px;color:#fff;font-weight:760;font-variant-numeric:tabular-nums}
 .grid{display:grid;grid-template-columns:1.05fr 1fr;gap:12px;margin-bottom:12px}.panel{background:rgba(15,23,37,.86);border:1px solid var(--line);border-radius:10px;padding:12px;box-shadow:0 24px 80px rgba(0,0,0,.24)}.panel-title{display:flex;justify-content:space-between;align-items:center;color:#fff;font-size:13px;font-weight:760;margin-bottom:10px}.muted{color:var(--muted)}
 .mix{display:grid;gap:8px}.mix-row{display:grid;grid-template-columns:92px 1fr 86px;gap:9px;align-items:center}.mix-name{color:#c7d2e3}.mix-val{color:#fff;text-align:right;font-variant-numeric:tabular-nums}.bar{height:9px;background:#0b1220;border:1px solid #1b293d;border-radius:999px;overflow:hidden}.fill{height:100%;width:0;background:var(--blue)}.fill.current_time{background:#f97316}.fill.semantic_state{background:#22c55e}.fill.profile{background:var(--violet)}.fill.diary{background:var(--amber)}.fill.event_core{background:#fb7185}.fill.evidence{background:#38bdf8}.fill.memory_structure{background:#94a3b8}.fill.time_insight{background:var(--cyan)}.fill.xinchao{background:#e879f9}.fill.enhancer{background:var(--green)}.fill.context{background:var(--blue)}.fill.other_extra{background:var(--pink)}
-.mini-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px}.mini{border:1px solid var(--line2);border-radius:7px;padding:8px;color:var(--muted);background:#0c1421}.mini b{display:block;color:#fff;font-size:15px;margin-top:2px;font-variant-numeric:tabular-nums}.state-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.state{border:1px solid var(--line2);border-radius:8px;background:#0c1421;padding:9px}.state strong{display:flex;align-items:center;justify-content:space-between;color:#fff;margin-bottom:6px}.dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:#64748b}.dot.on{background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.14)}.dot.off{background:#ef4444;box-shadow:0 0 0 3px rgba(239,68,68,.12)}.state pre{white-space:pre-wrap;color:#aebcd0;font-size:11px;line-height:1.45}
-.inject-table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}.inject-table th,.inject-table td{border-bottom:1px solid var(--line2);padding:7px 6px;text-align:right;white-space:nowrap}.inject-table th:first-child,.inject-table td:first-child{text-align:left}.inject-table th{color:var(--muted);font-weight:600}.inject-table td{color:#d9e5f5}
+.mini-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:10px}.mini{border:1px solid var(--line2);border-radius:7px;padding:8px;color:var(--muted);background:#0c1421}.mini b{display:block;color:#fff;font-size:15px;margin-top:2px;font-variant-numeric:tabular-nums}.state-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.state{border:1px solid var(--line2);border-radius:8px;background:#0c1421;padding:9px}.state strong{display:flex;align-items:center;justify-content:space-between;color:#fff;margin-bottom:6px}.dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:#64748b}.dot.on{background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.14)}.dot.off{background:#ef4444;box-shadow:0 0 0 3px rgba(239,68,68,.12)}.state pre{white-space:pre-wrap;color:#aebcd0;font-size:11px;line-height:1.45}
+#inject-table{max-width:100%;overflow-x:auto}.inject-table{width:100%;min-width:716px;border-collapse:collapse;font-variant-numeric:tabular-nums}.inject-table th,.inject-table td{border-bottom:1px solid var(--line2);padding:7px 6px;text-align:right;white-space:nowrap}.inject-table th:first-child,.inject-table td:first-child{text-align:left}.inject-table th{color:var(--muted);font-weight:600}.inject-table td{color:#d9e5f5}
 .filter-bar{display:flex;gap:7px;margin-bottom:12px;flex-wrap:wrap;align-items:center;background:rgba(15,23,37,.72);border:1px solid var(--line);border-radius:10px;padding:10px}.filter-bar button.active{background:#1d4ed8;color:#fff;border-color:#3b82f6}label{color:var(--muted)}input[type=checkbox]{accent-color:#3b82f6}
 #log-list{background:rgba(15,23,37,.86);border-radius:10px;border:1px solid var(--line);max-height:calc(100vh - 610px);min-height:260px;overflow-y:auto;box-shadow:0 24px 80px rgba(0,0,0,.25)}.log-entry{padding:8px 12px;border-bottom:1px solid var(--line2);display:grid;grid-template-columns:86px 92px 1fr;gap:10px;align-items:flex-start;line-height:1.45}.log-entry:hover{background:#111d2f}.log-entry:last-child{border-bottom:none}.log-cat{display:inline-block;padding:2px 8px;border-radius:5px;font-size:11px;font-weight:760;min-width:72px;text-align:center;text-transform:uppercase;letter-spacing:.3px}.cat-xinchao{background:rgba(232,121,249,.12);color:#f0abfc;border:1px solid rgba(232,121,249,.26)}.cat-enhancer{background:rgba(52,211,153,.12);color:var(--green);border:1px solid rgba(52,211,153,.26)}.cat-compress{background:rgba(96,165,250,.12);color:var(--blue);border:1px solid rgba(96,165,250,.26)}.cat-inject{background:rgba(251,191,36,.12);color:var(--amber);border:1px solid rgba(251,191,36,.26)}.cat-recall{background:rgba(167,139,250,.12);color:var(--violet);border:1px solid rgba(167,139,250,.26)}.cat-sync{background:rgba(244,114,182,.12);color:var(--pink);border:1px solid rgba(244,114,182,.26)}.cat-cache{background:rgba(20,184,166,.12);color:#5eead4;border:1px solid rgba(20,184,166,.26)}.cat-system{background:rgba(148,163,184,.12);color:#cbd5e1;border:1px solid rgba(148,163,184,.24)}.log-time{color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}.log-msg{word-break:break-word;color:#d9e5f5}.log-detail{display:block;color:#93a4bb;font-size:11px;margin-top:4px;white-space:pre-wrap}.empty{padding:34px;text-align:center;color:var(--muted)}.ctx-used{display:inline-block;margin-left:8px;padding:1px 7px;border-radius:5px;font-size:11px;font-weight:760}.ctx-used.yes{background:rgba(52,211,153,.13);color:#34d399;border:1px solid rgba(52,211,153,.3)}.ctx-used.no{background:rgba(248,113,113,.13);color:#f87171;border:1px solid rgba(248,113,113,.3)}.ctx-used.wait{background:rgba(251,191,36,.12);color:#fbbf24;border:1px solid rgba(251,191,36,.3)}
 @media(max-width:980px){.head{display:block}.top-actions{justify-content:flex-start;margin-top:10px}.stats{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}.mini-grid,.state-grid{grid-template-columns:1fr}.log-entry{grid-template-columns:1fr;gap:4px}#log-list{max-height:none}}
@@ -3598,8 +4945,8 @@ body{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Microsoft YaHei",mo
 <div class="shell">
 <div class="head">
 <div>
-<h1>memos-memory operations console <span class="muted" style="font-size:12px">v{{VERSION}}</span></h1>
-<div class="sub">1.10.x 风格运行控制台：查看真实注入构成、子系统状态、最近样本、检索、压缩、同步与缓存事件。</div>
+<h1>运行控制台 <span class="muted" style="font-size:12px">v{{VERSION}}</span></h1>
+<div class="sub">实时事件 · 请求组成 · 子系统状态 · 最近注入</div>
 </div>
 <div class="top-actions"><a href="/">打开 WebUI</a><a href="/xinchao">心潮工作台</a><a href="/api/console/stats" target="_blank">Stats API</a><a href="/api/logs?limit=300" target="_blank">Logs API</a></div>
 </div>
@@ -3623,6 +4970,7 @@ body{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Microsoft YaHei",mo
 <div class="mini">Total estimate<b id="latest-total">0 字</b></div>
 <div class="mini">Memory block<b id="latest-memory">0 字</b></div>
 <div class="mini">Memo count<b id="latest-count">0</b></div>
+<div class="mini">ACCESS subset<b id="latest-access">0 字</b></div>
 </div>
 </section>
 <section class="panel">
@@ -3657,7 +5005,7 @@ body{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Microsoft YaHei",mo
 <script>
 var cat="", timer=null;
 var cats={xinchao:"cat-xinchao",enhancer:"cat-enhancer",compress:"cat-compress",inject:"cat-inject",cache:"cat-cache",recall:"cat-recall",sync:"cat-sync",system:"cat-system"};
-var labels={current_time:"当前时间",semantic_state:"滚动状态",profile:"旧画像",time_insight:"时间洞察",diary:"日记视角",event_core:"事件核心",evidence:"原文证据",memory_structure:"记忆结构",xinchao:"心潮状态",enhancer:"Enhancer",cache:"Provider缓存",context:"Astr上下文",other_extra:"其他注入"};
+var labels={current_time:"当前时间",semantic_state:"滚动状态",profile:"长期身份核",time_insight:"时间洞察",diary:"日记视角",event_core:"事件核心",evidence:"原文证据",memory_structure:"记忆结构",xinchao:"心潮状态",enhancer:"Enhancer",cache:"Provider缓存",context:"Astr上下文",other_extra:"其他注入"};
 var mixKeys=["current_time","semantic_state","profile","time_insight","diary","event_core","evidence","memory_structure","xinchao","enhancer","context","other_extra"];
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){if(c==="&")return"&amp;";if(c==="<")return"&lt;";if(c===">")return"&gt;";if(c==='"')return"&quot;";return"&#39;";});}
 function n(v){return Number(v||0).toLocaleString("zh-CN")}
@@ -3665,9 +5013,9 @@ function pct(v,t){return t>0?Math.round((Number(v||0)*1000)/t)/10:0}
 function pretty(v){try{return JSON.stringify(v,null,2)}catch(e){return String(v)}}
 async function fetchJson(url){var r=await fetch(url);var d=await r.json();if(!d.ok)throw new Error(d.error||"request failed");return d.data}
 async function fetchAll(){await Promise.all([fetchStats(),fetchLogs()])}
-function renderMix(latest,totals){var comp=latest.composition||{},total=Number(latest.total_est_chars||0),label=latest.ts_iso||"waiting";if(latest.outcome)label+=" · "+latest.outcome;if(!total&&totals){comp=totals;total=mixKeys.reduce(function(s,k){return s+Number(comp[k]||0)},0);label=total?"累计样本":"waiting"}document.getElementById("latest-time").textContent=label;document.getElementById("latest-total").textContent=n(total)+" 字";document.getElementById("latest-memory").textContent=n(latest.chars||comp.diary||0)+" 字";document.getElementById("latest-count").textContent=n(latest.count||0);document.getElementById("latest-mix").innerHTML=total?mixKeys.map(function(k){var v=Number(comp[k]||0),p=pct(v,total);return"<div class='mix-row'><div class='mix-name'>"+labels[k]+"</div><div class='bar'><div class='fill "+k+"' style='width:"+p+"%'></div></div><div class='mix-val'>"+n(v)+" / "+p+"%</div></div>"}).join(""):"<div class='empty'>还没有请求样本。任意一次真实 LLM 对话后这里都会出现。</div>"}
-function renderStates(data){var f=data.features||{},rt=data.latest_runtime||{};var defs=[["xinchao","Xinchao",f.xinchao,rt.xinchao],["enhancer","RP enhancer",f.enhancer,rt.enhancer],["provider_cache","Provider cache",f.provider_cache,rt.provider_cache],["system_cache_guard","System guard",f.system_cache_guard,rt.system_cache_guard],["prefix_drift","Prefix drift",f.prefix_drift,rt.prefix_drift],["context","Context trim",f.context,rt.context],["archive","Context archive",f.archive,{}],["profile","Profile",f.profile,{}],["time_insight","Time insight",f.time_insight,{}]];document.getElementById("state-grid").innerHTML=defs.map(function(x){return"<div class='state'><strong>"+esc(x[1])+"<i class='dot "+(x[2]?"on":"off")+"'></i></strong><pre>"+esc(Object.keys(x[3]||{}).length?pretty(x[3]):(x[2]?"已启用，等待运行样本":"未启用"))+"</pre></div>"}).join("")}
-async function fetchStats(){try{var data=await fetchJson("/api/console/stats");renderMix(data.latest||{},data.totals||{});renderStates(data);var rows=(data.rows||[]).slice(-10).reverse();var tbl=document.getElementById("inject-table");if(!rows.length){tbl.innerHTML="<div class='empty'>还没有请求样本。任意一次真实 LLM 对话后这里都会出现。</div>"}else{tbl.innerHTML="<table class='inject-table'><thead><tr><th>time</th><th>result</th><th>total</th><th>now</th><th>ctx</th><th>story</th><th>state</th><th>evidence</th><th>profile</th><th>mind</th><th>enh</th><th>other</th></tr></thead><tbody>"+rows.map(function(x){var c=x.composition||{};return"<tr><td>"+esc(x.ts_iso||"")+"</td><td>"+esc(x.outcome||"legacy")+"</td><td>"+n(x.total_est_chars)+"</td><td>"+n(c.current_time)+"</td><td>"+n(c.context)+"</td><td>"+n(c.diary)+"</td><td>"+n(c.semantic_state)+"</td><td>"+n(c.evidence)+"</td><td>"+n(c.profile)+"</td><td>"+n(c.xinchao)+"</td><td>"+n(c.enhancer)+"</td><td>"+n(c.other_extra)+"</td></tr>"}).join("")+"</tbody></table>"}}catch(e){document.getElementById("latest-mix").innerHTML="<div class='empty'>Stats API failed: "+esc(e.message)+"</div>";document.getElementById("inject-table").innerHTML="<div class='empty'>无法读取 /api/console/stats："+esc(e.message)+"</div>"}}
+function renderMix(latest,totals){var comp=latest.composition||{},total=Number(latest.total_est_chars||0),label=latest.ts_iso||"waiting";if(latest.outcome)label+=" · "+latest.outcome;if(!total&&totals){comp=totals;total=mixKeys.reduce(function(s,k){return s+Number(comp[k]||0)},0);label=total?"累计样本":"waiting"}document.getElementById("latest-time").textContent=label;document.getElementById("latest-total").textContent=n(total)+" 字";document.getElementById("latest-memory").textContent=n(latest.chars||comp.diary||0)+" 字";document.getElementById("latest-count").textContent=n(latest.count||0);document.getElementById("latest-access").textContent=n(comp.access_supplement||0)+" 字";document.getElementById("latest-mix").innerHTML=total?mixKeys.map(function(k){var v=Number(comp[k]||0),p=pct(v,total);return"<div class='mix-row'><div class='mix-name'>"+labels[k]+"</div><div class='bar'><div class='fill "+k+"' style='width:"+p+"%'></div></div><div class='mix-val'>"+n(v)+" / "+p+"%</div></div>"}).join(""):"<div class='empty'>还没有请求样本。任意一次真实 LLM 对话后这里都会出现。</div>"}
+function renderStates(data){var f=data.features||{},rt=data.latest_runtime||{};var defs=[["xinchao","Xinchao",f.xinchao,rt.xinchao],["enhancer","RP enhancer",f.enhancer,rt.enhancer],["access_supplement","ACCESS supplement",f.access_supplement,{}],["llm_runtime","LLM Runtime 2.0",f.llm_runtime,rt.llm_runtime],["provider_cache","Provider cache",f.provider_cache,rt.provider_cache],["system_cache_guard","System guard",f.system_cache_guard,rt.system_cache_guard],["prefix_drift","Prefix drift",f.prefix_drift,rt.prefix_drift],["context","Context trim",f.context,rt.context],["archive","Context archive",f.archive,{}],["profile","Profile",f.profile,{}],["time_insight","Time insight",f.time_insight,{}]];document.getElementById("state-grid").innerHTML=defs.map(function(x){return"<div class='state'><strong>"+esc(x[1])+"<i class='dot "+(x[2]?"on":"off")+"'></i></strong><pre>"+esc(Object.keys(x[3]||{}).length?pretty(x[3]):(x[2]?"已启用，等待运行样本":"未启用"))+"</pre></div>"}).join("")}
+async function fetchStats(){try{var data=await fetchJson("/api/console/stats");renderMix(data.latest||{},data.totals||{});renderStates(data);var rows=(data.rows||[]).slice(-10).reverse();var tbl=document.getElementById("inject-table");if(!rows.length){tbl.innerHTML="<div class='empty'>还没有请求样本。任意一次真实 LLM 对话后这里都会出现。</div>"}else{tbl.innerHTML="<table class='inject-table'><thead><tr><th>time</th><th>result</th><th>total</th><th>now</th><th>ctx</th><th>story</th><th>access*</th><th>state</th><th>evidence</th><th>profile</th><th>mind</th><th>enh</th><th>other</th></tr></thead><tbody>"+rows.map(function(x){var c=x.composition||{};return"<tr><td>"+esc(x.ts_iso||"")+"</td><td>"+esc(x.outcome||"legacy")+"</td><td>"+n(x.total_est_chars)+"</td><td>"+n(c.current_time)+"</td><td>"+n(c.context)+"</td><td>"+n(c.diary)+"</td><td>"+n(c.access_supplement)+"</td><td>"+n(c.semantic_state)+"</td><td>"+n(c.evidence)+"</td><td>"+n(c.profile)+"</td><td>"+n(c.xinchao)+"</td><td>"+n(c.enhancer)+"</td><td>"+n(c.other_extra)+"</td></tr>"}).join("")+"</tbody></table><div class='muted' style='padding:8px'>* ACCESS 是历史记忆块中的子集，不重复计入 total。</div>"}}catch(e){document.getElementById("latest-mix").innerHTML="<div class='empty'>Stats API failed: "+esc(e.message)+"</div>";document.getElementById("inject-table").innerHTML="<div class='empty'>无法读取 /api/console/stats："+esc(e.message)+"</div>"}}
 async function fetchLogs(){try{var data=await fetchJson(cat?"/api/logs?limit=300&category="+encodeURIComponent(cat):"/api/logs?limit=300");var counts=data.counts||{};document.getElementById("total").textContent=n(data.total||0);["xinchao","inject","recall","cache","enhancer","compress","sync"].forEach(function(k){var el=document.getElementById("cnt-"+k);if(el)el.textContent=n(counts[k]||0)});var logs=data.logs||[],el=document.getElementById("log-list");if(!logs.length){el.innerHTML="<div class='empty'>当前分类没有日志。只有实际触发过对应流程才会出现。</div>";return}el.innerHTML=logs.map(function(l){var detail=l.detail&&Object.keys(l.detail).length?"<span class='log-detail'>"+esc(JSON.stringify(l.detail))+"</span>":"",badge="",d=l.detail||{};if(l.category==="recall"&&d.context_ready&&Number(d.context_query_parts||0)>0){var reason=d.context_used_reason?"原因: "+String(d.context_used_reason):"上下文查询片段: "+Number(d.context_query_parts||0);if(d.context_used===true)badge="<span class='ctx-used yes' title='"+esc(reason)+"'>已用上文</span>";else if(d.context_used===false)badge="<span class='ctx-used no' title='"+esc(reason)+"'>未用上文</span>";else badge="<span class='ctx-used wait' title='"+esc(reason)+"'>判定中</span>"}return"<div class='log-entry'><span class='log-time'>"+esc(l.ts_iso||"")+"</span><span class='log-cat "+(cats[l.category]||"cat-system")+"'>"+esc(l.category||"system")+"</span><span class='log-msg'>"+esc(l.message||"")+badge+detail+"</span></div>"}).join("")}catch(e){document.getElementById("log-list").innerHTML="<div class='empty'>Load failed: "+esc(e.message)+"</div>"}}
 function setCat(c,btn){cat=c;document.querySelectorAll(".filter-bar button[data-cat]").forEach(function(b){b.classList.toggle("active",b===btn)});fetchAll()}
 async function clearLogs(){await fetch("/api/logs?clear=1");fetchAll()}

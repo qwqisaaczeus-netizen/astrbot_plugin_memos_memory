@@ -1,0 +1,632 @@
+{
+  "scale": 1000,
+  "sqlite": "3.50.4",
+  "python": "3.12.13",
+  "timings_ms": {
+    "candidate_backfill_batch_200": {
+      "p50": 15.7425,
+      "p95": 18.6257,
+      "p99": 18.6257,
+      "samples": 6
+    },
+    "graph_backfill_batch_10": {
+      "p50": 36.2665,
+      "p95": 54.0007,
+      "p99": 57.8356,
+      "samples": 100
+    },
+    "incremental_queue_build_1": {
+      "p50": 3.9247,
+      "p95": 4.2147,
+      "p99": 15.4484,
+      "samples": 30
+    },
+    "full_scope_projection": {
+      "p50": 16.9698,
+      "p95": 16.9698,
+      "p99": 16.9698,
+      "samples": 1
+    },
+    "full_scope_claim_rebuild": {
+      "p50": 27.7729,
+      "p95": 27.7729,
+      "p99": 27.7729,
+      "samples": 1
+    },
+    "query": {
+      "p50": 0.2964,
+      "p95": 0.3474,
+      "p99": 0.4197,
+      "samples": 60
+    },
+    "list_threads": {
+      "p50": 0.2065,
+      "p95": 0.2172,
+      "p99": 0.2206,
+      "samples": 60
+    },
+    "candidate_lookup": {
+      "p50": 0.5397,
+      "p95": 0.6317,
+      "p99": 0.7781,
+      "samples": 60
+    }
+  },
+  "workload": "80% hot scope; 20 other scopes; frequent common terms/entities; rare pair per 1000; 365 event dates; source updates after build",
+  "seed_seconds": 0.038817099994048476,
+  "candidate_backfill_rows": 1000,
+  "candidate_backfill_seconds": 0.09278039999480825,
+  "enqueue_seconds": 0.16681929999322165,
+  "graph_backfill_seconds": 3.3110137000039686,
+  "graph_backfill_processed": 1000,
+  "graph_backfill_errors": 0,
+  "graph_backfill_complete": true,
+  "candidate_counts": {
+    "p50": 50,
+    "p95": 50,
+    "p99": 50,
+    "samples": 1000
+  },
+  "projection": {
+    "threads_projected": 50,
+    "edges_considered": 50,
+    "version_conflicts": 0
+  },
+  "claim_rebuild": {
+    "episodes": 800,
+    "extracted": 0,
+    "written": 0,
+    "slots": 0,
+    "transitions": 0,
+    "views": 50,
+    "elapsed_ms": 27.47,
+    "extractor_version": "test6-claim-v3"
+  },
+  "candidate_metrics": [
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    },
+    {
+      "postings_read": 507,
+      "route_queries": 17,
+      "common_routes_skipped": 5,
+      "unique_candidates": 57,
+      "returned": 50
+    }
+  ],
+  "query_plans": {
+    "seed": [
+      [
+        8,
+        0,
+        56,
+        "SEARCH t USING COVERING INDEX idx_thread_episode_terms_term (term=?)"
+      ],
+      [
+        14,
+        0,
+        46,
+        "SEARCH e USING INDEX sqlite_autoindex_episodes_1 (episode_id=?)"
+      ],
+      [
+        21,
+        0,
+        45,
+        "SEARCH s USING COVERING INDEX sqlite_autoindex_thread_episode_scopes_1 (episode_id=? AND scope_id=?)"
+      ],
+      [
+        46,
+        0,
+        0,
+        "USE TEMP B-TREE FOR DISTINCT"
+      ],
+      [
+        47,
+        0,
+        0,
+        "USE TEMP B-TREE FOR ORDER BY"
+      ]
+    ],
+    "route": [
+      [
+        10,
+        0,
+        62,
+        "SEARCH m USING INDEX idx_thread_members_episode (episode_id=?)"
+      ],
+      [
+        17,
+        0,
+        46,
+        "SEARCH t USING INDEX sqlite_autoindex_memory_threads_1 (thread_id=?)"
+      ],
+      [
+        26,
+        0,
+        0,
+        "USE TEMP B-TREE FOR GROUP BY"
+      ],
+      [
+        61,
+        0,
+        0,
+        "CORRELATED SCALAR SUBQUERY 1"
+      ],
+      [
+        66,
+        61,
+        54,
+        "SEARCH m2 USING COVERING INDEX idx_thread_members_thread (thread_id=?)"
+      ]
+    ],
+    "posting": [
+      [
+        4,
+        0,
+        55,
+        "SEARCH thread_candidate_postings USING COVERING INDEX sqlite_autoindex_thread_candidate_postings_1 (scope_id=? AND kind=? AND term=?)"
+      ]
+    ],
+    "date": [
+      [
+        4,
+        0,
+        47,
+        "SEARCH thread_candidate_episodes USING COVERING INDEX idx_candidate_date (scope_id=? AND event_ts>? AND event_ts<?)"
+      ]
+    ],
+    "queue": [
+      [
+        4,
+        0,
+        46,
+        "SEARCH thread_build_queue USING COVERING INDEX idx_build_queue_status (status=? AND next_attempt_ts<?)"
+      ]
+    ],
+    "list": [
+      [
+        5,
+        0,
+        62,
+        "SEARCH t USING INDEX idx_threads_scope_recent (scope_id=?)"
+      ],
+      [
+        31,
+        0,
+        0,
+        "CORRELATED SCALAR SUBQUERY 1"
+      ],
+      [
+        36,
+        31,
+        54,
+        "SEARCH m USING COVERING INDEX idx_thread_members_thread (thread_id=?)"
+      ]
+    ]
+  },
+  "queue": {
+    "completed": 1000
+  },
+  "db_bytes": 3489792,
+  "wal_bytes": 4742152,
+  "rss_bytes": 50479104,
+  "table_counts": {
+    "episodes": 1000,
+    "thread_candidate_postings": 10008,
+    "memory_episode_edges": 50,
+    "memory_threads": 50,
+    "memory_claims": 0,
+    "thread_materialized_views": 50
+  },
+  "integrity_check": "ok"
+}

@@ -12,7 +12,7 @@
 .nav{display:grid;gap:4px}.nav button,.nav>a{position:relative;display:flex;align-items:center;gap:10px;border:0;background:transparent;color:#c5d2ce;padding:10px 11px;border-radius:7px;text-align:left;min-height:40px;transition:background .18s ease,color .18s ease,transform .18s ease}.nav button::before,.nav>a::before{content:"";position:absolute;left:0;top:9px;bottom:9px;width:3px;border-radius:3px;background:#56bfa1;transform:scaleY(0);transition:transform .2s ease}.nav button:hover,.nav>a:hover{background:rgba(255,255,255,.07);color:#fff;transform:translateX(2px)}.nav button.active{background:#2a4c43;color:#fff}.nav button.active::before{transform:scaleY(1)}.nav .ico{width:22px;text-align:center;color:#89d7c0;font-family:ui-monospace,Consolas,monospace;font-size:11px}.side-foot{margin-top:auto;color:#91a6a0;font-size:11px;line-height:1.8;padding:10px 8px;border-top:1px solid rgba(255,255,255,.1)}.side-foot a:hover{color:#fff}
 .main{padding:0 24px 28px;min-width:0;width:min(100%,1720px);margin:0 auto}.top{position:sticky;top:0;z-index:12;display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:18px;padding:20px 0 14px;background:rgba(243,246,245,.94);backdrop-filter:blur(12px);border-bottom:1px solid rgba(216,226,223,.78)}.top h2{font-size:24px;margin:0 0 5px;font-weight:760;color:var(--ink)}.top p{margin:0;color:var(--muted);font-size:13px}.actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}.btn{position:relative;border:1px solid var(--line);background:var(--surface);color:var(--text);border-radius:8px;padding:8px 11px;min-height:36px;transition:border-color .18s ease,background .18s ease,color .18s ease,box-shadow .18s ease,transform .12s ease}.btn:hover{border-color:#9ecabb;background:#f8fcfa;box-shadow:0 6px 16px rgba(20,33,31,.06)}.btn:active{transform:translateY(1px)}.btn.primary{background:var(--green);border-color:var(--green);color:#fff}.btn.primary:hover{background:#066f51;border-color:#066f51}.btn.danger{color:var(--red)}.btn.loading{padding-left:32px;pointer-events:none;opacity:.82}.btn.loading::before{content:"";position:absolute;left:11px;top:50%;width:12px;height:12px;margin-top:-7px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;animation:spin .75s linear infinite}
 .tab{display:none}.tab.active{display:block;animation:pageIn .28s ease both}.grid{display:grid;gap:12px}.stats{grid-template-columns:repeat(auto-fit,minmax(165px,1fr));margin-bottom:12px}.two{grid-template-columns:minmax(0,1.42fr) minmax(310px,.82fr)}.three{grid-template-columns:repeat(3,minmax(0,1fr))}.four{grid-template-columns:repeat(4,minmax(0,1fr))}
-.card{background:var(--surface);border:1px solid var(--line2);border-radius:8px;box-shadow:var(--shadow);padding:15px;transition:border-color .2s ease,box-shadow .2s ease,transform .2s ease}.card:hover{border-color:#d1dfdb;box-shadow:var(--shadow-hover)}.card h3{margin:0 0 12px;font-size:14px;color:var(--ink)}.card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}.label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}.value{font-size:27px;font-weight:760;margin-top:5px;color:var(--ink);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.hint{color:var(--muted);font-size:12px;margin-top:4px}.small{font-size:12px;color:var(--muted)}.mono{font-family:ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums}
+.card{min-width:0;background:var(--surface);border:1px solid var(--line2);border-radius:8px;box-shadow:var(--shadow);padding:15px;transition:border-color .2s ease,box-shadow .2s ease,transform .2s ease}.card:hover{border-color:#d1dfdb;box-shadow:var(--shadow-hover)}.card h3{margin:0 0 12px;font-size:14px;color:var(--ink)}.card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}.label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}.value{font-size:27px;font-weight:760;margin-top:5px;color:var(--ink);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.hint{color:var(--muted);font-size:12px;margin-top:4px}.small{font-size:12px;color:var(--muted)}.mono{font-family:ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums}
 .toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px}.toolbar input,.toolbar select{border:1px solid var(--line);background:#fff;border-radius:8px;padding:8px 10px;min-height:36px;min-width:220px;color:var(--text);transition:border-color .18s ease,box-shadow .18s ease}.toolbar input:focus,.toolbar select:focus{border-color:#76bba5;box-shadow:0 0 0 3px var(--focus);outline:0}.toolbar input{flex:1}.toolbar .narrow{min-width:110px;flex:0}
 .pill{display:inline-flex;align-items:center;gap:4px;padding:3px 7px;border-radius:999px;font-size:11px;font-weight:700;white-space:nowrap;border:1px solid var(--line2);background:#f1f5f9;color:#475569}.ok{color:var(--green)}.warn{color:var(--amber)}.bad{color:var(--red)}
 .table-wrap{overflow:auto}.table-wrap,.pre{border:1px solid var(--line2);border-radius:8px;background:#fff}table{width:100%;border-collapse:collapse;min-width:760px}th{font-size:11px;text-align:left;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.35px;background:var(--surface2);position:sticky;top:0;z-index:1}td,th{border-bottom:1px solid var(--line2);padding:9px 10px;vertical-align:top}td{color:#334155}tbody tr{transition:background .16s ease}tbody tr:hover{background:#f5faf8}.empty{padding:32px;text-align:center;color:var(--muted)}.pre{white-space:pre-wrap;line-height:1.65;color:#334155;max-height:560px;overflow:auto;padding:12px;background:var(--surface2)}
@@ -35,15 +35,17 @@
 .value.compact{font-size:20px;line-height:1.25;overflow-wrap:anywhere}.backup-notice{display:grid;grid-template-columns:190px minmax(0,1fr);gap:16px;align-items:center;margin:12px 0;padding:13px 15px;border-left:4px solid var(--green);background:#ecfdf5;color:#285448}.backup-notice strong{color:#075f45}.backup-notice span{font-size:12px;line-height:1.65}.backup-layout{display:grid;grid-template-columns:minmax(360px,.85fr) minmax(0,1.15fr);gap:12px}.backup-list{display:grid;gap:7px;margin-top:10px;max-height:600px;overflow:auto}.backup-row{width:100%;border:1px solid var(--line2);border-radius:8px;background:#fff;padding:11px 12px;text-align:left;color:var(--text);cursor:pointer;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center}.backup-row:hover,.backup-row.active{border-color:#38a77f;background:#f0fdf7}.backup-row.bad{border-left:4px solid var(--red)}.backup-row-title{font-weight:750;color:var(--ink);overflow-wrap:anywhere}.backup-row-meta{font-size:11px;color:var(--muted);margin-top:4px}.backup-flags{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end}.backup-pending{margin-bottom:10px}.backup-pending:empty{display:none}.backup-pending-box{padding:11px 12px;border:1px solid #e7ba8f;border-left:4px solid var(--amber);background:#fffaf5;border-radius:8px}.backup-pending-box.failed{border-color:#f3a4ae;border-left-color:var(--red);background:#fff1f2}.backup-kv{display:grid;grid-template-columns:150px minmax(0,1fr);border:1px solid var(--line2);border-radius:8px;overflow:hidden}.backup-kv dt,.backup-kv dd{margin:0;padding:8px 10px;border-bottom:1px solid var(--line2)}.backup-kv dt{color:var(--muted);background:var(--surface2)}.backup-kv dd{overflow-wrap:anywhere}.backup-kv dt:last-of-type,.backup-kv dd:last-of-type{border-bottom:0}.backup-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}.backup-actions button:disabled{cursor:not-allowed;opacity:.45}
 @media(max-width:1080px){.backup-layout{grid-template-columns:1fr}}
 @media(max-width:640px){.backup-notice{grid-template-columns:1fr;gap:4px}.backup-kv{grid-template-columns:112px minmax(0,1fr)}.backup-layout{display:block}.backup-layout>.card+.card{margin-top:12px}}
+.house-envelope{position:fixed;z-index:90;right:24px;top:46%;width:72px;height:58px;border:0;background:transparent;filter:drop-shadow(0 10px 16px rgba(20,33,31,.25));cursor:grab;touch-action:none}.house-envelope:active{cursor:grabbing}.house-envelope[hidden]{display:none}.house-envelope-rope{position:absolute;left:35px;bottom:48px;width:2px;height:54px;background:#8d7652}.house-envelope-paper{position:absolute;inset:8px 5px 2px;background:#f1e4bd;border:1px solid #9b8054;border-radius:2px;overflow:hidden}.house-envelope-paper::before{content:"";position:absolute;left:0;right:0;top:0;height:100%;clip-path:polygon(0 0,50% 58%,100% 0);background:#e0cea0}.house-envelope-paper::after{content:"";position:absolute;width:15px;height:15px;left:50%;top:48%;transform:translate(-50%,-50%);border-radius:50%;background:#8d3d37;border:2px solid #b65a50}.house-envelope-badge{position:absolute;right:-1px;top:0;display:grid;place-items:center;min-width:20px;height:20px;padding:0 4px;border-radius:10px;background:#c9363e;color:#fff;font:11px/1 sans-serif}.house-envelope.new .house-envelope-paper{animation:houseSway 3.8s ease-in-out infinite;transform-origin:50% 0}.house-envelope:focus-visible{outline:2px solid #56bfa1;outline-offset:4px}@keyframes houseSway{0%,100%{transform:rotate(-1deg)}50%{transform:rotate(2deg)}}@media(max-width:640px){.house-envelope{width:62px;height:50px;right:12px}.house-envelope-rope{left:30px;bottom:42px;height:42px}}
 </style>
-</head>
+<link rel="stylesheet" href="/assets/workbench.css?v=610blue1"><link rel="stylesheet" href="/assets/atelier.css?v=610blue1"><script src="/assets/lucide.min.js" defer></script><script src="/assets/workbench.js?v=610blue1" defer></script></head>
 <body>
+<button id="house-envelope" class="house-envelope" type="button" aria-label="进入心笺小院" title="心笺小院" hidden><span class="house-envelope-rope"></span><span class="house-envelope-paper"></span><span id="house-envelope-badge" class="house-envelope-badge" hidden>0</span></button>
 <div class="app">
   <aside class="side">
     <div class="brand">
       <h1>memos-memory</h1>
       <p>长期记忆、画像、召回诊断与运行观测</p>
-      <span class="version" id="side-version">WebUI 5.0.0-test0</span>
+      <span class="version" id="side-version">WebUI 6.1.0</span>
     </div>
     <div class="status">
       <div class="status-row"><span><i class="dot" id="dot-memos"></i>memos</span><b id="txt-memos">-</b></div>
@@ -58,7 +60,7 @@
       <button data-tab="eval"><span class="ico">04</span>召回实验室</button>
       <button data-tab="timeline"><span class="ico">05</span>月份档案</button>
       <button data-tab="feedback"><span class="ico">06</span>召回反馈</button>
-      <button data-tab="profile"><span class="ico">07</span>长期画像</button>
+      <button data-tab="profile"><span class="ico">07</span>人格与状态</button>
       <button data-tab="context"><span class="ico">08</span>上下文</button>
       <button data-tab="health"><span class="ico">09</span>健康检查</button>
       <button data-tab="activity"><span class="ico">10</span>活动日志</button>
@@ -67,16 +69,20 @@
       <button data-tab="backups"><span class="ico">13</span>备份管理</button>
     </nav>
     <div class="side-foot">
-      <div id="side-foot-version">WebUI 5.0.0-test0</div>
+      <div id="side-foot-version">WebUI 6.1.0</div>
+      <div><a href="/threads">打开记忆脉络</a></div>
+      <div><a href="/forgetting">打开非破坏式遗忘</a></div>
       <div><a href="/access">打开记忆可达性</a></div>
       <div><a href="/xinchao">打开心潮工作台</a></div>
+      <div><a href="/models">管理外置模型池</a></div>
+      <div><a href="/house">进入心笺小院</a></div>
       <div><a href="/console">打开专业控制台</a></div>
     </div>
   </aside>
   <main class="main">
     <div class="top">
       <div><h2 id="page-title">概览</h2><p id="page-sub">观察插件连接、记忆规模、召回质量和注入运行情况。</p></div>
-      <div class="actions"><a class="btn" href="/production">记忆生产</a><a class="btn" href="/access">记忆可达性</a><a class="btn" href="/xinchao">心潮工作台</a><a class="btn" href="/console">专业控制台</a><button class="btn primary" id="refresh-page" onclick="refreshCurrent(true)">刷新当前页</button></div>
+      <div class="actions"><a class="btn" href="/production">记忆生产</a><a class="btn" href="/access">记忆可达性</a><a class="btn" href="/threads">记忆脉络</a><a class="btn" href="/xinchao">心潮工作台</a><a class="btn" href="/models">模型池</a><a class="btn" href="/house">心笺小院</a><a class="btn" href="/console">专业控制台</a><button class="btn primary" id="refresh-page" onclick="refreshCurrent(true)">刷新当前页</button></div>
     </div>
 
     <section id="overview" class="tab active">
@@ -88,15 +94,16 @@
         <div class="card"><div class="label">画像状态</div><div class="value" id="st-profile">-</div><div class="hint">长期画像接入</div></div>
         <div class="card"><div class="label">时间模型</div><div class="value" id="st-time">同轮快照</div><div class="hint" id="st-time-hint">等待首轮时间样本</div></div>
       </div>
-      <div class="architecture-band" aria-label="4.x 三层记忆状态">
-        <div class="layer-card source"><div class="layer-kicker">第一层 · 原文档案</div><div class="layer-value" id="arch-source-value">-</div><div class="layer-hint" id="arch-source-hint">保存压缩前的会话与轮次</div></div>
-        <div class="layer-card state"><div class="layer-kicker">第二层 · 滚动状态</div><div class="layer-value" id="arch-state-value">-</div><div class="layer-hint" id="arch-state-hint">收敛关系、边界、倾向与情绪基调</div></div>
-        <div class="layer-card story"><div class="layer-kicker">第三层 · 剧情入口</div><div class="layer-value" id="arch-story-value">-</div><div class="layer-hint" id="arch-story-hint">日记负责剧情连续性，并可回原文取证</div></div>
+      <div class="architecture-band" aria-label="分层记忆状态">
+        <div class="layer-card evidence"><div class="layer-kicker">情景证据</div><div class="layer-value" id="arch-evidence-value">-</div><div class="layer-hint" id="arch-evidence-hint">等待证据统计</div></div>
+        <div class="layer-card source"><div class="layer-kicker">原文档案</div><div class="layer-value" id="arch-source-value">-</div><div class="layer-hint" id="arch-source-hint">保存压缩前的会话与轮次</div></div>
+        <div class="layer-card state"><div class="layer-kicker">滚动状态</div><div class="layer-value" id="arch-state-value">-</div><div class="layer-hint" id="arch-state-hint">收敛关系、边界、倾向与情绪基调</div></div>
+        <div class="layer-card story"><div class="layer-kicker">文学日记</div><div class="layer-value" id="arch-story-value">-</div><div class="layer-hint" id="arch-story-hint">日记负责剧情连续性，并可回原文取证</div></div>
       </div>
-      <div class="request-path" id="arch-path"><strong>4.4 请求路径</strong><span class="path-step">等待状态</span></div>
+      <div class="request-path" id="arch-path"><strong>当前请求路径</strong><span class="path-step">等待状态</span></div>
       <div class="grid two">
         <div class="card"><div class="card-head"><h3>注入构成</h3><span class="small" id="mix-time">等待样本</span></div><div class="bars" id="mix-bars"></div></div>
-        <div class="card"><h3>连接状态</h3><div class="pre" id="status-box">加载中...</div></div>
+        <div class="card"><h3>运行状态</h3><div class="pre" id="status-box">加载中...</div></div>
       </div>
       <div class="grid three" style="margin-top:12px">
         <div class="card"><div class="card-head"><h3>记忆结构</h3><span class="small" id="structure-total">加载中...</span></div><div class="structure-tabs" role="tablist" aria-label="记忆结构统计"><button class="active" data-structure-view="memory_types" onclick="setStructureView('memory_types')">记忆类型</button><button data-structure-view="evidence_quality" onclick="setStructureView('evidence_quality')">证据来源</button><button data-structure-view="traceability" onclick="setStructureView('traceability')">原文回链</button></div><div id="structure-chart" class="structure-chart"><div class="empty">加载中...</div></div><div class="structure-foot"><span class="small" id="backup-meta">等待备份状态</span><button class="btn" id="backup-now" onclick="runDataBackup()" title="立即创建不含 Token 和配置的本地数据备份">立即备份</button></div></div>
@@ -159,20 +166,27 @@
     </section>
 
     <section id="profile" class="tab">
+      <div class="toolbar"><button class="btn primary" onclick="loadProfile()">刷新</button><button class="btn" onclick="rebuildProfileSemanticState()">重新融合滚动状态</button></div>
       <div class="grid two">
         <div class="card">
-          <div class="card-head"><h3>当前长期画像</h3><span class="small" id="profile-meta">加载中...</span></div>
+          <div class="card-head"><h3>长期人格内核</h3><span class="small" id="profile-meta">加载中...</span></div>
           <div id="profile-current" class="pre">加载中...</div>
           <div class="card-head" style="margin-top:12px"><h3>稳定事实</h3><span class="small" id="profile-facts-meta">-</span></div>
           <div id="profile-facts" class="pre">加载中...</div>
         </div>
         <div class="card">
-          <div class="card-head"><h3>历史画像版本</h3><span class="small" id="profile-history-count">-</span></div>
-          <div id="profile-history" class="list"><div class="empty">加载中...</div></div>
+          <div class="card-head"><h3>当前滚动状态</h3><span class="small" id="profile-state-meta">加载中...</span></div>
+          <div id="profile-state-current" class="pre">加载中...</div>
+          <div class="card-head" style="margin-top:12px"><h3>下一次融合判断</h3><span class="small" id="profile-state-next">-</span></div>
+          <div id="profile-state-decision" class="list"><div class="empty">加载中...</div></div>
         </div>
       </div>
       <div class="grid two" style="margin-top:12px">
-        <div class="card"><h3>画像更新记录</h3><div id="profile-runs" class="pre">加载中...</div></div>
+        <div class="card"><div class="card-head"><h3>滚动状态历史</h3><span class="small" id="profile-state-history-count">-</span></div><div id="profile-state-history" class="list"><div class="empty">加载中...</div></div></div>
+        <div class="card"><div class="card-head"><h3>历史人格内核</h3><span class="small" id="profile-history-count">-</span></div><div id="profile-history" class="list"><div class="empty">加载中...</div></div></div>
+      </div>
+      <div class="grid two" style="margin-top:12px">
+        <div class="card"><h3>人格内核更新记录</h3><div id="profile-runs" class="pre">加载中...</div></div>
         <div class="card"><h3>时间洞察</h3><div id="time-box" class="pre">加载中...</div></div>
       </div>
     </section>
@@ -245,8 +259,8 @@
 
 <script>
 var activeTab="overview", memoryCache=[], settingsState={items:[],byKey:{},presets:[],dirty:{}}, overviewStructure={}, structureView="memory_types", backupState={data:null,selected:"",detail:null};
-var titles={overview:["概览","观察 4.x 三层记忆、精简召回与实际注入运行情况。"],memories:["记忆列表","查看已经同步到本地索引的 Memos 剧情日记。"],episodic:["原文与状态","查看原始轮次、情景证据和收敛后的当前滚动状态。"],eval:["召回实验室","模拟当前精简召回，并用真实问题运行路线消融。"],timeline:["月份档案","按月份和日期浏览日记，不参与主召回配额。"],feedback:["召回反馈","直接修正真实注入和实验室结果。"],profile:["长期画像","旧画像保留为状态初始化种子和历史资料。"],context:["上下文","查看 AstrBot 当前上下文和插件归档备份。"],health:["健康检查","检查触发线索、分类、索引和记忆可用性。"],activity:["活动日志","查看插件运行事件流。"],settings:["插件设置","优先配置 4.x 当前主路，旧参数集中保留为兼容回退。"],debug:["调试与测试","查看内部状态并测试 provider 连通性。"],backups:["备份管理","创建、校验、下载与安全恢复插件本地数据。"]};
-var mixLabels={current_time:"当前时间",profile:"旧画像",semantic_state:"滚动状态",time_insight:"时间洞察",diary:"日记视角",event_core:"事件核心",evidence:"原文证据",memory_structure:"记忆结构",xinchao:"心潮状态",enhancer:"Enhancer",context:"Astr上下文",other_extra:"其他注入"};
+var titles={overview:["概览","原文、证据与日记"],memories:["记忆列表","查看已经同步到本地索引的 Memos 剧情日记。"],episodic:["原文与状态","查看原始轮次、情景证据和收敛后的当前滚动状态。"],eval:["召回实验室","模拟当前精简召回，并用真实问题运行路线消融。"],timeline:["月份档案","按月份和日期浏览日记，不参与主召回配额。"],feedback:["召回反馈","直接修正真实注入和实验室结果。"],profile:["人格与状态","长期人格内核保持稳定，滚动状态只承载近期变化。"],context:["上下文","查看 AstrBot 当前上下文和插件归档备份。"],health:["健康检查","检查触发线索、分类、索引和记忆可用性。"],activity:["活动日志","查看插件运行事件流。"],settings:["插件设置","连接、记忆策略与运行维护"],debug:["调试与测试","查看内部状态并测试 provider 连通性。"],backups:["备份管理","创建、校验、下载与安全恢复插件本地数据。"]};
+var mixLabels={current_time:"当前时间",profile:"长期身份核",semantic_state:"滚动状态",time_insight:"时间洞察",diary:"日记视角",event_core:"事件核心",evidence:"原文证据",memory_structure:"记忆结构",xinchao:"心潮状态",enhancer:"Enhancer",context:"Astr上下文",other_extra:"其他注入"};
 var mixKeys=["current_time","semantic_state","profile","time_insight","diary","event_core","evidence","memory_structure","xinchao","enhancer","context","other_extra"];
 function stateReason(s){var p=(s||{}).pending_preview||{},m={initial_state:"首次建立",significant_change:"显著变化立即融合",batch_threshold:"达到累计批次",max_wait:"达到最长等待",failed_retry:"失败重试",every_batch:"逐批更新",deferred:"普通变化继续累计",empty:"没有待处理",waiting_for_episode_view:"等待 Episode 视图"};return m[p.reason]||p.reason||""}
 function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,function(c){if(c==="&")return"&amp;";if(c==="<")return"&lt;";if(c===">")return"&gt;";if(c==='"')return"&quot;";return"&#39;";});}
@@ -277,7 +291,7 @@ function renderSideStatus(st){
 }
 function onText(v){return v?"开启":"关闭"}
 function yesNo(v){return v?"正常":"异常"}
-var structureLabels={plot_fact:"剧情事实",emotional_anchor:"情感锚点",relationship_shift:"关系转折",promise_or_rule:"承诺规则",behavior_bias:"行为倾向",daily_texture:"日常质感",unknown:"未分类",source_grounded:"原始对话生成",mixed_user_edited:"证据加编辑",diary_derived:"旧日记推导",recoverable:"可回原文",unlinked:"暂无精确回链"};
+var structureLabels={event:"剧情事件",persona:"人格关系",texture:"日常质感",plot_fact:"剧情事实",emotional_anchor:"情感锚点",relationship_shift:"关系转折",promise_or_rule:"承诺规则",behavior_bias:"行为倾向",daily_texture:"日常质感",unknown:"未分类",source_grounded:"原始对话生成",mixed_user_edited:"证据加编辑",diary_derived:"旧日记推导",recoverable:"可回原文",unlinked:"暂无精确回链"};
 function setStructureView(view){structureView=view;document.querySelectorAll("[data-structure-view]").forEach(function(btn){btn.classList.toggle("active",btn.dataset.structureView===view)});renderStructureChart()}
 function renderStructureChart(){var rows=(overviewStructure[structureView]||[]).filter(function(x){return Number(x.v||0)>0}),total=rows.reduce(function(sum,x){return sum+Number(x.v||0)},0),box=document.getElementById("structure-chart");if(!box)return;document.getElementById("structure-total").textContent=structureView==="memory_types"?n(total)+" 篇日记":n(overviewStructure.episodes_total||total)+" 条情景";if(!rows.length){box.innerHTML="<div class='empty'>当前还没有可统计的数据</div>";return}box.innerHTML=rows.slice(0,8).map(function(x,index){var value=Number(x.v||0),percent=pct(value,total);return"<div class='structure-row'><div class='structure-label' title='"+esc(structureLabels[x.k]||x.k)+"'>"+esc(structureLabels[x.k]||x.k)+"</div><div class='structure-track'><div class='structure-fill alt"+(index%6)+"' style='width:"+percent+"%'></div></div><div class='structure-value'>"+n(value)+" · "+percent+"%</div></div>"}).join("")}
 function renderBackupStatus(status){var el=document.getElementById("backup-meta");if(!el)return;status=status||{};if(!status.enabled){el.textContent="自动备份已关闭";return}if(status.latest_ts){el.textContent="最近 "+tsText(status.latest_ts)+" · "+n(status.count||0)+" 份"}else{el.textContent="尚无备份 · 将自动创建首份"}}
@@ -306,30 +320,34 @@ function renderStatusPanel(st){
     ["上下文治理",onText(st.context_governance_enable),(st.context_exclude_command_turns?"指令回合隔离开启":(st.context_archive_enable?"自动归档开启":"自动归档关闭"))]
   ];
   document.getElementById("status-box").className="status-grid";
-  document.getElementById("status-box").innerHTML=rows.map(function(r){return"<div class='status-line'><b>"+esc(r[0])+"</b><span class='small'>"+esc(r[2]||"")+"</span><span class='pill'>"+esc(r[1])+"</span></div>"}).join("");
+  function rowHtml(r){return"<div class='status-line'><b>"+esc(r[0])+"</b><span class='small'>"+esc(r[2]||"")+"</span><span class='pill'>"+esc(r[1])+"</span></div>"}
+  var box=document.getElementById("status-box"),wasOpen=!!box.querySelector('details[open]');
+  box.innerHTML=rows.slice(0,4).map(rowHtml).join("")+"<details class='wb-fold'"+(wasOpen?" open":"")+"><summary>全部模块状态 · "+rows.length+" 项</summary>"+rows.slice(4).map(rowHtml).join("")+"</details>";
 }
 function renderArchitecture(st){
   var ep=st.episodic_stats||{},ss=st.semantic_state||{},state=ss.state||{},arch=st.recall_architecture||{};
+  document.getElementById("arch-evidence-value").textContent=n(ep.episodes||0)+" 条事件";
+  document.getElementById("arch-evidence-hint").textContent=n(ep.evidence||0)+" 条证据 · "+n(ep.recoverable_episodes||0)+" 条可回原文";
   document.getElementById("arch-source-value").textContent=n(ep.source_batches||0)+" 批 / "+n(ep.source_turns||0)+" 轮";
   document.getElementById("arch-source-hint").textContent=n(ep.recoverable_episodes||0)+" 篇可回原文 · 原始生成 "+n(ep.source_grounded||0)+" 篇 · 原始向量 "+n(ep.source_turn_vectors||0)+"/"+n(ep.source_turns||0)+" · 旧日记推导 "+n(ep.diary_derived||0)+" 篇";
   document.getElementById("arch-state-value").textContent=ss.ready?("v"+n(state.version||0)):(ss.enabled?"等待融合":"已关闭");
   document.getElementById("arch-state-hint").textContent=ss.ready?(n((state.rendered_text||"").length)+" 字 · 待处理 "+n(ss.pending||0)+(stateReason(ss)?" · "+stateReason(ss):"")):"更新失败不会阻断日记与原文归档";
-  document.getElementById("arch-story-value").textContent=n(ep.episodes||0)+" 条入口";
+  document.getElementById("arch-story-value").textContent="读取日记索引…";
   document.getElementById("arch-story-hint").textContent="每轮目标 "+n(arch.story_normal||arch.story_min||0)+" 条 · 上限 "+n(arch.story_max||0)+" 条 · 候选池 "+n(arch.candidate_k||0)+(arch.inject_char_budget?" · 软目标 "+n(arch.inject_char_budget)+" 字":"")+(arch.safety_net?" · 安全网开":" · 安全网关");
   var active=arch.active==="lean_full_memory_fusion";
   var steps=active?["当前问题","一次向量","事件 + 日记 + 原文 + BM25",arch.temporal_on_demand?"具体时间按需":"时间路线关闭",st.rerank_active?"一次重排":"不重排","证据覆盖选择",arch.safety_net?"弱结果安全网":"安全网关闭",arch.inject_char_budget?"软目标紧凑治理":"融合记忆条目","滚动状态"]:["兼容回退",arch.active||"未就绪"];
-  document.getElementById("arch-path").innerHTML="<strong>"+(active?"4.6 当前请求路径":"当前请求路径")+"</strong>"+steps.map(function(step,index){return(index?"<span class='path-arrow'>›</span>":"")+"<span class='path-step'>"+esc(step)+"</span>"}).join("");
+  document.getElementById("arch-path").innerHTML="<strong>"+(active?"当前请求路径":"当前请求路径")+"</strong>"+steps.map(function(step,index){return(index?"<span class='path-arrow'>›</span>":"")+"<span class='path-step'>"+esc(step)+"</span>"}).join("");
 }
 async function loadOverview(){
   try{
     var st=await api("/api/status");
     renderSideStatus(st);
     document.getElementById("st-version").textContent=st.plugin_version||"-";
-    document.getElementById("side-version").textContent="WebUI "+(st.plugin_version||"5.0.0-test0");
-    document.getElementById("side-foot-version").textContent="WebUI "+(st.plugin_version||"5.0.0-test0");
+    document.getElementById("side-version").textContent="WebUI "+(st.plugin_version||"6.1.0");
+    document.getElementById("side-foot-version").textContent="WebUI "+(st.plugin_version||"6.1.0");
     document.getElementById("st-emb").textContent=(st.emb_cache_used!=null?n(st.emb_cache_used)+"/"+n(st.emb_cache_size):"-");
     document.getElementById("st-compress").textContent=n(st.compress_count||0);
-    document.getElementById("st-profile").textContent=st.profile&&st.profile.connected?"已接入":(st.rp_enhancer_enable?"可用":"-");
+    document.getElementById("st-profile").textContent=st.profile&&st.profile.connected?"已接入":(st.profile&&st.profile.enabled?"等待数据":"未接入");
     var tm=st.time_model||{};document.getElementById("st-time").textContent=tm.request_snapshot?"同轮快照":"兼容";document.getElementById("st-time-hint").textContent=(tm.current_timezone||"-")+(tm.solar_date?" · 最近 "+tm.solar_date+(tm.period?" "+tm.period:""):" · 等待首轮样本");
     renderStatusPanel(st);
     renderArchitecture(st);
@@ -338,13 +356,29 @@ async function loadOverview(){
   try{
     var s=await api("/api/stats");
     document.getElementById("st-memories").textContent=n(s.memories_total||0);
+    document.getElementById("arch-story-value").textContent=n(s.memories_total||0)+" 篇日记";
     overviewStructure=s.memory_structure||{};renderStructureChart();
-    var tq=s.time_quality||{};var months=(s.by_month||[]).slice(-14).map(function(x){return x.k+": "+x.v}).join("\n");document.getElementById("month-box").textContent=(months||"暂无")+"\n\n时间质量\n明确/本次: "+n(tq.exact_or_explicit||0)+"\n推定: "+n(tq.inferred||0)+"\n未知: "+n(tq.unknown||0);
+    renderMonthDistribution(s);
   }catch(e){}
   try{var cs=await api("/api/console/stats");renderMix(cs.latest||{},cs.totals||{})}catch(e){renderMix({},{})}
   try{var tl=await api("/api/timeline");var rows=tl.recent||[];document.getElementById("overview-timeline").innerHTML=rows.slice(0,5).map(itemCard).join("")||"<div class='empty'>暂无记忆</div>"}catch(e){}
 }
-function renderMix(latest,totals){var comp=latest.composition||{}, total=Number(latest.total_est_chars||0), label=latest.ts_iso||"最近样本";if(latest.outcome)label+=" · "+latest.outcome;if(!total&&totals){comp=totals;total=mixKeys.reduce(function(s,k){return s+Number(comp[k]||0)},0);label=total?"累计样本":"等待样本"}document.getElementById("mix-time").textContent=label;document.getElementById("mix-bars").innerHTML=total?mixKeys.map(function(k){var v=Number(comp[k]||0),p=pct(v,total);return"<div class='bar-row'><div>"+mixLabels[k]+"</div><div class='bar'><div class='fill "+k+"' style='width:"+p+"%'></div></div><div class='mono'>"+n(v)+" / "+p+"%</div></div>"}).join(""):"<div class='empty'>还没有请求样本。任意一次真实 LLM 对话后，这里都会显示当前时间、画像、日记、心潮与上下文占比。</div>"}
+function renderMonthDistribution(stats){
+  var rows=(stats.by_month||[]).slice(-14),max=Math.max(1,...rows.map(function(x){return Number(x.v)||0})),tq=stats.time_quality||{};
+  document.getElementById("month-box").innerHTML=(rows.length?"<div class='month-distribution'>"+rows.map(function(x){return"<div class='month-distribution-row'><span>"+esc(x.k)+"</span><div class='month-distribution-track'><span style='width:"+(Math.max(0,Number(x.v)||0)/max*100)+"%'></span></div><b>"+n(x.v)+" 篇</b></div>"}).join("")+"</div>":"<div class='empty'>暂无月份统计</div>")+"<div class='month-quality'><span>明确时间 "+n(tq.exact_or_explicit||0)+"</span><span>推定 "+n(tq.inferred||0)+"</span><span>未知 "+n(tq.unknown||0)+"</span></div>";
+}
+function renderMix(latest,totals){
+  var comp=latest.composition||{},total=Number(latest.total_est_chars||0),label=latest.ts_iso||"最近样本";
+  if(latest.outcome)label+=" · "+latest.outcome;
+  if(!total&&totals){comp=totals;total=mixKeys.reduce(function(s,k){return s+Number(comp[k]||0)},0);label=total?"累计样本":"等待样本"}
+  document.getElementById("mix-time").textContent=label;
+  var box=document.getElementById("mix-bars");
+  if(!total){box.innerHTML="<div class='empty'>还没有真实请求样本</div>";return}
+  var positive=mixKeys.filter(function(k){return Number(comp[k]||0)>0});
+  box.innerHTML="<div class='composition-ribbon' role='group' aria-label='本次输入组成'>"+positive.map(function(k){var value=Number(comp[k]||0),percent=pct(value,total);return"<button type='button' class='ribbon-segment "+k+"' style='flex-grow:"+value+"' data-mix-focus='"+k+"' aria-label='"+esc(mixLabels[k]+"，"+n(value)+" 字，"+percent+"%")+"' title='"+esc(mixLabels[k]+" · "+n(value)+" 字 · "+percent+"%")+"'></button>"}).join("")+"</div><div class='ribbon-readout' aria-live='polite'>输入估算 <b>"+n(total)+" 字</b></div>"+mixKeys.map(function(k){var v=Number(comp[k]||0),p=pct(v,total);return"<div class='bar-row' data-mix-key='"+k+"'><div>"+mixLabels[k]+"</div><div class='bar'><div class='fill "+k+"' style='width:"+p+"%'></div></div><div class='mono'>"+n(v)+" / "+p+"%</div></div>"}).join("");
+  function focusPart(key){box.querySelectorAll('[data-mix-key]').forEach(function(row){row.classList.toggle('mix-focused',row.dataset.mixKey===key)});box.querySelector('.ribbon-readout').textContent=key?mixLabels[key]+" · "+n(comp[key])+" 字 · "+pct(comp[key],total)+"%":"输入估算 "+n(total)+" 字"}
+  box.querySelectorAll('[data-mix-focus]').forEach(function(button){button.onmouseenter=button.onfocus=button.onclick=function(){focusPart(button.dataset.mixFocus)};button.onmouseleave=button.onblur=function(){focusPart('')}});
+}
 async function loadMemories(){try{var lim=document.getElementById("mem-limit").value||100;var f=(document.getElementById("mem-filter").value||"").toLowerCase();var d=await api("/api/memories?limit="+encodeURIComponent(lim));memoryCache=d.items||[];var rows=memoryCache.filter(function(x){return !f||JSON.stringify(x).toLowerCase().includes(f)});document.getElementById("mem-list").innerHTML=rows.map(itemCard).join("")||"<div class='empty'>没有结果</div>"}catch(e){document.getElementById("mem-list").innerHTML="<div class='empty'>"+esc(e.message)+"</div>"}}
 function epQualityLabel(v){return({source_grounded:"原始对话可追溯",mixed_user_edited:"原始证据 + 用户编辑",diary_derived:"旧日记推导"})[v]||v||"未知"}
 function episodeCard(x){var id=encodeURIComponent(x.memo_name||"");var change=x.state_change||x.long_effect||"没有记录长期变化";return"<div class='item'><div class='item-head'><div><div class='item-title'>"+esc(x.scene_anchor||x.memo_name||"未命名情景")+"</div><div class='small'>"+esc([x.occurred_at||"时间未知",x.memory_type||"",epQualityLabel(x.evidence_quality),"重要性 "+n(x.importance||3)].filter(Boolean).join(" · "))+"</div></div><button class='btn' onclick='loadEpisodeDetail(decodeURIComponent(\""+id+"\"))'>证据</button></div><div class='item-body'>"+esc(change)+"</div>"+(x.unresolved&&x.unresolved.length?"<div class='tags'><span class='tag'>未解决 "+n(x.unresolved.length)+"</span></div>":"")+"</div>"}
@@ -389,8 +423,8 @@ async function doEval(){
   }catch(e){document.getElementById("eval-preview").textContent=e.message}
 }
 function renderMonthIndex(d){var idx=(d.calendar||{}).index||{},cues=idx.cues||[],tags=idx.tags||[],entities=idx.entities||[],types=idx.memory_types||{};document.getElementById("month-index-detail").innerHTML="<div class='small'>检索线索</div><div class='month-cues'>"+cues.slice(0,18).map(function(x){return"<span class='tag'>"+esc(x.value)+" "+n(x.count)+"</span>"}).join("")+"</div><div class='small' style='margin-top:10px'>人物与实体</div><div class='month-cues'>"+entities.slice(0,12).map(function(x){return"<span class='tag'>"+esc(x.value)+"</span>"}).join("")+"</div><div class='small' style='margin-top:10px'>标签与类型</div><div class='month-cues'>"+tags.slice(0,12).map(function(x){return"<span class='tag'>"+esc(x.value)+"</span>"}).join("")+(Object.keys(types).map(function(k){return"<span class='tag'>"+esc(k)+" "+n(types[k])+"</span>"}).join(""))+"</div>"}
-function renderCalendar(d){var cal=d.calendar||{},weeks=cal.weeks||[];document.getElementById("month-title").textContent=(d.selected||"-")+" 日记日历";document.getElementById("month-meta").textContent=n(cal.memo_count||0)+" 篇 · "+n(cal.day_count||0)+" 个记忆日";document.getElementById("month-calendar").innerHTML="<div class='month-weekdays'><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div>"+weeks.map(function(week){return"<div class='month-week'>"+week.map(function(day){if(!day.day)return"<span class='month-day empty-day'></span>";var cls=day.count?(day.count>=3?" has-notes has-many":" has-notes"):"";return"<button class='month-day"+cls+"' onclick='showTimelineDay("+day.day+")'><span class='day-number'>"+day.day+"</span>"+(day.count?"<span class='day-count'>"+day.count+" 篇</span>":"")+"</button>"}).join("")+"</div>"}).join("");renderMonthIndex(d);showTimelineDay(0)}
-function showTimelineDay(day){timelineState.activeDay=day;document.querySelectorAll(".month-day").forEach(function(x){x.classList.remove("active")});if(day){var buttons=document.querySelectorAll(".month-day");buttons.forEach(function(x){if(Number((x.querySelector(".day-number")||{}).textContent)===day)x.classList.add("active")})}var rows=[],days=((timelineState.data||{}).calendar||{}).days||[];if(day){var hit=days.find(function(x){return Number(x.day)===Number(day)});rows=hit?hit.memos||[]:[];document.getElementById("day-title").textContent=(timelineState.selected||"")+"-"+String(day).padStart(2,"0")}else{document.getElementById("day-title").textContent="月份索引"}document.getElementById("day-memos").innerHTML=rows.map(itemCard).join("")}
+function renderCalendar(d){var cal=d.calendar||{},weeks=cal.weeks||[];document.getElementById("month-title").textContent=(d.selected||"-")+" 日记日历";document.getElementById("month-meta").textContent=n(cal.memo_count||0)+" 篇 · "+n(cal.day_count||0)+" 个记忆日";document.getElementById("month-calendar").innerHTML="<div class='month-weekdays'><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span></div>"+weeks.map(function(week){return"<div class='month-week'>"+week.map(function(day){if(!day.day)return"<span class='month-day empty-day'></span>";var cls=day.count?(day.count>=3?" has-notes has-many":" has-notes"):"";return"<button class='month-day"+cls+"' data-day='"+day.day+"' aria-pressed='false' aria-label='"+esc((d.selected||'')+'-'+String(day.day).padStart(2,'0')+'，'+(day.count||0)+' 篇日记')+"' onclick='showTimelineDay("+day.day+")'><span class='day-number'>"+day.day+"</span>"+(day.count?"<span class='day-count'>"+day.count+" 篇</span><span class='day-pages' aria-hidden='true'></span>":"")+"</button>"}).join("")+"</div>"}).join("");renderMonthIndex(d);showTimelineDay(0)}
+function showTimelineDay(day){timelineState.activeDay=day;document.querySelectorAll(".month-day[data-day]").forEach(function(x){var selected=Number(x.dataset.day)===Number(day);x.classList.toggle("active",selected);x.setAttribute('aria-pressed',String(selected))});var rows=[],days=((timelineState.data||{}).calendar||{}).days||[];if(day){var hit=days.find(function(x){return Number(x.day)===Number(day)});rows=hit?hit.memos||[]:[];document.getElementById("day-title").textContent=(timelineState.selected||"")+"-"+String(day).padStart(2,"0")}else{document.getElementById("day-title").textContent="月份索引"}document.getElementById("day-memos").innerHTML=rows.map(itemCard).join("")||(day?"<div class='empty'>这一天没有日记</div>":"")}
 async function loadTimeline(month){try{var d=await api("/api/timeline"+(month?"?month="+encodeURIComponent(month):""));timelineState={selected:d.selected||"",data:d,activeDay:0};document.getElementById("month-list").innerHTML=(d.months||[]).map(function(x){return"<button class='month-chip "+(x.year_month===d.selected?"active":"")+"' onclick='loadTimeline(\""+esc(x.year_month)+"\")'><b>"+esc(x.year_month)+"</b><span>"+n(x.memo_count)+"篇 · "+n(x.day_count)+"天</span></button>"}).join("")||"<div class='empty'>暂无日记</div>";renderCalendar(d)}catch(e){document.getElementById("month-calendar").innerHTML="<div class='empty'>"+esc(e.message)+"</div>"}}
 function shortName(id){return String(id||"").replace(/^memos\//,"")}
 var feedbackLabels={useful:"有帮助",key:"关键记忆",irrelevant:"无关",incorrect:"事实错误",stale:"已过时",frequent:"太频繁"};
@@ -408,20 +442,42 @@ function toggleProfileHistory(index){
   document.querySelectorAll(".profile-version").forEach(function(card){card.classList.remove("open");var btn=card.querySelector(".profile-version-toggle"),panel=card.querySelector(".profile-version-body"),label=card.querySelector(".profile-version-action-text");if(btn)btn.setAttribute("aria-expanded","false");if(panel){panel.hidden=true;panel.innerHTML=""}if(label)label.textContent="查看"});
   if(!opening||!target||!button||!body)return;
   var x=profileHistoryState[index]||{},profile=x.profile||"",facts=x.profile_facts||"";
-  body.innerHTML="<div class='profile-version-section'><div class='profile-version-label'>画像正文</div><div class='pre'>"+esc(profile||"无画像正文")+"</div></div>"+(facts?"<div class='profile-version-section'><div class='profile-version-label'>稳定事实</div><div class='pre'>"+esc(facts)+"</div></div>":"");
+  body.innerHTML="<div class='profile-version-section'><div class='profile-version-label'>人格内核</div><div class='pre'>"+esc(profile||"无人格内核正文")+"</div></div>"+(facts?"<div class='profile-version-section'><div class='profile-version-label'>稳定事实</div><div class='pre'>"+esc(facts)+"</div></div>":"");
   body.hidden=false;target.classList.add("open");button.setAttribute("aria-expanded","true");var label=button.querySelector(".profile-version-action-text");if(label)label.textContent="收起";
 }
 function renderProfileStatus(st){
   var connected=!!(st&&st.connected);
-  document.getElementById("profile-meta").textContent=connected?("v"+(st.version||1)+" · "+tsText(st.updated_ts)+" · 来源 "+(st.source_count||0)+" 条 · "+(st.fresh?"新鲜":"可能过期")):(st&&st.reason?st.reason:"未接入");
-  document.getElementById("profile-current").textContent=connected?(st.profile||"暂无当前画像"):"画像附属/内置画像未接入或暂无数据";
+  document.getElementById("profile-meta").textContent=connected?("v"+(st.version||1)+" · "+tsText(st.updated_ts)+" · 新证据 "+n(st.new_identity_evidence||0)+"/"+n(st.minimum_new_evidence||0)+" · "+(st.fresh?"可用":"可能过期")):(st&&st.reason?st.reason:"未接入");
+  document.getElementById("profile-current").textContent=connected?(st.profile||"暂无人格内核"):"长期人格内核未启用或暂无数据";
   document.getElementById("profile-facts-meta").textContent=connected?((st.facts_chars||0)+" 字"):"-";
   document.getElementById("profile-facts").textContent=connected?(st.profile_facts||"暂无稳定事实"):"暂无数据";
   var hist=connected?(st.history||[]):[];profileHistoryState=hist.slice().reverse();document.getElementById("profile-history-count").textContent=hist.length+" 个历史版本";
-  document.getElementById("profile-history").innerHTML=profileHistoryState.length?profileHistoryState.map(profileHistoryCard).join(""):"<div class='empty'>暂无历史画像。下一次画像更新后，旧画像会保存在这里。</div>";
+  document.getElementById("profile-history").innerHTML=profileHistoryState.length?profileHistoryState.map(profileHistoryCard).join(""):"<div class='empty'>暂无历史人格内核。下一次有效更新后，旧版本会保存在这里。</div>";
   var runs=connected?(st.runs||[]):[];
   document.getElementById("profile-runs").textContent=runs.length?runs.map(function(r){return tsText(r.created_ts)+"  "+(r.status||"-")+"  来源 "+(r.source_count||0)+" 条  "+(r.message||"")}).join("\n"):"暂无更新记录";
 }
+var stateReasonLabels={empty:"队列为空",deferred:"继续累计",minimum_interval:"普通更新冷却中",hard_change:"重大变化立即融合",meaningful_delta_threshold:"有效变化簇达到门槛",cross_axis_significant_change:"跨维度显著变化",max_wait_meaningful:"有效变化等待到期",no_meaningful_delta:"仅有重复日常，将清理队列",initial_state:"等待首次状态",failed_retry:"失败任务待重试",every_batch:"兼容逐批更新"};
+function renderProfileSemanticState(d){
+  d=d||{};var state=d.state||{},preview=d.pending_preview||{},delta=preview.delta||{},signal=preview.signal||{},summary=d.queue_summary||{},counts=summary.counts||{},history=d.history||[];
+  document.getElementById("profile-state-meta").textContent=d.ready?("v"+n(state.version||0)+" · "+n((state.rendered_text||"").length)+" 字 · 更新于 "+tsText(state.updated_ts)):(d.enabled?"等待首次融合":"已关闭");
+  document.getElementById("profile-state-current").textContent=state.rendered_text||"当前还没有滚动状态。人格内核仍可独立工作，待出现有效近期变化后会建立状态。";
+  var reason=stateReasonLabels[preview.reason]||preview.reason||"等待数据";
+  document.getElementById("profile-state-next").textContent=reason;
+  var metrics=[
+    ["待处理批次",n(preview.pending_batches!=null?preview.pending_batches:d.pending||0)],
+    ["有效变化簇",n(delta.cluster_count||0)+" / "+n(preview.cluster_threshold||d.batch_threshold||0)],
+    ["有效情景",n(delta.meaningful_episodes||0)+" / "+n(delta.total_episodes||preview.episode_count||0)],
+    ["变化信号",Number(signal.score||0).toFixed(2)+(signal.hard?" · 硬事件":"")],
+    ["状态年龄",d.state_age_hours==null?"尚未建立":Number(d.state_age_hours).toFixed(1)+" 小时"],
+    ["普通冷却",n(d.minimum_interval_hours||0)+" 小时"],
+    ["无变化拦截",n((summary.suppressed_reasons||{}).no_material_state_change||0)+" 次"],
+    ["日常队列清理",n((summary.suppressed_reasons||{}).no_meaningful_delta||0)+" 批"]
+  ];
+  document.getElementById("profile-state-decision").innerHTML="<div class='ctx-summary'>"+metrics.map(function(x){return"<div class='mini'>"+esc(x[0])+"<b>"+esc(x[1])+"</b></div>"}).join("")+"</div><div class='small' style='margin-top:10px'>判断："+esc(reason)+"。日常队列被清理时只移除状态融合任务，不删除 Episode、日记或原文。</div>";
+  document.getElementById("profile-state-history-count").textContent=history.length+" 个版本";
+  document.getElementById("profile-state-history").innerHTML=history.map(function(x){var s=x.state||{};return"<details class='item'><summary><b>v"+n(x.version||0)+"</b> · "+esc(tsText(x.created_ts))+" · "+esc(stateReasonLabels[String(x.reason||"").replace(/^adaptive_/,"")]||x.reason||"update")+"</summary><div class='pre' style='margin-top:10px'>"+esc(s.rendered_text||"")+"</div></details>"}).join("")||"<div class='empty'>暂无滚动状态历史</div>";
+}
+async function rebuildProfileSemanticState(){if(!confirm("从现有情景证据重新融合滚动状态？人格内核、日记和原文不会被修改，旧状态版本会保留。"))return;var meta=document.getElementById("profile-state-meta");meta.textContent="融合中";try{var d=await apiPost("/api/state/rebuild",{});meta.textContent=d.updated?"融合完成":"未更新："+(d.reason||"未知原因");await loadProfile()}catch(e){meta.textContent=e.message}}
 function renderTimeInsight(st){
   var box=document.getElementById("time-box"), connected=!!(st&&st.connected), stats=st&&st.stats||{}, evidence=st&&st.evidence||[];
   if(!connected){box.innerHTML="<div class='empty'>"+esc(st&&st.enabled?"时间洞察已开启，但暂无可注入内容。"+(st.reason?" 原因："+st.reason:""):"时间洞察未开启")+"</div>";return}
@@ -430,7 +486,7 @@ function renderTimeInsight(st){
     +"<div class='pre' style='max-height:220px'>"+esc(block||"暂无注入文本")+"</div>"
     +"<div class='list' style='margin-top:10px'>"+(evidence.length?evidence.slice(0,8).map(function(x){return"<div class='item'><div class='item-title'>"+esc(x.title||x.memo_name||x.date||"证据")+"</div><div class='small'>"+esc(x.reason||x.type||"")+"</div><div class='item-body'>"+esc(x.text||x.preview||"").slice(0,260)+"</div></div>"}).join(""):"<div class='empty'>暂无证据明细</div>")+"</div>";
 }
-async function loadProfile(){try{renderProfileStatus(await api("/api/affiliate/status"))}catch(e){renderProfileStatus({connected:false,reason:e.message})}try{renderTimeInsight(await api("/api/time-insight/status"))}catch(e){document.getElementById("time-box").innerHTML="<div class='empty'>"+esc(e.message)+"</div>"}}
+async function loadProfile(){var all=await Promise.allSettled([api("/api/affiliate/status"),api("/api/state/status"),api("/api/time-insight/status")]);if(all[0].status==="fulfilled")renderProfileStatus(all[0].value);else renderProfileStatus({connected:false,reason:all[0].reason&&all[0].reason.message||"读取失败"});if(all[1].status==="fulfilled")renderProfileSemanticState(all[1].value);else{document.getElementById("profile-state-current").textContent=all[1].reason&&all[1].reason.message||"读取失败";document.getElementById("profile-state-decision").innerHTML="<div class='empty'>无法读取状态判断</div>"}if(all[2].status==="fulfilled")renderTimeInsight(all[2].value);else document.getElementById("time-box").innerHTML="<div class='empty'>"+esc(all[2].reason&&all[2].reason.message||"读取失败")+"</div>"}
 function renderMessages(target,messages){var rows=messages||[];document.getElementById(target).innerHTML=rows.length?"<div class='msg-list'>"+rows.map(function(m){return"<div class='msg'><div class='msg-head'><span class='msg-role'>#"+esc(m.index)+" "+esc(m.role||"unknown")+"</span><span class='small'>"+n(m.chars||0)+" 字</span></div><div class='msg-body'>"+esc(m.content||"")+"</div></div>"}).join("")+"</div>":"<div class='empty'>暂无消息</div>"}
 function contextSummary(sel,settings){var st=(sel&&sel.last_request_stat)||{};return"<div class='ctx-summary'><div class='mini'>当前条数<b>"+n(sel&&sel.history_count||0)+"</b></div><div class='mini'>请求保留<b>"+n(settings&&settings.request_keep||0)+"</b></div><div class='mini'>最近裁剪<b>"+n(st.trimmed||0)+"</b></div><div class='mini'>归档保留<b>"+n(settings&&settings.archive_keep||0)+"</b></div></div>"}
 function contextOptionKey(x){return encodeURIComponent(x.unified_msg_origin||"")+"|"+encodeURIComponent(x.conversation_id||"")}
@@ -450,7 +506,7 @@ async function clearLogs(){try{await api("/api/logs?clear=1");loadLogs()}catch(e
 function settingValueText(v){if(v===true)return"开启";if(v===false)return"关闭";return String(v==null?"":v)}
 function settingControl(item){var key=item.key,id="setting-"+key,value=item.value==null?"":item.value,change="markSetting(this,'"+key+"','"+item.type+"')";if(item.type==="bool")return"<label class='toggle-line'><span>"+(value?"开启":"关闭")+"</span><input id='"+id+"' type='checkbox' "+(value?"checked":"")+" onchange=\""+change+"\"></label>";if((item.options||[]).length)return"<select id='"+id+"' onchange=\""+change+"\">"+item.options.map(function(o){return"<option value='"+esc(o.value)+"' "+(String(o.value)===String(value)?"selected":"")+">"+esc(o.label)+"</option>"}).join("")+"</select>";var type=item.type==="int"||item.type==="float"?"number":(item.sensitive?"password":"text"),step=item.step!=null?item.step:(item.type==="float"?"any":"1"),attrs=type==="number"?(" step='"+esc(step)+"'"+(item.min!=null?" min='"+esc(item.min)+"'":"")+(item.max!=null?" max='"+esc(item.max)+"'":"")):"",placeholder=item.sensitive?(item.configured?"已配置，留空保持原值":"尚未配置"):"";return"<input id='"+id+"' type='"+type+"' value='"+esc(value)+"' placeholder='"+esc(placeholder)+"'"+attrs+" onchange=\""+change+"\">"}
 function settingRow(item){var reset=item.sensitive?(item.configured?"<button onclick=\"clearSensitiveSetting('"+item.key+"')\">清除</button>":""):"<button onclick=\"resetSetting('"+item.key+"')\">恢复默认</button>";return"<div class='setting-row' id='row-"+item.key+"' data-group='"+esc(item.group)+"' data-search='"+esc((item.key+" "+item.description+" "+(item.hint||"")).toLowerCase())+"'><div class='setting-copy'><div class='setting-name'>"+esc(item.description||item.key)+"</div><div class='setting-key'>"+esc(item.key)+"</div>"+(item.hint?"<div class='setting-hint'>"+esc(item.hint)+"</div>":"")+"</div><div class='setting-control'>"+settingControl(item)+"<div class='setting-actions'>"+reset+"</div></div></div>"}
-function renderSettings(){var groups=settingsState.groups||[],items=settingsState.items||[],html="";groups.forEach(function(group){var rows=items.filter(function(x){return x.group===group});if(!rows.length)return;var compatibility=group.indexOf("兼容回退")===0,head="<div class='settings-group-head'><h3>"+esc(group)+"</h3><span class='small'>"+n(rows.length)+" 项</span></div>",grid="<div class='setting-grid'>"+rows.map(settingRow).join("")+"</div>";html+=compatibility?("<details class='settings-group compatibility' data-settings-group='"+esc(group)+"'><summary>"+esc(group)+" · "+n(rows.length)+" 项 · 仅在 4.x 当前主路关闭或未就绪时生效</summary>"+grid+"</details>"):("<section class='settings-group' data-settings-group='"+esc(group)+"'>"+head+grid+"</section>")});document.getElementById("settings-groups").innerHTML=html||"<div class='settings-empty'>没有可编辑设置</div>";filterSettings()}
+function renderSettings(){var groups=settingsState.groups||[],items=settingsState.items||[],html="<p class='small'><a href='/models'>模型、超时与并发设置已集中到调度中心 →</a></p>";groups.forEach(function(group){var rows=items.filter(function(x){return x.group===group&&!x.scheduling});if(!rows.length)return;var compatibility=group.indexOf("兼容回退")===0,grid="<div class='setting-grid'>"+rows.map(settingRow).join("")+"</div>";html+="<details class='settings-group"+(compatibility?" compatibility":"")+"' data-settings-group='"+esc(group)+"'><summary>"+esc(group)+" · "+n(rows.length)+" 项"+(compatibility?" · 兼容路线":"")+"</summary>"+grid+"</details>"});document.getElementById("settings-groups").innerHTML=html;filterSettings()}
 function renderPresets(){document.getElementById("preset-strip").innerHTML=(settingsState.presets||[]).map(function(p){return"<button class='preset-btn' onclick=\"applyPreset('"+esc(p.id)+"')\"><strong>"+esc(p.name)+"</strong><span>"+esc(p.summary)+"</span><em>成本 "+esc(p.cost)+" · "+n(Object.keys(p.values||{}).length)+" 项参数</em></button>"}).join("")||"<div class='empty'>没有可用预设</div>"}
 async function loadSettings(){try{var d=await api("/api/settings");settingsState={items:d.items||[],byKey:{},presets:d.presets||[],groups:d.groups||[],dirty:{}};settingsState.items.forEach(function(x){settingsState.byKey[x.key]=x});var sel=document.getElementById("settings-group-filter"),prev=sel.value;sel.innerHTML="<option value=''>全部分类</option>"+settingsState.groups.map(function(g){return"<option value='"+esc(g)+"'>"+esc(g)+"</option>"}).join("");if(settingsState.groups.includes(prev))sel.value=prev;document.getElementById("settings-notice").textContent=d.notice||"";renderPresets();renderSettings();updateSettingsDirty()}catch(e){document.getElementById("settings-groups").innerHTML="<div class='settings-empty'>"+esc(e.message)+"</div>"}}
 function readSettingControl(el,type){if(type==="bool")return!!el.checked;if(type==="int")return parseInt(el.value,10);if(type==="float")return parseFloat(el.value);return el.value}
@@ -493,7 +549,11 @@ async function deleteBackup(){var file=backupState.selected;if(!file||!confirm("
 async function scheduleBackupRestore(){var file=backupState.selected;if(!file)return;var msg="将「"+file+"」预约为恢复目标。\n\n系统会先创建一份当前数据的安全备份；本次运行不替换数据库，只有下次插件重载时才会在数据库打开前恢复。Memos 服务端数据与 AstrBot 配置不会改变。\n\n确认继续？";if(!confirm(msg))return;try{var d=await apiPost("/api/data-backup/restore",{file:file,confirm:"RESTORE_ON_RELOAD"});alert("恢复已预约。\n安全备份："+(((d.pending_restore||{}).safety_backup)||"已创建")+"\n\n请在合适的时候重载插件使恢复生效。");await loadBackups()}catch(e){alert("恢复预约失败："+e.message)}}
 async function cancelBackupRestore(){if(!confirm("取消当前恢复预约？已经创建的安全备份会保留。"))return;try{await apiPost("/api/data-backup/cancel-restore",{});await loadBackups()}catch(e){alert("取消失败："+e.message)}}
 async function loadDebug(){try{document.getElementById("debug-box").textContent=pretty(await api("/api/debug"))}catch(e){document.getElementById("debug-box").textContent=e.message}}async function testApi(path){try{document.getElementById("debug-box").textContent=pretty(await api(path))}catch(e){document.getElementById("debug-box").textContent=e.message}}
+async function loadHouseEnvelope(){try{var d=await api("/api/house/overview");var el=document.getElementById("house-envelope"),badge=document.getElementById("house-envelope-badge"),count=Number((d.stats||{}).unread||0);el.hidden=!d.show_envelope;el.classList.toggle("new",count>0);badge.hidden=!count;badge.textContent=count>9?"9+":count}catch(e){document.getElementById("house-envelope").hidden=true}}
+(function(){var el=document.getElementById("house-envelope"),drag=false,moved=false,sx=0,sy=0,ox=0,oy=0,key="memos-house-envelope:"+(innerWidth<=640?"mobile":"desktop");function clamp(){var r=el.getBoundingClientRect(),x=Math.max(6,Math.min(innerWidth-r.width-6,r.left)),y=Math.max(6,Math.min(innerHeight-r.height-6,r.top));el.style.left=x+"px";el.style.top=y+"px";el.style.right="auto";return{x:x,y:y}}try{var p=JSON.parse(localStorage.getItem(key)||"null");if(p){el.style.left=p.x+"px";el.style.top=p.y+"px";el.style.right="auto"}}catch(e){}el.addEventListener("pointerdown",function(e){drag=true;moved=false;sx=e.clientX;sy=e.clientY;var r=el.getBoundingClientRect();ox=r.left;oy=r.top;el.setPointerCapture(e.pointerId)});el.addEventListener("pointermove",function(e){if(!drag)return;var dx=e.clientX-sx,dy=e.clientY-sy;if(Math.abs(dx)+Math.abs(dy)>5)moved=true;el.style.left=ox+dx+"px";el.style.top=oy+dy+"px";el.style.right="auto"});el.addEventListener("pointerup",function(){if(!drag)return;drag=false;var p=clamp();try{localStorage.setItem(key,JSON.stringify(p))}catch(e){}if(!moved)location.href="/house"});addEventListener("resize",clamp)})();
 loadOverview();
+loadHouseEnvelope();
 </script>
 </body>
 </html>
+

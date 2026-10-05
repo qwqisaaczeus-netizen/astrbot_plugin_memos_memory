@@ -1,4 +1,4 @@
 name: astrbot_plugin_memos_memory
 author: yjcmode
-version: 5.0.0-test0
-description: 面向长期角色扮演的 Memos 分层记忆、证据检索、滚动人格与非破坏式可达系统
+version: 6.1.0
+description: evidence-grounded long-term roleplay memory with source archives, semantic state, full-memory recall and non-destructive forgetting

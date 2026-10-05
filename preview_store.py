@@ -126,6 +126,40 @@ class PreviewStore:
             return False
         return self.update_status(preview_id, "discarded")
 
+    def record_inplace_success(
+        self, preview_id: str, memo_name: str, rollback_id: int,
+    ) -> bool:
+        """Mark a one-item in-place repair as confirmed and rollback-addressable."""
+        with self._lock:
+            conn = self._get_conn()
+            preview = self.get(preview_id)
+            if not preview or preview.get("status") == "discarded":
+                return False
+            now = time.time()
+            old_name = str(preview.get("old_memo_name") or memo_name)
+            conn.execute(
+                """INSERT INTO diary_preview_items
+                   (preview_id,item_index,old_memo_name,new_memo_name,status,error,
+                    rollback_id,created_ts,updated_ts)
+                   VALUES (?,0,?,?,?,'',?,?,?)
+                   ON CONFLICT(preview_id,item_index) DO UPDATE SET
+                    old_memo_name=excluded.old_memo_name,
+                    new_memo_name=excluded.new_memo_name,status='succeeded',error='',
+                    rollback_id=excluded.rollback_id,updated_ts=excluded.updated_ts""",
+                (
+                    str(preview_id), old_name, str(memo_name), "succeeded",
+                    int(rollback_id), now, now,
+                ),
+            )
+            conn.execute(
+                """UPDATE diary_rewrite_previews
+                   SET status='confirmed',updated_ts=?,confirmed_ts=?
+                   WHERE preview_id=?""",
+                (now, now, str(preview_id)),
+            )
+            conn.commit()
+            return True
+
     def confirm(
         self,
         preview_id: str,

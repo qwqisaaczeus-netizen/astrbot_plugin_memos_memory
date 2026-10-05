@@ -106,6 +106,7 @@ class MemosClient:
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.warning("[memos] 健康检查失败: %s", exc)
             self._connected = False
+            self._auth_ok = False
             return False
 
     async def diagnose(self) -> dict[str, Any]:
@@ -191,12 +192,27 @@ class MemosClient:
         async with session.get(self._url("/memos"), params=params) as resp:
             if resp.status != 200:
                 body = await resp.text()
+                self._connected = True
+                if resp.status in (401, 403):
+                    self._auth_ok = False
                 raise MemosError(_http_error_message("list_memos", resp.status, body))
-            data = await resp.json()
-        if isinstance(data, dict):
-            return {"memos": data.get("memos", []),
-                    "next_page_token": data.get("nextPageToken") or data.get("next_page_token", "")}
-        return {"memos": [], "next_page_token": ""}
+            try:
+                data = await resp.json()
+            except (aiohttp.ContentTypeError, json.JSONDecodeError, ValueError) as exc:
+                raise MemosError(f"list_memos 返回了无效 JSON: {type(exc).__name__}") from exc
+        self._connected = True
+        self._auth_ok = True
+        if not isinstance(data, dict):
+            raise MemosError("list_memos 返回结构无效: 根节点必须是对象")
+        memos = data.get("memos", [])
+        if not isinstance(memos, list) or any(not isinstance(item, dict) for item in memos):
+            raise MemosError("list_memos 返回结构无效: memos 必须是对象数组")
+        next_token = data.get("nextPageToken", data.get("next_page_token", ""))
+        if next_token is None:
+            next_token = ""
+        if not isinstance(next_token, str):
+            raise MemosError("list_memos 返回结构无效: page token 必须是字符串")
+        return {"memos": memos, "next_page_token": next_token}
 
     async def list_all_memos(self, page_size: int = 100) -> list[dict[str, Any]]:
         """翻页拉取全部 memo(自动处理 page_token)。用于全量 reindex / 对账。"""
@@ -205,8 +221,15 @@ class MemosClient:
         seen_tokens: set[str] = set()
         while True:
             batch = await self.list_memos(page_size=page_size, page_token=token)
-            out.extend(batch.get("memos", []))
+            if not isinstance(batch, dict):
+                raise MemosError("list_all_memos 收到无效分页结果")
+            memos = batch.get("memos")
             next_token = batch.get("next_page_token", "")
+            if not isinstance(memos, list) or any(not isinstance(item, dict) for item in memos):
+                raise MemosError("list_all_memos 收到无效 memos 分页")
+            if not isinstance(next_token, str):
+                raise MemosError("list_all_memos 收到无效 page token")
+            out.extend(memos)
             if not next_token:
                 break
             if next_token == token or next_token in seen_tokens:

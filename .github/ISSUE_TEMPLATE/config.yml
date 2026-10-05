@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 安装、升级与回退
+    url: https://github.com/qwqisaaczeus-netizen/astrbot_plugin_memos_memory/blob/main/docs/installation.md
+    about: 先核对固定版本附件、校验值、启用条件与数据备份
+  - name: 当前发布与已知边界
+    url: https://github.com/qwqisaaczeus-netizen/astrbot_plugin_memos_memory/releases/tag/v6.1.0
+    about: 查看 6.1.0 更新说明与验证范围

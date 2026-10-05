@@ -7,6 +7,7 @@ elsewhere; this class only knows the active `VectorGeneration` to address
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -113,6 +114,7 @@ class EpisodeRepo:
                 episode_id TEXT DEFAULT '',
                 old_content TEXT NOT NULL,
                 new_content TEXT NOT NULL,
+                old_episode_json TEXT NOT NULL DEFAULT '{}',
                 note TEXT DEFAULT '',
                 created_ts REAL NOT NULL,
                 reverted_ts REAL
@@ -184,10 +186,20 @@ class EpisodeRepo:
         ev_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(episode_evidence)").fetchall()}
         if "evidence_tier" not in ev_cols:
             conn.execute("ALTER TABLE episode_evidence ADD COLUMN evidence_tier TEXT DEFAULT 'supporting'")
+        rollback_cols = {
+            str(r["name"])
+            for r in conn.execute("PRAGMA table_info(diary_rollbacks)").fetchall()
+        }
+        if "old_episode_json" not in rollback_cols:
+            conn.execute(
+                "ALTER TABLE diary_rollbacks "
+                "ADD COLUMN old_episode_json TEXT NOT NULL DEFAULT '{}'"
+            )
         ep_cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(episodes)").fetchall()}
         if "embedding_generation" not in ep_cols:
             conn.execute("ALTER TABLE episodes ADD COLUMN embedding_generation TEXT DEFAULT ''")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_episode_active ON episodes(active, event_ts DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_episode_source_batch ON episodes(source_batch_id, active)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_episode_memo ON episodes(memo_name)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_episode ON episode_evidence(episode_id, evidence_index)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_episode_turn_link ON episode_turn_links(batch_id, turn_index)")
@@ -480,6 +492,161 @@ class EpisodeRepo:
             episode["source_turns"] = []
         return episode
 
+    @staticmethod
+    def _json_sql_value(value: Any) -> Any:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return {"blob64": base64.b64encode(bytes(value)).decode("ascii")}
+        return value
+
+    @staticmethod
+    def _sql_json_value(value: Any) -> Any:
+        if isinstance(value, dict) and set(value) == {"blob64"}:
+            return base64.b64decode(str(value["blob64"]).encode("ascii"))
+        return value
+
+    def episode_snapshot(self, memo_name: str) -> dict[str, Any] | None:
+        """Capture the exact machine record before an in-place diary replacement."""
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT * FROM episodes WHERE memo_name=? AND active=1",
+                (str(memo_name),),
+            ).fetchone()
+            if row is None:
+                return None
+            episode_id = str(row["episode_id"])
+            row_id = int(row["id"])
+            evidence = conn.execute(
+                "SELECT * FROM episode_evidence WHERE episode_id=? ORDER BY evidence_index",
+                (episode_id,),
+            ).fetchall()
+            links = conn.execute(
+                "SELECT * FROM episode_turn_links WHERE episode_id=?",
+                (episode_id,),
+            ).fetchall()
+            versions = conn.execute(
+                "SELECT * FROM embedding_versions WHERE kind='card' AND row_id=?",
+                (row_id,),
+            ).fetchall()
+            vec_rows: list[dict[str, Any]] = []
+            if self._gen._vec_ok:
+                for generation in {str(item["generation"]) for item in versions}:
+                    try:
+                        table = self._gen.table_name_for("card", generation)
+                        vec_row = conn.execute(
+                            f"SELECT rowid,embedding FROM {table} WHERE rowid=?",
+                            (row_id,),
+                        ).fetchone()
+                        if vec_row is not None:
+                            vec_rows.append({
+                                "generation": generation,
+                                "embedding": self._json_sql_value(vec_row["embedding"]),
+                            })
+                    except Exception:
+                        continue
+            encode = lambda rows: [
+                {key: self._json_sql_value(value) for key, value in dict(item).items()}
+                for item in rows
+            ]
+            return {
+                "episode_row": encode([row])[0],
+                "evidence_rows": encode(evidence),
+                "turn_link_rows": encode(links),
+                "embedding_versions": encode(versions),
+                "vec_rows": vec_rows,
+            }
+
+    def restore_episode_snapshot(self, snapshot: dict[str, Any]) -> bool:
+        """Restore the exact Episode, evidence and cached card vectors."""
+        raw = snapshot.get("episode_row") if isinstance(snapshot, dict) else None
+        if not isinstance(raw, dict):
+            return False
+        old_row = {key: self._sql_json_value(value) for key, value in raw.items()}
+        episode_id = str(old_row.get("episode_id") or "")
+        memo_name = str(old_row.get("memo_name") or "")
+        row_id = int(old_row.get("id") or 0)
+        if not episode_id or not memo_name or row_id <= 0:
+            return False
+        with self._lock:
+            conn = self._get_conn()
+            current = conn.execute(
+                "SELECT id,episode_id FROM episodes WHERE memo_name=?",
+                (memo_name,),
+            ).fetchone()
+            if current is None or int(current["id"]) != row_id:
+                return False
+            try:
+                conn.execute("SAVEPOINT restore_diary_episode")
+                columns = [key for key in old_row if key != "id"]
+                conn.execute(
+                    "UPDATE episodes SET " + ",".join(f"{key}=?" for key in columns)
+                    + " WHERE id=?",
+                    (*[old_row[key] for key in columns], row_id),
+                )
+                conn.execute(
+                    "DELETE FROM episode_evidence WHERE episode_id=?", (episode_id,),
+                )
+                conn.execute(
+                    "DELETE FROM episode_turn_links WHERE episode_id=?", (episode_id,),
+                )
+                for table, key in (
+                    ("episode_evidence", "evidence_rows"),
+                    ("episode_turn_links", "turn_link_rows"),
+                ):
+                    for item in snapshot.get(key) or []:
+                        values = {
+                            col: self._sql_json_value(value)
+                            for col, value in dict(item).items()
+                        }
+                        cols = list(values)
+                        conn.execute(
+                            f"INSERT INTO {table} ({','.join(cols)}) VALUES "
+                            f"({','.join('?' for _ in cols)})",
+                            tuple(values[col] for col in cols),
+                        )
+                conn.execute(
+                    "DELETE FROM embedding_versions WHERE kind='card' AND row_id=?",
+                    (row_id,),
+                )
+                for item in snapshot.get("embedding_versions") or []:
+                    values = {
+                        col: self._sql_json_value(value)
+                        for col, value in dict(item).items()
+                    }
+                    cols = list(values)
+                    conn.execute(
+                        f"INSERT INTO embedding_versions ({','.join(cols)}) VALUES "
+                        f"({','.join('?' for _ in cols)})",
+                        tuple(values[col] for col in cols),
+                    )
+                if self._gen._vec_ok:
+                    generations = {
+                        str(item.get("generation") or "")
+                        for item in snapshot.get("vec_rows") or []
+                    }
+                    generations.add(self._gen.active_generation())
+                    for generation in generations:
+                        if not generation:
+                            continue
+                        table = self._gen.table_name_for("card", generation)
+                        conn.execute(f"DELETE FROM {table} WHERE rowid=?", (row_id,))
+                    for item in snapshot.get("vec_rows") or []:
+                        generation = str(item.get("generation") or "")
+                        if generation:
+                            table = self._gen.table_name_for("card", generation)
+                            conn.execute(
+                                f"INSERT INTO {table}(rowid,embedding) VALUES (?,?)",
+                                (row_id, self._sql_json_value(item.get("embedding"))),
+                            )
+                conn.execute("RELEASE SAVEPOINT restore_diary_episode")
+                conn.commit()
+                return True
+            except Exception:
+                conn.execute("ROLLBACK TO SAVEPOINT restore_diary_episode")
+                conn.execute("RELEASE SAVEPOINT restore_diary_episode")
+                conn.rollback()
+                raise
+
     def episodes_for_batch(self, batch_id: str) -> list[dict[str, Any]]:
         if not batch_id:
             return []
@@ -494,6 +661,27 @@ class EpisodeRepo:
             if detail:
                 out.append(detail)
         return out
+
+    def fallback_repair_candidates(self, limit: int = 100) -> list[dict[str, Any]]:
+        """List published fallback diaries that retain first-hand source turns."""
+        rows = self._get_conn().execute(
+            """SELECT e.episode_id,e.memo_name,e.source_batch_id,e.occurred_at,
+                      e.scene_anchor,e.scene_start_turn,e.scene_end_turn,
+                      e.render_retry_reason,e.diary_render_version,e.created_ts,
+                      LENGTH(e.card_text) AS card_len,b.message_count,
+                      b.status AS batch_status,b.attempts,b.last_error,b.next_retry_ts,
+                      (SELECT COUNT(*) FROM source_turns s
+                        WHERE s.batch_id=e.source_batch_id) AS source_turns
+                 FROM episodes e
+                 JOIN source_batches b ON b.batch_id=e.source_batch_id
+                WHERE e.active=1 AND e.render_fallback=1
+                  AND e.source_batch_id IS NOT NULL AND e.source_batch_id!=''
+                  AND EXISTS (SELECT 1 FROM source_turns s2
+                               WHERE s2.batch_id=e.source_batch_id)
+                ORDER BY e.created_ts DESC LIMIT ?""",
+            (max(1, min(500, int(limit))),),
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def memo_names(self) -> set[str]:
         rows = self._get_conn().execute("SELECT memo_name FROM episodes WHERE active=1").fetchall()
@@ -579,21 +767,69 @@ class EpisodeRepo:
                 conn.commit()
             return last_id if return_last_id else count
 
+    def record_content_rollback(
+        self,
+        *,
+        memo_name: str,
+        episode_id: str,
+        old_content: str,
+        new_content: str,
+        old_episode: dict[str, Any] | None = None,
+        note: str = "",
+    ) -> int:
+        """Persist an in-place Memos edit so it can be restored exactly."""
+        with self._lock:
+            conn = self._get_conn()
+            cur = conn.execute(
+                """INSERT INTO diary_rollbacks
+                   (memo_name,episode_id,old_content,new_content,old_episode_json,note,created_ts)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (
+                    str(memo_name), str(episode_id), str(old_content),
+                    str(new_content), json.dumps(old_episode or {}, ensure_ascii=False),
+                    str(note or "")[:500], time.time(),
+                ),
+            )
+            conn.commit()
+            return int(cur.lastrowid or 0)
+
     def rollback_rows_for_memo(self, memo_name: str) -> list[dict[str, Any]]:
         rows = self._get_conn().execute(
-            """SELECT id,memo_name,episode_id,old_content,new_content,note,created_ts,reverted_ts
+            """SELECT id,memo_name,episode_id,old_content,new_content,old_episode_json,
+                      note,created_ts,reverted_ts
                FROM diary_rollbacks WHERE memo_name=? ORDER BY created_ts DESC""",
             (str(memo_name),),
         ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._decode_rollback(row) for row in rows]
 
     def rollback_history(self, limit: int = 30) -> list[dict[str, Any]]:
         rows = self._get_conn().execute(
-            """SELECT id,memo_name,episode_id,old_content,new_content,note,created_ts,reverted_ts
+            """SELECT id,memo_name,episode_id,old_content,new_content,old_episode_json,
+                      note,created_ts,reverted_ts
                FROM diary_rollbacks ORDER BY created_ts DESC LIMIT ?""",
             (max(1, min(200, int(limit))),),
         ).fetchall()
-        return [dict(row) for row in rows]
+        return [self._decode_rollback(row) for row in rows]
+
+    @staticmethod
+    def _decode_rollback(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        data = dict(row)
+        raw = data.pop("old_episode_json", "{}")
+        try:
+            parsed = json.loads(raw or "{}")
+        except (TypeError, json.JSONDecodeError):
+            parsed = {}
+        data["old_episode"] = parsed if isinstance(parsed, dict) else {}
+        return data
+
+    def rollback_by_id(self, rollback_id: int) -> dict[str, Any] | None:
+        row = self._get_conn().execute(
+            """SELECT id,memo_name,episode_id,old_content,new_content,old_episode_json,
+                      note,created_ts,reverted_ts
+               FROM diary_rollbacks WHERE id=?""",
+            (int(rollback_id),),
+        ).fetchone()
+        return self._decode_rollback(row) if row else None
 
     def mark_rollback_reverted(self, rollback_id: int) -> None:
         with self._lock:

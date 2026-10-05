@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 class SourceArchive:
     """Repository: complete raw conversation + per-chunk vectors."""
 
-    SCHEMA_VERSION = 5
+    SCHEMA_VERSION = 6
 
     def __init__(
         self,
@@ -55,10 +55,27 @@ class SourceArchive:
                 first_event_ts REAL DEFAULT 0,
                 last_event_ts REAL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'archived',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT DEFAULT '',
+                next_retry_ts REAL NOT NULL DEFAULT 0,
                 created_ts REAL NOT NULL,
                 updated_ts REAL NOT NULL
             )"""
         )
+        batch_cols = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(source_batches)").fetchall()
+        }
+        if "attempts" not in batch_cols:
+            conn.execute(
+                "ALTER TABLE source_batches ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+            )
+        if "last_error" not in batch_cols:
+            conn.execute("ALTER TABLE source_batches ADD COLUMN last_error TEXT DEFAULT ''")
+        if "next_retry_ts" not in batch_cols:
+            conn.execute(
+                "ALTER TABLE source_batches ADD COLUMN next_retry_ts REAL NOT NULL DEFAULT 0"
+            )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS source_turns (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,15 +193,38 @@ class SourceArchive:
             conn.commit()
         return batch_id
 
-    def mark_batch(self, batch_id: str, status: str) -> None:
+    def mark_batch(
+        self,
+        batch_id: str,
+        status: str,
+        *,
+        error: str = "",
+        retry_after: float = 0.0,
+        increment_attempt: bool = False,
+    ) -> None:
         if not batch_id:
             return
+        now = time.time()
+        next_retry_ts = now + max(0.0, float(retry_after or 0.0))
         with self._lock:
             conn = self._get_conn()
-            conn.execute(
-                "UPDATE source_batches SET status=?,updated_ts=? WHERE batch_id=?",
-                (str(status), time.time(), batch_id),
-            )
+            if str(status) == "committed":
+                conn.execute(
+                    """UPDATE source_batches
+                       SET status=?,last_error='',next_retry_ts=0,updated_ts=?
+                       WHERE batch_id=?""",
+                    (str(status), now, batch_id),
+                )
+            else:
+                conn.execute(
+                    """UPDATE source_batches
+                       SET status=?,attempts=attempts+?,last_error=?,next_retry_ts=?,updated_ts=?
+                       WHERE batch_id=?""",
+                    (
+                        str(status), 1 if increment_attempt else 0,
+                        str(error or "")[:1000], next_retry_ts, now, batch_id,
+                    ),
+                )
             conn.commit()
 
     # ---- reads ---------------------------------------------------------
@@ -198,6 +238,17 @@ class SourceArchive:
             (batch_id,),
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def batch_info(self, batch_id: str) -> dict[str, Any] | None:
+        if not batch_id:
+            return None
+        row = self._get_conn().execute(
+            """SELECT batch_id,session_id,source_kind,message_count,status,
+                      attempts,last_error,next_retry_ts,created_ts,updated_ts
+               FROM source_batches WHERE batch_id=?""",
+            (str(batch_id),),
+        ).fetchone()
+        return dict(row) if row else None
 
     def turn_chunks_for_turn(self, turn_id: int) -> list[dict[str, Any]]:
         rows = self._get_conn().execute(

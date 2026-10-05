@@ -50,6 +50,10 @@ TEMPORAL_MARKERS = (
 )
 RELATION_CUE_WORDS = ("答应", "承诺", "约定", "拒绝", "分手", "和好", "离开", "重逢")
 EMOTION_CUE_WORDS = ("生气", "难过", "害怕", "高兴", "紧张", "安心", "委屈")
+CURRENT_STATE_WORDS = ("现在", "目前", "如今", "还", "仍然", "已经", "是否", "是不是", "关系", "边界", "称呼")
+EVOLUTION_WORDS = ("以前", "后来", "变化", "改变", "第一次", "最初", "从前", "怎么变", "为什么会", "发展")
+PROSPECTIVE_WORDS = ("答应", "承诺", "约定", "计划", "下次", "还没", "没完成", "未完成", "什么时候", "以后", "等待")
+COUNTEREVIDENCE_WORDS = ("还", "仍然", "是否", "是不是", "已经", "不再", "为什么", "怎么变")
 ENTITY_SUFFIXES = (
     "钥匙", "戒指", "项链", "盒子", "箱子", "房间", "学校", "医院", "车站",
     "天台", "寺庙", "破庙", "公园", "广场", "桥边", "河边", "海边",
@@ -79,6 +83,16 @@ class QueryPlan:
     context_turn_indexes: list[int] = field(default_factory=list)
     rewritten: bool = False  # True when LLM disambiguation was applied
     raw_standalone: str = ""
+    thread_intent: bool = False
+    current_state_intent: bool = False
+    evolution_intent: bool = False
+    prospective_intent: bool = False
+    target_entities: list[str] = field(default_factory=list)
+    target_claim_slots: list[str] = field(default_factory=list)
+    time_constraints: list[str] = field(default_factory=list)
+    requires_counterevidence: bool = False
+    # Optional caller-provided signal; planning itself never invokes an online model.
+    emotion_signal: float = 0.0
 
 
 class QueryPlanner:
@@ -87,6 +101,11 @@ class QueryPlanner:
 
     def __init__(self, plugin: Any):
         self.plugin = plugin
+
+    @staticmethod
+    def _emotion_signal(emotion_cues: list[str]) -> float:
+        """Derive a small local signal from explicit user emotion cues only."""
+        return min(1.0, 0.28 + 0.14 * max(0, len(emotion_cues) - 1)) if emotion_cues else 0.0
 
     def _temporal_constraint(self, query: str):
         reference_now = None
@@ -97,6 +116,33 @@ class QueryPlanner:
             except Exception:
                 reference_now = None
         return parse_temporal_constraint(query, reference_now)
+
+    @staticmethod
+    def _thread_facets(query: str, intent: str, entities: list[str]) -> dict[str, Any]:
+        current = any(word in query for word in CURRENT_STATE_WORDS)
+        evolution = any(word in query for word in EVOLUTION_WORDS)
+        prospective = any(word in query for word in PROSPECTIVE_WORDS)
+        slots: list[str] = []
+        for slot, words in (
+            ("relationship", ("关系", "亲近", "疏远", "和好", "分手", "信任")),
+            ("commitment", ("答应", "承诺", "约定", "保证")),
+            ("boundary", ("边界", "禁区", "不许", "不要叫", "不能叫", "别叫")),
+            ("preference", ("喜欢", "讨厌", "习惯", "害怕")),
+            ("identity", ("身份", "名字", "昵称", "称呼", "是谁")),
+            ("plan", ("计划", "打算", "准备", "下次")),
+            ("unresolved", ("还没", "未完成", "没解决", "等待")),
+        ):
+            if any(word in query for word in words):
+                slots.append(slot)
+        return {
+            "thread_intent": intent == "narrative" or evolution or current,
+            "current_state_intent": current,
+            "evolution_intent": evolution,
+            "prospective_intent": prospective,
+            "target_entities": list(entities),
+            "target_claim_slots": slots,
+            "requires_counterevidence": any(word in query for word in COUNTEREVIDENCE_WORDS),
+        }
 
     # ---- classify intent ---------------------------------------------
 
@@ -211,7 +257,10 @@ class QueryPlanner:
         resolved = self._extract_entities(text, window)[:12]
         cue_source = query + " " + text
         relation_cues = [w for w in RELATION_CUE_WORDS if w in cue_source]
-        emotion_cues = [w for w in EMOTION_CUE_WORDS if w in cue_source]
+        # Historical context may resolve people or events, but it cannot assert
+        # the user's current affect. Only explicit words in this turn contribute
+        # to the local prospective-memory urgency signal.
+        emotion_cues = [w for w in EMOTION_CUE_WORDS if w in query]
         broad = any(w in query for w in BROAD_WORDS)
         sparse_subject = self._query_subject_sparse(query)
         # "no candidate" only when we did try context but extracted nothing
@@ -225,6 +274,7 @@ class QueryPlanner:
             intent, query, resolved, temporal, relation_cues, emotion_cues,
         )
         confidence = self._confidence(intent, temporal, resolved)
+        thread = self._thread_facets(query, intent, resolved)
         return QueryPlan(
             intent=intent,
             search_text=standalone,
@@ -239,6 +289,9 @@ class QueryPlanner:
             if isinstance(contexts, list) else [],
             raw_standalone=query,
             rewritten=False,
+            time_constraints=temporal[:4],
+            emotion_signal=self._emotion_signal(emotion_cues),
+            **thread,
         )
 
     @staticmethod
@@ -332,18 +385,27 @@ class QueryPlanner:
             sparse = self._query_subject_sparse(user_query)
             cue_source = user_query + " " + context_text
             relation_cues = [w for w in RELATION_CUE_WORDS if w in cue_source]
-            emotion_cues = [w for w in EMOTION_CUE_WORDS if w in cue_source]
+            emotion_cues = [w for w in EMOTION_CUE_WORDS if w in user_query]
             reason, use_context = self._decide_use_context(
                 intent, has_temporal, "、".join(resolved), broad, sparse, bool(context_text))
             search_text = self._build_standalone(
                 intent, user_query, resolved, [], relation_cues, emotion_cues,
             )
             confidence = self._confidence(intent, list(constraint.markers), resolved)
+            thread = self._thread_facets(user_query, intent, resolved)
             plan = QueryPlan(intent=intent, search_text=search_text,
                              use_context=use_context, context_used_reason=reason,
                              confidence=confidence, resolved_entities=resolved,
-                             relation_cues=relation_cues, emotion_cues=emotion_cues,
-                             temporal_constraints=list(constraint.markers))
+                              relation_cues=relation_cues, emotion_cues=emotion_cues,
+                              temporal_constraints=list(constraint.markers),
+                              time_constraints=list(constraint.markers),
+                              emotion_signal=self._emotion_signal(emotion_cues), **thread)
+
+        if not context_text:
+            thread = self._thread_facets(user_query, plan.intent, plan.resolved_entities)
+            for key, value in thread.items():
+                setattr(plan, key, value)
+            plan.time_constraints = list(plan.temporal_constraints)
         return {
             "intent": plan.intent,
             "search_text": plan.search_text,
@@ -356,6 +418,15 @@ class QueryPlanner:
             "temporal": plan.intent == "temporal",
             "facets": {"entities": plan.resolved_entities, "temporal": plan.temporal_constraints,
                        "relation": plan.relation_cues},
+            "thread_intent": plan.thread_intent,
+            "current_state_intent": plan.current_state_intent,
+            "evolution_intent": plan.evolution_intent,
+            "prospective_intent": plan.prospective_intent,
+            "target_entities": plan.target_entities,
+            "target_claim_slots": plan.target_claim_slots,
+            "time_constraints": plan.time_constraints,
+            "requires_counterevidence": plan.requires_counterevidence,
+            "emotion_signal": plan.emotion_signal,
         }
 
     # ---- 6.2 optional LLM disambiguation (narrowed condition) --------
@@ -399,18 +470,31 @@ class QueryPlanner:
         standalone = str(data.get("standalone_query") or "").strip()
         if not standalone:
             return plan
+        current_query = plan.raw_standalone
         plan.raw_standalone = standalone
         plan.search_text = standalone
         plan.resolved_entities = [str(v).strip() for v in (data.get("resolved_entities") or [])
                                   if str(v).strip()][:12]
         plan.relation_cues = [str(v).strip() for v in (data.get("relation_cues") or [])
                               if str(v).strip()][:6]
-        plan.emotion_cues = [str(v).strip() for v in (data.get("emotion_cues") or [])
-                             if str(v).strip()][:6]
+        llm_emotion_cues = [
+            str(v).strip() for v in (data.get("emotion_cues") or [])
+            if str(v).strip()
+        ][:6]
+        # The optional LLM may identify cues, but only cues literally present in
+        # the current user turn are allowed to influence current-turn urgency.
+        plan.emotion_cues = [
+            cue for cue in llm_emotion_cues if cue in current_query
+        ]
+        plan.emotion_signal = self._emotion_signal(plan.emotion_cues)
         plan.temporal_constraints = [str(v).strip() for v in (data.get("temporal_constraints") or [])
                                      if str(v).strip()][:4]
         plan.intent = str(data.get("intent") or plan.intent)
         plan.confidence = max(plan.confidence, min(1.0, float(data.get("confidence") or 0.0) or 0.0))
+        thread = self._thread_facets(plan.raw_standalone, plan.intent, plan.resolved_entities)
+        for key, value in thread.items():
+            setattr(plan, key, value)
+        plan.time_constraints = list(plan.temporal_constraints)
         plan.rewritten = True
         # mark the reason extension so logging shows the LLM was used
         if plan.context_used_reason == "specific_query":

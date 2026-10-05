@@ -58,11 +58,11 @@ class StoreTestCase(unittest.IsolatedAsyncioTestCase):
             evidence_quality="source_grounded",
         )
 
-    async def test_facade_schema_version_is_seven(self):
-        self.assertEqual(EpisodicStore.SCHEMA_VERSION, 7)
-        self.assertEqual(SourceArchive.SCHEMA_VERSION, 5)
+    async def test_facade_schema_version(self):
+        self.assertEqual(EpisodicStore.SCHEMA_VERSION, 15)
+        self.assertEqual(SourceArchive.SCHEMA_VERSION, 6)
         row = self.store._connect().execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-        self.assertEqual(row["value"], "7")
+        self.assertEqual(row["value"], str(EpisodicStore.SCHEMA_VERSION))
 
     async def test_source_archive_preserves_complete_text_without_truncation(self):
         text = "开" + ("甲乙丙丁" * 6000) + "终"
@@ -326,6 +326,17 @@ class DiaryPipelineTests(unittest.TestCase):
             6,
         )
 
+    def test_paraphrased_stage_directions_still_look_like_a_transcript(self):
+        raw = "那天我们在院子里谈起旧信，后来一起走过长廊。" * 100
+        content = "我记得那天的旧信。" + (
+            "（她抬手整理衣袖，又望着门外迟疑了一会儿。）"
+            "我想把那时的心情留下来。"
+        ) * 16
+        report = self.pipeline.risk_report(content, raw)
+        self.assertLess(report.source_copy_ratio, 0.1)
+        self.assertGreater(report.stage_direction_ratio, 0.2)
+        self.assertGreaterEqual(report.risk, 0.42)
+
     def test_tier_coverage_requires_must_and_excludes_archive_only(self):
         episode = {"evidence": [
             {"tier": "must_write", "detail": "一起去公园"},
@@ -369,6 +380,29 @@ class DiaryPipelineTests(unittest.TestCase):
         })
         self.assertTrue(self.pipeline.first_person_check(result).passed)
         self.assertIn("我也记住了这份变化", result)
+
+    def test_fallback_compacts_large_evidence_instead_of_copying_transcript(self):
+        evidence = [
+            {
+                "tier": "must_write",
+                "detail": f"对话中记录：第{index}项关键变化，关系与承诺得到确认。" + ("逐字原话" * 90),
+                "quote": "这段引语不应在已有细节时重复追加",
+            }
+            for index in range(1, 17)
+        ]
+        raw = "\n".join(item["detail"] for item in evidence)
+        result = self.pipeline.fallback_diary({
+            "occurred_at": "2026-08-14",
+            "scene_anchor": "深夜谈话",
+            "evidence": evidence,
+            "affect_before": "迟疑",
+            "affect_after": "安定",
+        })
+        self.assertIn("第1项关键变化", result)
+        self.assertNotIn("第9项关键变化", result)
+        self.assertNotIn("这段引语不应在已有细节时重复追加", result)
+        self.assertLess(len(result), 2200)
+        self.assertLess(self.pipeline.risk_report(result, raw).risk, 0.42)
 
 
 class QueryPlannerTests(unittest.IsolatedAsyncioTestCase):

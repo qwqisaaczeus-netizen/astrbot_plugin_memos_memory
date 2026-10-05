@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import calendar
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -111,8 +112,41 @@ def _phase_baseline(
     }
 
 
-def _phase_geometry(settings: dict[str, Any]) -> tuple[int, int, int, int, int]:
-    cycle_length = max(21, min(45, int(settings.get("body_cycle_length") or 28)))
+def _calendar_anchor(year: int, month: int, anchor_day: int) -> date:
+    """Return this month's anchor, clamping only for short months."""
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, min(anchor_day, last_day))
+
+
+def _shift_month(year: int, month: int, offset: int) -> tuple[int, int]:
+    absolute = year * 12 + (month - 1) + offset
+    return absolute // 12, absolute % 12 + 1
+
+
+def _calendar_cycle_bounds(anchor: date, current: date) -> tuple[date, date] | None:
+    """Find the current and next month-aligned cycle boundaries."""
+    if current < anchor:
+        return None
+    anchor_day = anchor.day
+    cycle_start = _calendar_anchor(current.year, current.month, anchor_day)
+    if current < cycle_start:
+        year, month = _shift_month(current.year, current.month, -1)
+        cycle_start = _calendar_anchor(year, month, anchor_day)
+    if cycle_start < anchor:
+        cycle_start = anchor
+    year, month = _shift_month(cycle_start.year, cycle_start.month, 1)
+    next_start = _calendar_anchor(year, month, anchor_day)
+    return cycle_start, next_start
+
+
+def _phase_geometry(
+    settings: dict[str, Any], cycle_length_override: int | None = None,
+) -> tuple[int, int, int, int, int]:
+    cycle_length = (
+        max(21, min(45, int(cycle_length_override)))
+        if cycle_length_override is not None
+        else max(21, min(45, int(settings.get("body_cycle_length") or 28)))
+    )
     period_length = max(2, min(min(10, cycle_length - 6), int(settings.get("body_period_length") or 5)))
     ovulation_day = max(
         period_length + 2,
@@ -372,8 +406,19 @@ def calculate_body_state(
         return {"available": False, "reason": "anchor_invalid", "signals": {}, "tendencies": []}
 
     local_now = _local_datetime(now, str(settings.get("time_zone") or "Asia/Shanghai"))
-    cycle_length, period_length, ovulation_day, ovulation_start, ovulation_end = _phase_geometry(settings)
-    cycle_day = ((local_now.date() - anchor).days % cycle_length) + 1
+    bounds = _calendar_cycle_bounds(anchor, local_now.date())
+    if bounds is None:
+        return {
+            "available": False, "reason": "anchor_future",
+            "date": local_now.date().isoformat(), "anchorDate": anchor.isoformat(),
+            "signals": {}, "tendencies": [],
+        }
+    cycle_start, next_cycle_start = bounds
+    cycle_length = (next_cycle_start - cycle_start).days
+    cycle_length, period_length, ovulation_day, ovulation_start, ovulation_end = _phase_geometry(
+        settings, cycle_length,
+    )
+    cycle_day = (local_now.date() - cycle_start).days + 1
     phase, phase_day, phase_duration, progress, baseline_today = _baseline_for_cycle_day(
         cycle_day, cycle_length, period_length, ovulation_start, ovulation_end,
     )
@@ -451,9 +496,14 @@ def calculate_body_state(
         "phaseDay": phase_day,
         "phaseDuration": phase_duration,
         "cycleLength": cycle_length,
+        "cycleMode": "calendar",
+        "anchorDate": anchor.isoformat(),
+        "anchorDay": anchor.day,
+        "cycleStart": cycle_start.isoformat(),
+        "nextCycleStart": next_cycle_start.isoformat(),
         "periodLength": period_length,
         "ovulationDay": ovulation_day,
-        "daysToNextCycle": cycle_length - cycle_day + 1,
+        "daysToNextCycle": (next_cycle_start - local_now.date()).days,
         "progress": round(_clamp(progress), 3),
         "signals": signals,
         "signalLabels": SIGNAL_LABELS,

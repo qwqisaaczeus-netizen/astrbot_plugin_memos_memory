@@ -19,10 +19,14 @@ _JSON_BACKUP_FILES = (
     "xinchao_settings.json",
     "runtime_telemetry.json",
     "episodic_db_location.json",
+    "house_settings.json",
+    "external_models.json",
 )
 _JSON_RESTORE_FILES = {
     "xinchao_state.json",
     "xinchao_settings.json",
+    "house_settings.json",
+    "external_models.json",
 }
 
 
@@ -34,17 +38,38 @@ class DataBackupManager:
         vec_db_path: str,
         episodic_db_path: str,
         plugin_version: str,
+        house_db_path: str = "",
+        runtime_state_dir: str = "",
         interval_days: int = 14,
         keep: int = 6,
         enabled: bool = True,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         self.backup_dir = Path(backup_dir).expanduser().resolve()
         self.vec_db_path = Path(vec_db_path).expanduser().resolve()
         self.episodic_db_path = Path(episodic_db_path).expanduser().resolve()
+        self.house_db_path = (
+            Path(house_db_path).expanduser().resolve()
+            if str(house_db_path or "").strip()
+            else self.vec_db_path.parent / "house_state.sqlite3"
+        )
+        self.runtime_state_dir = (
+            Path(runtime_state_dir).expanduser().resolve()
+            if str(runtime_state_dir or "").strip()
+            else self.vec_db_path.parent
+        )
         self.plugin_version = str(plugin_version)
         self.interval_days = max(1, min(365, int(interval_days)))
         self.keep = max(1, min(52, int(keep)))
         self.enabled = bool(enabled)
+        # Only typed, non-identifying settings are accepted; never arbitrary config.
+        allowed = {"thread_memory_enable": bool, "thread_mode": str,
+                   "thread_canary_percent": int, "schema_version": str,
+                   "builder_version": str, "policy_version": str}
+        self.metadata = {key: value for key, value in (metadata or {}).items()
+                         if key in allowed and type(value) is allowed[key]
+                         and (not isinstance(value, str) or
+                              (len(value) <= 80 and all(c.isalnum() or c in '._-' for c in value)))}
         self._lock = threading.RLock()
         self._last_result: dict[str, Any] = {}
         self._pending_path = self.backup_dir / "pending_restore.json"
@@ -73,10 +98,110 @@ class DataBackupManager:
     def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = path.with_suffix(path.suffix + ".tmp")
-        temp_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
-        )
+        with temp_path.open("w", encoding="utf-8") as stream:
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
         os.replace(temp_path, path)
+
+    @staticmethod
+    def _flush_file(path: Path) -> None:
+        with path.open("r+b") as stream:
+            os.fsync(stream.fileno())
+
+    def _restore_transition(self, transition: str) -> None:
+        """Fault-injection seam; production deliberately does nothing."""
+
+    def _recover_restore(self) -> bool:
+        journal_path = self.backup_dir / "restore_journal.json"
+        if not journal_path.exists():
+            return False
+        # Unlike optional status JSON, a damaged recovery record must fail closed.
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        root = self.backup_dir / "restore_transaction"
+        allowed = {self.vec_db_path, self.episodic_db_path, self.house_db_path}
+        allowed.update(self.vec_db_path.parent / n for n in _JSON_RESTORE_FILES)
+        allowed.update(Path(str(p) + suffix) for p in (
+            self.vec_db_path, self.episodic_db_path, self.house_db_path,
+        )
+                       for suffix in ("-wal", "-shm"))
+        entries = journal["entries"]
+        for entry in entries:
+            if Path(entry["destination"]) not in allowed:
+                raise RuntimeError("invalid restore recovery destination")
+            if entry["copy"] != Path(entry["copy"]).name:
+                raise RuntimeError("invalid restore recovery copy")
+            if journal["state"] != "committed" and entry["existed"]:
+                if self._digest(root / entry["copy"]) != entry["sha256"]:
+                    raise RuntimeError("restore rollback snapshot corrupted")
+        if journal["state"] != "committed":
+            for index, entry in enumerate(entries):
+                destination = Path(entry["destination"])
+                if entry["existed"]:
+                    staged = destination.with_name(destination.name + ".restore-recovery")
+                    shutil.copyfile(root / entry["copy"], staged)
+                    self._flush_file(staged)
+                    os.replace(staged, destination)
+                else:
+                    destination.unlink(missing_ok=True)
+                self._restore_transition(f"rollback_{index}")
+            pending = self.pending_restore()
+            pending.update(status="failed", last_error="interrupted restore rolled back")
+            self._write_json_atomic(self._pending_path, pending)
+        else:
+            self._write_json_atomic(self._last_restore_path, journal["result"])
+            self._pending_path.unlink(missing_ok=True)
+        self._restore_transition("recovered")
+        journal_path.unlink()
+        shutil.rmtree(root, ignore_errors=True)
+        return True
+
+    def _replace_with_journal(self, replacements: list[tuple[Path, Path]], result: dict) -> None:
+        root = self.backup_dir / "restore_transaction"
+        # No journal means an interrupted preparation never modified destinations.
+        if root.exists():
+            shutil.rmtree(root)
+        root.mkdir()
+        entries = []
+        targets = []
+        for _, destination in replacements:
+            targets.append(destination)
+            if destination.suffix in {".db", ".sqlite3"}:
+                targets.extend(Path(str(destination) + s) for s in ("-wal", "-shm"))
+        for index, destination in enumerate(dict.fromkeys(targets)):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            copy = root / str(index)
+            existed = destination.exists()
+            if existed:
+                shutil.copyfile(destination, copy)
+                self._flush_file(copy)
+            entries.append(dict(destination=str(destination), copy=copy.name, existed=existed,
+                                sha256=self._digest(copy) if existed else ""))
+            self._restore_transition(f"snapshot_{index}")
+        journal = dict(state="prepared", entries=entries, result=result)
+        journal_path = self.backup_dir / "restore_journal.json"
+        self._write_json_atomic(journal_path, journal)
+        self._restore_transition("prepared")
+        try:
+            for index, (staged, destination) in enumerate(replacements):
+                # Stage beside the destination, including when the DB is on another volume.
+                adjacent = destination.with_name("new_" + destination.name + ".restore-new")
+                shutil.copyfile(staged, adjacent)
+                self._flush_file(adjacent)
+                os.replace(adjacent, destination)
+                self._restore_transition(f"replace_{index}")
+                if destination.suffix in {".db", ".sqlite3"}:
+                    for suffix in ("-wal", "-shm"):
+                        Path(str(destination) + suffix).unlink(missing_ok=True)
+                        self._restore_transition(f"sidecar_{index}_{suffix}")
+            journal["state"] = "committed"
+            self._write_json_atomic(journal_path, journal)
+            self._restore_transition("committed")
+        except Exception:
+            self._recover_restore()
+            raise
+        self._recover_restore()
+
 
     def pending_restore(self) -> dict[str, Any]:
         pending = self._read_json(self._pending_path)
@@ -117,16 +242,23 @@ class DataBackupManager:
         return digest.hexdigest().upper()
 
     @staticmethod
-    def _backup_sqlite(source_path: Path, target_path: Path) -> dict[str, Any]:
-        source = sqlite3.connect(str(source_path), timeout=15, check_same_thread=False)
-        target = sqlite3.connect(str(target_path), timeout=15, check_same_thread=False)
+    def _backup_sqlite(source_path: Path, target_path: Path, *, timeout: float = 30.0) -> dict[str, Any]:
+        deadline = time.monotonic() + max(0.01, float(timeout))
+        source = sqlite3.connect(source_path.resolve().as_uri() + '?mode=ro', uri=True, timeout=1)
+        target = None
+        def progress(status, remaining, total):
+            if time.monotonic() >= deadline:
+                raise TimeoutError('SQLite backup deadline exceeded')
         try:
-            source.backup(target, pages=256, sleep=0.02)
+            target = sqlite3.connect(str(target_path), timeout=1)
+            source.backup(target, pages=256, sleep=0.02, progress=progress)
+            target.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
             row = target.execute("PRAGMA integrity_check").fetchone()
             if not row or str(row[0]).lower() != "ok":
                 raise RuntimeError(f"integrity_check failed for {source_path.name}")
         finally:
-            target.close()
+            if target is not None:
+                target.close()
             source.close()
         return {
             "name": source_path.name,
@@ -136,11 +268,26 @@ class DataBackupManager:
 
     @staticmethod
     def _check_sqlite(path: Path) -> None:
-        conn = sqlite3.connect(str(path), timeout=15)
+        conn = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=1)
+        deadline = time.monotonic() + 30.0
+        conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
         try:
             row = conn.execute("PRAGMA integrity_check").fetchone()
             if not row or str(row[0]).lower() != "ok":
                 raise RuntimeError(f"integrity_check failed for {path.name}")
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not tables:
+                raise RuntimeError('backup database has no schema')
+            if conn.execute('PRAGMA foreign_key_check').fetchone():
+                raise RuntimeError('backup foreign key validation failed')
+            if 'episode_turn_links' in tables:
+                if not {'episodes', 'source_turns'} <= tables:
+                    raise RuntimeError('backup source mapping schema incomplete')
+                if conn.execute('''SELECT 1 FROM episode_turn_links l
+                    LEFT JOIN episodes e ON e.episode_id=l.episode_id
+                    LEFT JOIN source_turns s ON s.batch_id=l.batch_id AND s.turn_index=l.turn_index
+                    WHERE e.episode_id IS NULL OR s.batch_id IS NULL LIMIT 1''').fetchone():
+                    raise RuntimeError('backup source mapping contains orphan links')
         finally:
             conn.close()
 
@@ -187,6 +334,12 @@ class DataBackupManager:
         if bad_name:
             raise RuntimeError(f"backup ZIP integrity check failed: {bad_name}")
         names = archive.namelist()
+        allowed = {
+            "manifest.json", "memories.db", "episodic_memory.db",
+            "house_state.sqlite3", "llm_compensation.db", *_JSON_BACKUP_FILES,
+        }
+        if len(names) != len(set(names)) or set(names) - allowed:
+            raise RuntimeError("backup has duplicate or unsupported entries")
         for name in names:
             posix = Path(name.replace("\\", "/"))
             if name.startswith(("/", "\\")) or ".." in posix.parts:
@@ -200,6 +353,18 @@ class DataBackupManager:
             raise RuntimeError("backup manifest secret policy is invalid")
         if not manifest.get("databases"):
             raise RuntimeError("backup archive contains no database snapshot")
+        entries = list(manifest.get("databases") or []) + list(manifest.get("json_files") or [])
+        declared = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise RuntimeError("invalid manifest entry")
+            name = str(entry.get("archive_name") or entry.get("name") or "")
+            digest = str(entry.get("sha256") or "")
+            if name not in allowed - {"manifest.json"} or len(digest) != 64 or any(c not in '0123456789abcdefABCDEF' for c in digest):
+                raise RuntimeError("invalid manifest name or digest")
+            declared.append(name)
+        if len(declared) != len(set(declared)) or set(declared) != set(names) - {"manifest.json"}:
+            raise RuntimeError("manifest membership mismatch")
         return manifest
 
     @classmethod
@@ -252,11 +417,14 @@ class DataBackupManager:
                     "databases": [],
                     "json_files": [],
                     "contains_config_or_tokens": False,
+                    "metadata": dict(self.metadata),
                 }
                 db_sources: list[tuple[str, Path]] = []
                 for label, path in (
                     ("memories.db", self.vec_db_path),
                     ("episodic_memory.db", self.episodic_db_path),
+                    ("house_state.sqlite3", self.house_db_path),
+                    ("llm_compensation.db", self.runtime_state_dir / "llm_compensation.db"),
                 ):
                     if path.exists() and path.is_file() and path not in [item[1] for item in db_sources]:
                         db_sources.append((label, path))
@@ -270,7 +438,10 @@ class DataBackupManager:
 
                 data_dir = self.vec_db_path.parent
                 for name in _JSON_BACKUP_FILES:
-                    source_path = data_dir / name
+                    source_path = (
+                        self.runtime_state_dir / name
+                        if name == "external_models.json" else data_dir / name
+                    )
                     if not source_path.exists() or not source_path.is_file():
                         continue
                     target_path = temp_dir / name
@@ -342,10 +513,13 @@ class DataBackupManager:
                     target = temp_dir / Path(archive_name).name
                     target.write_bytes(archive.read(archive_name))
                     expected = str(entry.get("sha256") or "").upper()
-                    if expected and self._digest(target) != expected:
+                    if self._digest(target) != expected:
                         raise RuntimeError(f"digest mismatch: {archive_name}")
+                    if archive_name.endswith(".json"):
+                        if not isinstance(json.loads(target.read_text(encoding="utf-8")), dict):
+                            raise RuntimeError("backup JSON must be an object")
                     verified.append(archive_name)
-                    if archive_name.endswith(".db"):
+                    if archive_name.endswith((".db", ".sqlite3")):
                         self._check_sqlite(target)
                         counts[archive_name] = self._sqlite_counts(target)
             stat = path.stat()
@@ -360,7 +534,8 @@ class DataBackupManager:
                 "counts": counts,
                 "restore_files": [
                     name for name in verified
-                    if name in {"memories.db", "episodic_memory.db"} or name in _JSON_RESTORE_FILES
+                    if name in {"memories.db", "episodic_memory.db", "house_state.sqlite3", "llm_compensation.db"}
+                    or name in _JSON_RESTORE_FILES
                 ],
             }
 
@@ -459,6 +634,7 @@ class DataBackupManager:
 
     def apply_pending_restore(self) -> dict[str, Any]:
         with self._lock:
+            self._recover_restore()
             pending = self.pending_restore()
             if not pending:
                 return {"applied": False, "reason": "none"}
@@ -476,9 +652,15 @@ class DataBackupManager:
                         destinations: dict[str, Path] = {
                             "memories.db": self.vec_db_path,
                             "episodic_memory.db": self.episodic_db_path,
+                            "house_state.sqlite3": self.house_db_path,
+                            "llm_compensation.db": self.runtime_state_dir / "llm_compensation.db",
                         }
                         for name in _JSON_RESTORE_FILES:
-                            destinations[name] = self.vec_db_path.parent / name
+                            destinations[name] = (
+                                self.runtime_state_dir / name
+                                if name == "external_models.json"
+                                else self.vec_db_path.parent / name
+                            )
                         replacements: list[tuple[Path, Path]] = []
                         for name in inspection.get("restore_files") or []:
                             destination = destinations.get(name)
@@ -486,40 +668,17 @@ class DataBackupManager:
                                 continue
                             staged = temp_dir / ("new_" + name)
                             staged.write_bytes(archive.read(name))
-                            if name.endswith(".db"):
+                            if name.endswith((".db", ".sqlite3")):
                                 self._check_sqlite(staged)
                             replacements.append((staged, destination))
                     if not replacements:
                         raise RuntimeError("backup contains no restorable plugin data")
-                    rollback_dir = temp_dir / "rollback"
-                    rollback_dir.mkdir()
-                    rollback: dict[Path, Path | None] = {}
-                    replaced: list[Path] = []
-                    try:
-                        for index, (staged, destination) in enumerate(replacements):
-                            destination.parent.mkdir(parents=True, exist_ok=True)
-                            old_copy: Path | None = None
-                            if destination.exists():
-                                old_copy = rollback_dir / f"{index}_{destination.name}"
-                                shutil.copy2(destination, old_copy)
-                            rollback[destination] = old_copy
-                            os.replace(staged, destination)
-                            replaced.append(destination)
-                        for destination in replaced:
-                            if destination.suffix == ".db":
-                                for suffix in ("-wal", "-shm"):
-                                    try:
-                                        destination.with_name(destination.name + suffix).unlink(missing_ok=True)
-                                    except OSError:
-                                        pass
-                    except Exception:
-                        for destination in reversed(replaced):
-                            old_copy = rollback.get(destination)
-                            if old_copy is None:
-                                destination.unlink(missing_ok=True)
-                            elif old_copy.exists():
-                                os.replace(old_copy, destination)
-                        raise
+                    self._replace_with_journal(replacements, {
+                        "applied": True, "file": source.name,
+                        "safety_backup": pending.get("safety_backup"),
+                        "restored_files": list(inspection.get("restore_files") or []),
+                        "applied_ts": time.time(),
+                    })
                 result = {
                     "applied": True,
                     "file": source.name,

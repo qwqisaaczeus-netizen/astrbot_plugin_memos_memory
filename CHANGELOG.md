@@ -2,6 +2,28 @@
 
 这里保留面向使用者的主要版本变化。更细的历史实现记录见 [完整参考手册](docs/full-reference.md)。
 
+## 6.1.0 — 2026-10-05
+
+- 正式发布 RC6 A 测试修正版与清蓝工作台；总览、心潮、月历、生产、调度、补偿与控制台统一视觉与交互。
+- 新生产加入证据解释核验和 `literary-v4`，区分正文关联、背景参考与证据库留存；不以关联数量冒充正文覆盖率。
+- 中文词面投影使用解释与原文；引用、覆盖、事实 ID 和容量兼容修正保留全部来源及失败历史。
+- 保留任务模型路线、请求预算和旧作业合同；安装不自动启用新日记生产、不重跑旧作业、不改写历史日记。
+- 仓库源码与原始 6.1.0 封包同步；新增稳定下载入口、安装/架构说明和 Issue 模板。原始 ZIP 不重新封包。
+- 明确 ACCESS 默认 `supplement` 的 T/A 有限补充，以及脉络/一致性 Shadow 边界；不声称完整遗忘或 7.x 已接管。
+- [发布说明](docs/releases/v6.1.0.md) · [安装升级](docs/installation.md)。本轮静态与 UI 契约验证通过，未重跑完整运行时回归。
+
+## 5.1.0（历史 Release：V5.1.0）
+
+- GitHub 已发布的原标签为大写 [V5.1.0](https://github.com/qwqisaaczeus-netizen/astrbot_plugin_memos_memory/releases/tag/V5.1.0)，保留原名称。
+- LLM Runtime 2.0 治理插件内部经 AstrBot Provider 发起的模型调用。
+- ACCESS Stage 2 Supplement 保留成熟主召回，并增加有限补充支路。
+
+## 4.6.4（历史维护版）
+
+- 心潮即时评估的时限、结构恢复与故障分类修正；保留规则信号与故障回退。
+- 包含 4.6.3 的 Episode 恢复及 sqlite-vec 兼容修正。
+- 完整记录见 [v4.6.4 Release](https://github.com/qwqisaaczeus-netizen/astrbot_plugin_memos_memory/releases/tag/v4.6.4)。
+
 ## 5.0.0-test0
 
 - 在 4.6.2 全 MEMORY 主链之后新增非破坏式记忆可达层。

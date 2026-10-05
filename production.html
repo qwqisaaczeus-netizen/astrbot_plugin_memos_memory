@@ -16,12 +16,13 @@
 .toolbar{margin-bottom:10px}.toolbar input,.toolbar select{min-height:36px;border:1px solid var(--line);border-radius:7px;background:#fff;padding:7px 10px;color:var(--ink)}.toolbar input{min-width:260px;flex:1}.toolbar select{min-width:150px}.table-wrap{overflow:auto;border:1px solid var(--line2);border-radius:7px}table{width:100%;border-collapse:collapse;min-width:900px}th,td{padding:9px 10px;border-bottom:1px solid var(--line2);text-align:left;vertical-align:top}th{position:sticky;top:0;background:#f5f7f6;color:var(--muted);font-size:11px;z-index:1}tbody tr{transition:background .15s ease}tbody tr:hover{background:#f3faf7}.mono{font-family:ui-monospace,Consolas,monospace}.pill{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:999px;padding:2px 7px;font-size:11px;background:#f6f8f7;white-space:nowrap}.pill.ok{border-color:#9ed8c7;background:var(--teal2);color:#07614f}.pill.warn{border-color:#edc28f;background:var(--amber2);color:#85460c}.pill.bad{border-color:#e9a2a7;background:var(--red2);color:#8d242b}.empty{padding:28px;text-align:center;color:var(--muted)}
 .episode-row{cursor:pointer}.episode-detail td{padding:0}.episode-sheet{background:#f7faf8;padding:13px;display:grid;grid-template-columns:minmax(0,1.15fr) minmax(260px,.85fr);gap:12px}.kv{display:grid;grid-template-columns:145px minmax(0,1fr);border:1px solid var(--line2);border-radius:7px;overflow:hidden}.kv dt,.kv dd{margin:0;padding:7px 9px;border-bottom:1px solid var(--line2)}.kv dt{background:#f1f5f3;color:var(--muted)}.quality-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.gauge{border:1px solid var(--line2);border-radius:7px;background:#fff;padding:9px}.gauge b{display:block;font-size:17px}.gauge span{font-size:10px;color:var(--muted)}
 .split{display:grid;grid-template-columns:minmax(0,1.18fr) minmax(320px,.82fr);gap:10px}.pre{white-space:pre-wrap;overflow:auto;max-height:520px;border:1px solid var(--line2);border-radius:7px;background:#f6f8f7;padding:11px}.list{display:grid;gap:8px}.list-item{border:1px solid var(--line2);border-radius:7px;padding:10px;background:#fff}.list-item header{display:flex;justify-content:space-between;gap:10px;margin-bottom:6px}.list-item strong{overflow-wrap:anywhere}.danger-zone{border-left:4px solid var(--red)}
+.repair-zone{border-left:4px solid var(--amber);margin-bottom:10px}.repair-zone .list{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
 @keyframes enter{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}@keyframes grow{from{transform:scaleX(0)}to{transform:scaleX(1)}}@keyframes pulse{50%{box-shadow:0 0 0 5px rgba(32,169,130,.12)}}
 @media(max-width:1100px){.metrics{grid-template-columns:repeat(3,minmax(0,1fr))}.split,.episode-sheet{grid-template-columns:1fr}.flow{grid-template-columns:1fr}.flow-step{min-height:52px}.shell{grid-template-columns:1fr}.rail{position:relative;height:auto;flex-direction:row;justify-content:flex-start;overflow:auto}.rail .spacer{display:none}.main{padding:16px}}
 @media(max-width:620px){.top{display:block}.top .actions{margin-top:10px}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.health{grid-template-columns:auto 1fr}.health .version{grid-column:2}.quality-grid{grid-template-columns:1fr}.toolbar input{min-width:100%}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}}
 </style>
-</head>
+<link rel="stylesheet" href="/assets/workbench.css?v=610blue1"><link rel="stylesheet" href="/assets/atelier.css?v=610blue1"><script src="/assets/lucide.min.js" defer></script><script src="/assets/workbench.js?v=610blue1" defer></script></head>
 <body>
 <div class="shell">
   <nav class="rail" aria-label="工作台导航">
@@ -29,17 +30,19 @@
     <a href="/" title="主 WebUI">HOME</a>
     <a class="active" href="/production" title="记忆生产">MAKE</a>
     <a href="/access" title="记忆可达性">ACCESS</a>
+    <a href="/forgetting" title="非破坏式遗忘">FORGET</a>
+    <a href="/threads" title="记忆脉络">THREAD</a>
     <a href="/xinchao" title="心潮工作台">MIND</a>
     <span class="spacer"></span>
     <a href="/console" title="专业控制台">LOG</a>
   </nav>
   <main class="main">
     <header class="top">
-      <div><h1>记忆生产工作台</h1><p>从原始对话到 Episode、第一人称日记与滚动状态，逐步核验 4.6 生产链。</p></div>
+      <div><h1>记忆生产工作台</h1><p>原文 · 证据 · 第一人称日记 · 滚动状态</p></div>
       <div class="actions"><button class="btn" onclick="loadAll()">刷新</button><a class="btn primary" href="/">返回主 WebUI</a></div>
     </header>
 
-    <div id="health" class="health"><i class="lamp"></i><div><strong>正在读取生产链</strong><small>检查数据库身份、追溯链接与向量代际。</small></div><span id="version" class="version">5.0.0-test0</span></div>
+    <div id="health" class="health"><i class="lamp"></i><div><strong>正在读取生产链</strong><small>检查数据库身份、追溯链接与向量代际。</small></div><span id="version" class="version">6.1.0</span></div>
 
     <section class="flow" aria-label="记忆生产流程">
       <div class="flow-step"><b>01 原文档案</b><span id="flow-source">持久保存会话轮次</span></div>
@@ -63,8 +66,28 @@
       <button data-panel="queue">重构队列</button>
       <button data-panel="batches">最近批次</button>
       <button data-panel="safety">数据安全</button>
+      <button data-panel="v2-workbench" onclick="loadV2()">6.1 草稿与迁移</button>
     </nav>
 
+    <section id="v2-workbench" class="panel">
+      <div class="card-head"><h2>6.1 生产记录</h2><span id="v2-status" class="pill warn">未全局接管</span></div>
+      <div class="actions"><button class="btn" onclick="loadV2()">刷新记录</button><button class="btn" id="v2-migrate" onclick="previewV2Migration()">生成迁移预检</button></div>
+      <p id="v2-result" role="status" class="small" style="overflow-wrap:anywhere"></p>
+      <div class="actions"><button class="btn primary" onclick="setV2Mode('automatic')">启用新生产</button><button class="btn" onclick="setV2Mode('compatibility')">使用兼容生产</button></div>
+      <p id="v2-readiness" class="small"></p>
+      <div class="inline" style="flex-wrap:wrap;gap:10px;margin:12px 0;min-width:0">
+        <label style="min-width:0;max-width:100%">原文批次 <select id="v2-source" style="width:320px;max-width:100%;display:block"></select></label>
+        <label style="min-width:0;max-width:100%">草稿模型 <select id="v2-provider" style="width:240px;max-width:100%;display:block"></select></label>
+        <label>总调用上限 <input id="v2-cap" type="number" min="5" max="20" value="8" style="width:70px"></label>
+        <button id="v2-start" class="btn primary" onclick="startV2Draft()">生成草稿</button>
+      </div>
+      <div id="v2-jobs" class="list"></div>
+      <details><summary>心潮调度记录</summary><div id="v2-mind" class="list"></div></details>
+      <h3>自动生产交接</h3><div id="v2-handoffs" class="list"></div>
+      <h3>旧记忆分级</h3><div id="v2-grades" class="inline"></div>
+      <div class="actions"><button id="v2-prev" class="btn" title="上一页" onclick="loadV2(-100)">‹</button><span id="v2-count" class="small"></span><button id="v2-next" class="btn" title="下一页" onclick="loadV2(100)">›</button></div>
+      <div class="table-wrap"><table><thead><tr><th>原日记</th><th>来源等级</th><th>核验范围</th><th>新证据链接</th><th>迁移状态</th></tr></thead><tbody id="v2-upgrades"></tbody></table></div>
+    </section>
     <section id="audit" class="panel active">
       <div class="card">
         <div class="card-head"><h2>逐篇 Episode 审计</h2><span id="episode-meta" class="small">加载中</span></div>
@@ -74,6 +97,7 @@
     </section>
 
     <section id="queue" class="panel">
+      <div class="card repair-zone"><div class="card-head"><div><h2>待文学重建</h2><span class="small">历史回退稿已有原文依据。先生成预览，确认后原位替换同一 Memo，不新增重复日记。</span></div><span id="repair-meta" class="pill warn">加载中</span></div><div id="repair-list" class="list"><div class="empty">加载中</div></div></div>
       <div class="split">
         <div class="card"><div class="card-head"><h2>长日记重构队列</h2><span id="queue-meta" class="small">加载中</span></div><div id="queue-list" class="list"><div class="empty">加载中</div></div></div>
         <div class="card"><div class="card-head"><h2>预览详情</h2><span id="preview-meta" class="small">只预览，不直接写 Memos</span></div><div id="preview-detail" class="pre">选择队列项目生成预览。</div></div>
@@ -106,7 +130,7 @@ function stateLabel(v){return v==="pending"?"累计待融合":v==="failed"?"融�
 function stateTone(v){return v==="done"?"ok":v==="failed"?"bad":"warn"}
 document.getElementById("tabs").addEventListener("click",function(e){var b=e.target.closest("button[data-panel]");if(!b)return;document.querySelectorAll(".tabs button").forEach(function(x){x.classList.toggle("active",x===b)});document.querySelectorAll(".panel").forEach(function(x){x.classList.toggle("active",x.id===b.dataset.panel)})});
 
-function renderOverview(d){state.overview=d;var t=d.totals||{},tr=d.trace||{},tb=d.traceable||{},dy=d.diary_stats||{},ss=d.source_status||{},id=d.identity||{},ga=d.generation_actions||{};document.getElementById("version").textContent=d.version||"5.0.0-test0";var h=document.getElementById("health");h.className="health "+(ss.level||"");h.querySelector("strong").textContent=ss.label||"生产状态未知";h.querySelector("small").textContent="可回原文 "+n(tr.turn_linked_episodes)+" 篇，精确链接 "+n(tb.exact_turn_link_count)+" 条；原文词面索引 "+(tb.source_lexical_ready?"可用":"未就绪")+"，向量索引 "+(tb.source_vector_ready?"可用":"迁移中或未建立")+"。";
+function renderOverview(d){state.overview=d;var t=d.totals||{},tr=d.trace||{},tb=d.traceable||{},dy=d.diary_stats||{},ss=d.source_status||{},id=d.identity||{},ga=d.generation_actions||{};document.getElementById("version").textContent=d.version||"6.1.0";var h=document.getElementById("health");h.className="health "+(ss.level||"");h.querySelector("strong").textContent=ss.label||"生产状态未知";h.querySelector("small").textContent="可回原文 "+n(tr.turn_linked_episodes)+" 篇，精确链接 "+n(tb.exact_turn_link_count)+" 条；原文词面索引 "+(tb.source_lexical_ready?"可用":"未就绪")+"，向量索引 "+(tb.source_vector_ready?"可用":"迁移中或未建立")+"。";
   document.getElementById("m-batches").textContent=n(t.batches);document.getElementById("m-batches-hint").textContent=n((d.batches||[]).length)+" 个最近批次可查看";document.getElementById("m-turns").textContent=n(t.turns);document.getElementById("m-turns-hint").textContent=n(tb.source_turn_vectors)+" 条已有向量";document.getElementById("m-episodes").textContent=n(t.episodes);document.getElementById("m-episodes-hint").textContent=n((dy.quality_dist||{}).source_grounded)+" 篇原始生成";document.getElementById("m-recoverable").textContent=n(tr.turn_linked_episodes);document.getElementById("m-recoverable-hint").textContent=(t.episodes?pct(tr.turn_linked_episodes/t.episodes):"0.0%")+" Episode 有有效原文链接";document.getElementById("m-links").textContent=n(t.turn_links);document.getElementById("m-links-hint").textContent=n(t.evidence)+" 条结构化证据";document.getElementById("m-diaries").textContent=n(dy.with_diary);document.getElementById("m-diaries-hint").textContent="平均风险 "+pct(dy.avg_transcript_risk)+" · 回退 "+n(dy.render_fallbacks)+" 篇";
   document.getElementById("flow-source").textContent=n(t.batches)+" 批 / "+n(t.turns)+" 轮";document.getElementById("flow-scene").textContent=n((d.scene_stats||{}).scenes)+" 个场景，平均 "+Number((d.scene_stats||{}).avg_span_turns||0).toFixed(1)+" 轮";document.getElementById("flow-episode").textContent=n(t.episodes)+" 篇 / "+n(t.evidence)+" 条证据";document.getElementById("flow-diary").textContent=n(dy.with_diary)+" 篇已写入";var sem=d.semantic_state||{},sp=sem.pending_preview||{},reason={initial_state:"首次建立",significant_change:"显著变化立即融合",batch_threshold:"达到累计批次",max_wait:"达到最长等待",failed_retry:"失败重试",every_batch:"逐批更新",deferred:"继续累计",empty:"无待处理",waiting_for_episode_view:"等待 Episode 视图"}[sp.reason]||sp.reason||"";document.getElementById("flow-state").textContent=(sem.ready?"v"+n((sem.state||{}).version||0):"未建立")+" · 累计待融合 "+n(sem.pending||0)+" · "+(sem.update_policy==="adaptive"?"自适应":"逐批")+(reason?" · "+reason:"");
   document.getElementById("db-state").textContent=id.migration_status||"稳定";document.getElementById("identity").innerHTML=[["数据库 UUID",id.database_uuid],["稳定绝对路径",id.canonical_db_path||d.db_path],["Schema",id.schema_version],["Active generation",id.active_generation],["Pending generation",id.pending_generation||"无"],["Previous generation",id.prev_generation||"无"],["路径冲突",id.path_conflict||"无"]].map(function(x){return"<dt>"+esc(x[0])+"</dt><dd class='mono'>"+esc(x[1]||"-")+"</dd>"}).join("");document.getElementById("generation-switch").disabled=!ga.switch_available;document.getElementById("generation-rollback").disabled=!ga.rollback_available;renderQueue(d);renderBatches(d);renderSafety(d)}
@@ -115,25 +139,148 @@ function renderEpisodes(d){state.episodes=d.items||[];document.getElementById("e
 function episodeSheet(x){var reasons=(x.scene_boundary_reasons||[]).join("、")||"未记录";return"<div class='episode-sheet'><dl class='kv'><dt>Memo</dt><dd class='mono'>"+esc(x.memo_name||"-")+"</dd><dt>源批次</dt><dd class='mono'>"+esc(x.source_batch_id||"-")+"</dd><dt>检索线索</dt><dd>"+esc(x.retrieval_key||"-")+"</dd><dt>边界原因</dt><dd>"+esc(reasons)+"</dd><dt>渲染版本</dt><dd>"+esc(x.diary_render_version||"历史版本")+"</dd><dt>重试 / 回退</dt><dd>"+esc(x.render_retry_reason||"无")+(x.render_fallback?"；已走兼容回退":"")+"</dd></dl><div class='quality-grid'><div class='gauge'><b>"+pct(x.must_coverage)+"</b><span>must 覆盖率</span></div><div class='gauge'><b>"+pct(x.support_coverage)+"</b><span>support 覆盖率</span></div><div class='gauge'><b>"+pct(x.source_overlap_ratio)+"</b><span>原文重叠率</span></div><div class='gauge'><b>"+pct(x.direct_quote_ratio)+"</b><span>直接复刻率</span></div><div class='gauge'><b>"+n(x.source_turns)+"</b><span>实际可回轮次</span></div><div class='gauge'><b>"+(x.memos_written?"已写入":"未写入")+"</b><span>Memos 状态</span></div></div></div>"}
 document.getElementById("episode-rows").addEventListener("click",function(e){var row=e.target.closest("tr.episode-row");if(!row)return;var detail=document.getElementById("episode-detail-"+row.dataset.index);detail.hidden=!detail.hidden});
 
-function renderQueue(d){var q=d.long_diaries||[],p=d.previews||[];document.getElementById("queue-meta").textContent=n(d.long_diaries_count)+" 个候选";document.getElementById("queue-list").innerHTML=q.map(function(x){return"<article class='list-item'><header><strong class='mono'>"+esc(x.memo_name||x.episode_id)+"</strong>"+pill(n(x.card_len)+" 字",x.transcript_risk>.65?"bad":"warn")+"</header><div class='small'>原文 "+n(x.source_turns)+" 轮 · must 覆盖 "+pct(x.must_coverage)+" · 风险 "+pct(x.transcript_risk)+"</div><div class='inline' style='margin-top:8px'><button class='btn primary' onclick='previewDiary("+JSON.stringify(String(x.episode_id||""))+ ")'>生成预览</button></div></article>"}).join("")||empty("当前没有需要重构的长日记");document.getElementById("previews-meta").textContent=n(p.length)+" 条";document.getElementById("previews-list").innerHTML=p.map(function(x){var buttons="<button class='btn' onclick='showPreview("+JSON.stringify(String(x.preview_id||""))+ ")'>查看</button>";if(x.status==="pending")buttons+="<button class='btn primary' onclick='confirmPreview("+JSON.stringify(String(x.preview_id||""))+ ")'>确认写回</button><button class='btn danger' onclick='discardPreview("+JSON.stringify(String(x.preview_id||""))+ ")'>丢弃</button>";if(x.status==="confirmed")buttons+="<button class='btn danger' onclick='rollbackPreview("+JSON.stringify(String(x.preview_id||""))+ ")'>回滚</button>";return"<article class='list-item'><header><strong class='mono'>"+esc(x.preview_id||"-")+"</strong>"+pill(x.status||"unknown",x.status==="confirmed"?"ok":x.status==="pending"?"warn":"")+"</header><div class='small'>原篇目 "+esc(x.old_memo_name||x.episode_id||"-")+" · 新日记 "+n(x.new_diaries_count||(x.new_diaries||[]).length)+" 篇</div><div class='inline' style='margin-top:8px'>"+buttons+"</div></article>"}).join("")||empty("暂无预览")}
+function renderQueue(d){var q=d.long_diaries||[],r=d.fallback_repairs||[],p=d.previews||[];document.getElementById("repair-meta").textContent=n(d.fallback_repair_count||r.length)+" 篇待处理";document.getElementById("repair-list").innerHTML=r.map(function(x){return"<article class='list-item'><header><strong class='mono'>"+esc(x.memo_name||x.episode_id)+"</strong>"+pill("禁止继续发布","bad")+"</header><div class='small'>保留原文 "+n(x.source_turns)+" 轮 · "+esc(x.occurred_at||"时间未知")+"<br>失败原因："+esc(x.render_retry_reason||x.last_error||"旧版兼容回退")+"</div><div class='inline' style='margin-top:8px'><button class='btn primary' onclick='previewRepair("+JSON.stringify(String(x.episode_id||""))+ ")'>按原文重建预览</button></div></article>"}).join("")||empty("没有待文学重建的历史回退稿");document.getElementById("queue-meta").textContent=n(d.long_diaries_count)+" 个候选";document.getElementById("queue-list").innerHTML=q.map(function(x){return"<article class='list-item'><header><strong class='mono'>"+esc(x.memo_name||x.episode_id)+"</strong>"+pill(n(x.card_len)+" 字",x.transcript_risk>.65?"bad":"warn")+"</header><div class='small'>原文 "+n(x.source_turns)+" 轮 · must 覆盖 "+pct(x.must_coverage)+" · 风险 "+pct(x.transcript_risk)+"</div><div class='inline' style='margin-top:8px'><button class='btn primary' onclick='previewDiary("+JSON.stringify(String(x.episode_id||""))+ ")'>生成预览</button></div></article>"}).join("")||empty("当前没有需要重构的长日记");document.getElementById("previews-meta").textContent=n(p.length)+" 条";document.getElementById("previews-list").innerHTML=p.map(function(x){var inplace=x.mode==="inplace_fallback_repair",buttons="<button class='btn' onclick='showPreview("+JSON.stringify(String(x.preview_id||""))+ ")'>查看</button>";if(x.status==="pending")buttons+="<button class='btn primary' onclick='confirmPreview("+JSON.stringify(String(x.preview_id||""))+ ")'>"+(inplace?"原位修复":"确认写回")+"</button><button class='btn danger' onclick='discardPreview("+JSON.stringify(String(x.preview_id||""))+ ")'>丢弃</button>";if(x.status==="confirmed")buttons+="<button class='btn danger' onclick='rollbackPreview("+JSON.stringify(String(x.preview_id||""))+ ")'>回滚</button>";return"<article class='list-item'><header><strong class='mono'>"+esc(x.preview_id||"-")+"</strong>"+pill(inplace?"原位修复":(x.status||"unknown"),inplace?"warn":x.status==="confirmed"?"ok":x.status==="pending"?"warn":"")+"</header><div class='small'>原篇目 "+esc(x.old_memo_name||x.episode_id||"-")+" · "+(inplace?"替换同一 Memo":"新日记 "+n(x.new_diaries_count||(x.new_diaries||[]).length)+" 篇")+"</div><div class='inline' style='margin-top:8px'>"+buttons+"</div></article>"}).join("")||empty("暂无预览")}
 function showPreview(id){var p=((state.overview||{}).previews||[]).find(function(x){return x.preview_id===id});if(!p)return;state.preview=p;document.getElementById("preview-meta").textContent=(p.preview_id||"预览")+" · "+(p.status||"unknown");document.getElementById("preview-detail").innerHTML=(p.new_diaries||[]).map(function(x,i){return"<strong>"+esc(x.episode_key||("新日记 "+(i+1)))+"</strong><div class='small'>场景 "+n(x.scene_start_turn)+"–"+n(x.scene_end_turn)+" · must "+pct(x.must_coverage)+"</div><p>"+esc(x.content||"")+"</p>"}).join("")||esc(JSON.stringify(p,null,2))}
 
 function renderBatches(d){var bs=d.batches||[];document.getElementById("batches-meta").textContent=n(bs.length)+" 个最近批次";document.getElementById("batch-rows").innerHTML=bs.map(function(b){return"<tr><td class='mono'>"+esc(b.batch_id||"-")+"</td><td>"+esc(b.source_kind||"-")+"</td><td>"+n(b.user_turns)+" user / "+n(b.assistant_turns)+" assistant<div class='small'>"+n(b.char_count)+" 字符</div></td><td>"+esc(when(b.first_event_ts))+"<div class='small'>至 "+esc(when(b.last_event_ts))+"</div></td><td>"+n(b.ep_cnt)+"<div class='small'>"+n(b.scene_cnt)+" 场景</div></td><td>"+n(b.must_cnt)+" must / "+n(b.diary_cnt)+" 日记</td><td>"+pill(stateLabel(b.state_status),stateTone(b.state_status))+"</td></tr>"}).join("")||"<tr><td colspan='7'>"+empty("暂无原文生产批次")+"</td></tr>"}
 function renderSafety(d){var snaps=d.snapshots||[],rolls=d.rollbacks||[];document.getElementById("snapshots-meta").textContent=n(snaps.length)+" 个快照";document.getElementById("snapshots-list").innerHTML=snaps.map(function(s){var c=s.counts||{};return"<article class='list-item'><header><strong class='mono'>"+esc(s.file_name||"-")+"</strong>"+pill(s.kind||"snapshot")+"</header><div class='small'>"+n(c.batches)+" 批 / "+n(c.turns)+" 轮 / "+n(c.episodes)+" 篇 · "+esc(String(s.digest||"").slice(0,12))+"</div><button class='btn danger' style='margin-top:8px' onclick='restoreSnapshot("+JSON.stringify(String(s.file_name||""))+ ")'>恢复</button></article>"}).join("")||empty("暂无数据库快照");document.getElementById("rollbacks-meta").textContent=n(d.rollback_count)+" 条";document.getElementById("rollbacks-list").innerHTML=rolls.map(function(r){return"<article class='list-item'><header><strong class='mono'>"+esc(r.memo_name||r.episode_id||"-")+"</strong>"+pill(r.reverted_ts?"已回滚":"已写入",r.reverted_ts?"":"ok")+"</header><div class='small'>"+esc(when(r.created_ts))+"</div>"+(!r.reverted_ts?"<button class='btn danger' style='margin-top:8px' onclick='rollbackMemo("+JSON.stringify(String(r.memo_name||""))+ ")'>回滚写入</button>":"")+"</article>"}).join("")||empty("暂无写回记录")}
 
 async function mutate(path,body,message){if(state.busy)return;if(message&&!confirm(message))return;state.busy=true;try{var d=await post(path,body||{});await loadOverview();return d}catch(e){alert(e.message)}finally{state.busy=false}}
-async function previewDiary(id){document.getElementById("preview-detail").textContent="正在调用 LLM 生成预览；不会写入 Memos...";var p=await mutate("/api/production/long_diary_preview",{episode_id:id});if(p){state.overview.previews=state.overview.previews||[];state.overview.previews.unshift(p);showPreview(p.preview_id)}}
-function confirmPreview(id){return mutate("/api/production/long_diary_confirm",{preview_id:id},"确认写回新日记？原日记会保留，可随后回滚。")}
+async function previewDiary(id){document.getElementById("preview-detail").textContent="正在调用 LLM 生成预览；不会写入 Memos...";var p=await mutate("/api/production/long_diary_preview",{episode_id:id});if(p)showPreview(p.preview_id)}
+async function previewRepair(id){document.getElementById("preview-detail").textContent="正在从保留的原始对话重新生成文学日记；此时不会修改 Memos...";var p=await mutate("/api/production/fallback_repair_preview",{episode_id:id});if(p)showPreview(p.preview_id)}
+function confirmPreview(id){var p=((state.overview||{}).previews||[]).find(function(x){return x.preview_id===id}),inplace=p&&p.mode==="inplace_fallback_repair";return mutate(inplace?"/api/production/fallback_repair_confirm":"/api/production/long_diary_confirm",{preview_id:id},inplace?"确认用这篇合格文学日记原位替换旧回退稿？Memo 名称与原文证据链接保持不变，并可精确回滚。":"确认写回新日记？原日记会保留，可随后回滚。")}
 function discardPreview(id){return mutate("/api/production/long_diary_discard",{preview_id:id},"丢弃该预览？不会修改 Memos。")}
-function rollbackPreview(id){return mutate("/api/production/long_diary_rollback",{preview_id:id},"回滚将删除本次重构写入的新 Memos。确认继续？")}
-function rollbackMemo(name){return mutate("/api/production/long_diary_rollback",{memo_name:name},"确认回滚这次 Memos 写入？")}
+function rollbackPreview(id){return mutate("/api/production/long_diary_rollback",{preview_id:id},"确认恢复修复前的精确内容？普通重构预览仍会删除其新增 Memo。")}
+function rollbackMemo(name){return mutate("/api/production/long_diary_rollback",{memo_name:name},"确认恢复这次写回前的内容？")}
 function restoreSnapshot(name){return mutate("/api/production/restore_snapshot",{file_name:name},"恢复快照会覆盖当前原文库；系统会先快照当前库。确认继续？")}
 function generationSwitch(){return mutate("/api/production/generation_switch",{},"确认将待定向量代际切为 active？")}
 function generationRollback(){return mutate("/api/production/generation_rollback",{},"确认恢复上一向量代际？")}
 async function loadOverview(){try{renderOverview(await api("/api/production/overview"))}catch(e){var h=document.getElementById("health");h.className="health red";h.querySelector("strong").textContent="生产工作台加载失败";h.querySelector("small").textContent=e.message}}
 async function loadEpisodes(){try{var q=encodeURIComponent(document.getElementById("episode-q").value.trim()),quality=encodeURIComponent(document.getElementById("episode-quality").value);renderEpisodes(await api("/api/production/episodes?limit=180&q="+q+"&quality="+quality))}catch(e){document.getElementById("episode-rows").innerHTML="<tr><td colspan='6'>"+empty(e.message)+"</td></tr>"}}
 async function loadAll(){await Promise.all([loadOverview(),loadEpisodes()])}
+var v2offset=0;
+function renderV2Attempts(j){
+  const b=j.budget||{}, attempts=j.attempts||[];
+  const audit=j.claim_audit||{}, counts=audit.counts||{}, tokens=j.token_summary||{};
+  return '<p class="small">调用 '+n(b.used)+' / '+n(b.cap)+' · '+esc(j.writer_version||'尚未写作')+' · '+esc(j.call_profile||'legacy')+(b.expired?' · 原调用期限已结束':'')+'</p>'+
+    '<p class="small">解释核验：'+esc(audit.status||'not_requested')+' · 保留 '+n(counts.accepted)+' · 修正 '+n(counts.corrected)+' · 待确认 '+n(counts.uncertain)+'</p>'+
+    '<p class="small">已知总用量 '+n(tokens.total_tokens)+' tokens · 已返回思考用量 '+n(tokens.reasoning_tokens)+' · 总用量缺失 '+n(tokens.usage_missing_attempts)+' 次</p>'+
+    attempts.map(a=>'<p class="small">'+esc(a.task)+' #'+n(a.ordinal)+' · '+esc(a.error_kind||a.outcome)+' · '+(Number(a.elapsed_ms||0)/1000).toFixed(1)+' 秒 · '+(a.usage&&Number.isFinite(a.usage.total_tokens)?n(a.usage.total_tokens)+' tokens':'用量未返回，费用未知')+'</p>').join('');
+}
+function renderV2Draft(r){
+  const report=r.report||{},binding=report.binding||report,editorial=report.editorial_review;
+  const status=editorial?'人工事实复核':report.advisory_issues?.length?'通过 · 有编辑建议':r.status;
+  const audit=editorial?'<details><summary>修订依据</summary><p>'+esc(editorial.reason)+'</p></details>':'';
+  const links=binding.prose_fact_ids?'<p class="small">正文关联 '+n(binding.prose_fact_ids.length)+' 条 · 背景参考 '+n((binding.reference_fact_ids||[]).length)+' 条 · 证据层保留 '+n((binding.evidence_only_fact_ids||[]).length)+' 条 · 重新绑定 '+n((binding.rebound_fact_ids||[]).length)+' 条</p>':'';
+  return '<article><h3>'+esc(r.draft.title)+' · 修订 '+r.revision+'</h3><p>'+pill(status)+'</p><p style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(r.draft.body)+'</p><p class="small">'+esc((report.blocking||[]).concat(report.warnings||[]).join('、')||'本地检查通过')+'</p>'+links+audit+'</article>';
+}
+async function loadV2(delta=0){
+  try{
+    const opened=new Set([...document.querySelectorAll('#v2-jobs details[open]')].map(e=>e.querySelector('p')?.textContent));
+    const d=await api('/api/production/v2?offset='+Math.max(0,v2offset+delta));
+    v2offset=d.offset||0;
+    for(const [id,items] of [['v2-source',(d.sources||[]).map(s=>({value:s.batch_id,label:s.batch_id+' · '+s.message_count+' 条消息'}))],['v2-provider',(d.provider_options||[]).filter(p=>p.value)]]){
+      const select=document.getElementById(id), old=select.value;
+      select.innerHTML=items.map(p=>'<option value="'+esc(p.value)+'">'+esc(p.label)+'</option>').join('');
+      if(items.some(p=>p.value===old))select.value=old;
+    }
+    document.getElementById('v2-count').textContent='共 '+n(d.total)+' 条 · 当前 '+n((d.upgrades||[]).length)+' 条';
+    document.getElementById('v2-prev').disabled=v2offset===0;
+    document.getElementById('v2-next').disabled=v2offset+100>=(d.total||0);
+    document.getElementById('v2-status').textContent=d.automatic_publication?'自动生产已启用':(d.enabled?'等待发布能力确认':'自动生产未启用');
+    document.getElementById('v2-mind').innerHTML=(d.mind_calls||[]).map(c=>'<p>'+esc(c.task)+' · '+esc(c.status)+' · '+n(c.attempts)+' 次 · '+esc(new Date(c.updated*1000).toLocaleString())+'</p>').join('')||empty('暂无心潮统一调度记录');
+    const ready=d.readiness||{};
+    document.getElementById('v2-readiness').textContent='当前链路：'+(ready.mode==='automatic'?'6.1 新生产':ready.mode==='blocked'?'新生产等待发布确认':'兼容生产')+' · 原文库'+(ready.archive_ready?'就绪':'未就绪')+' · 索引'+(ready.index_ready?'就绪':'未就绪');
+    document.getElementById('v2-handoffs').innerHTML=(d.handoffs||[]).map(h=>'<details class="list-item"><summary>'+esc(h.source_kind)+' · '+esc(h.status)+'</summary><p>'+esc(h.batch_id)+'</p><p>'+esc(h.error_kind||'')+'</p><p>'+esc(h.next_retry?'下次可恢复：'+new Date(h.next_retry*1000).toLocaleString():'')+'</p>'+((h.status!=='done'&&(d.jobs||[]).some(j=>j.job_id===h.job_id&&j.publication.length))?'<button class="btn v2-delivery" data-job="'+esc(h.job_id)+'">恢复交付</button>':'')+'</details>').join('')||empty('暂无自动交接批次');
+    document.querySelectorAll('.v2-delivery').forEach(b=>b.onclick=()=>resumeV2Delivery(b));
+    const labels={source_complete:'完整原文',source_partial:'原文不完整',diary_only:'仅日记',broken_binding:'关联损坏'};
+    document.getElementById('v2-grades').innerHTML=Object.entries(d.grades||{}).map(([k,v])=>pill((labels[k]||k)+' '+n(v))).join('');
+    document.getElementById('v2-jobs').innerHTML=(d.jobs||[]).map(j=>'<details class="list-item"><summary>'+esc(j.batch_id)+' · '+esc(j.status)+'</summary><p class="small">'+esc(j.job_id)+'</p>'+renderV2Attempts(j)+'<p>'+j.parts.map(p=>pill('片段 '+(p.part+1)+' · '+p.status)).join(' ')+'</p>'+j.drafts.map(renderV2Draft).join('')+j.publication.map(p=>'<p>'+esc(p.name)+' · '+esc(p.event_time)+' · '+pill(p.status)+'</p>').join('')+'</details>').join('')||empty('暂无 6.1 生产作业');
+    document.getElementById('v2-upgrades').innerHTML=(d.upgrades||[]).map(p=>'<tr><td>'+esc(p.memo_name||p.episode_id)+'</td><td>'+esc(labels[p.grade]||p.grade)+'</td><td>'+n(p.ranges)+'</td><td>'+n(p.links)+'</td><td>'+esc(p.status)+'</td></tr>').join('')||'<tr><td colspan="5">'+empty('暂无迁移预检')+'</td></tr>';
+    document.querySelectorAll('#v2-jobs details').forEach(e=>{e.open=opened.has(e.querySelector('p')?.textContent);});
+    document.querySelectorAll('#v2-upgrades tr').forEach((row,index)=>{
+      const p=(d.upgrades||[])[index];if(!p||p.grade!=='source_complete')return;
+      const candidates=(d.jobs||[]).filter(j=>j.batch_id===p.batch_id&&!['queued','extracting','superseded'].includes(j.status));
+      const cell=row.lastElementChild;
+      if(candidates.length){
+        const select=document.createElement('select');select.setAttribute('aria-label','证据来源作业');
+        for(const j of candidates){const option=document.createElement('option');option.value=j.job_id;option.textContent=j.job_id.slice(0,10)+' · '+j.status;select.append(option);}cell.append(select);
+        const b=document.createElement('button');b.className='btn';b.textContent='应用证据升级';b.onclick=()=>upgradeV2(p,'upgrade_apply',select.value,b);cell.append(b);
+      }
+      if(p.status==='evidence_link_active'){const b=document.createElement('button');b.className='btn';b.textContent='撤回升级';b.onclick=()=>upgradeV2(p,'upgrade_rollback',null,b);cell.append(b);}
+    });
+    document.querySelectorAll('#v2-jobs details').forEach((e,index)=>{
+      const j=d.jobs[index], bar=document.createElement('div');bar.className='actions';
+      const choices=j.publication.length?[['publish','继续交付']]:[['pause','暂停'],['cancel','取消并保留原文'],['revalidate','本地重新校验'],['resume','原预算继续'],['retry','补齐未完成阶段'],['rewrite','重写正文'],['replan','重做规划'],['reextract','重新抽取'],...(j.status==='draft_ready'?[['publish','发布合格草稿']]:[])];
+      if(j.status==='published'||j.status==='superseded')return;
+      for(const [action,label] of choices){const b=document.createElement('button');b.className='btn';b.textContent=label;b.onclick=()=>controlV2(j,action,b);bar.append(b);}e.append(bar);
+    });
+  }catch(e){document.getElementById('v2-result').textContent=e.message;}
+}
+async function previewV2Migration(){
+  if(!confirm('创建原文库一致性副本并生成迁移预检？不会调用模型、写入 Memos 或切换旧记忆。'))return;
+  const button=document.getElementById('v2-migrate');button.disabled=true;
+  try{await post('/api/production/v2/migrate_preview',{});document.getElementById('v2-result').textContent='预检已保存，旧记忆保持不变';await loadV2();}
+  catch(e){document.getElementById('v2-result').textContent=e.message;}
+  finally{button.disabled=false;}
+}
+async function startV2Draft(){
+  const button=document.getElementById('v2-start');
+  const body={batch_id:document.getElementById('v2-source').value,provider_id:document.getElementById('v2-provider').value,job_cap:Number(document.getElementById('v2-cap').value),confirm_model_calls:true};
+  if(!body.batch_id||!body.provider_id){document.getElementById('v2-result').textContent='请选择批次与模型';return;}
+  if(!confirm('这会调用所选模型并产生费用，总调用上限 '+body.job_cap+' 次。仅生成草稿，不写入 Memos，不清空缓冲。继续？'))return;
+  button.disabled=true;
+  try{const d=await post('/api/production/v2/draft',body);document.getElementById('v2-result').textContent='后台作业 '+d.job_id+' 已提交';await loadV2();}
+  catch(e){document.getElementById('v2-result').textContent=e.message;}
+  finally{button.disabled=false;}
+}
+async function resumeV2Delivery(button){
+  if(!confirm('恢复这批合格日记的 Memos 对账、发布和索引？不重新取证、写作或审稿；缺失索引可能调用 embedding 并产生费用。'))return;
+  button.disabled=true;
+  try{const d=await post('/api/production/v2/resume_delivery',{job_id:button.dataset.job,confirm_delivery:true});document.getElementById('v2-result').textContent='交付作业 '+d.job_id+' · '+d.status;await loadV2();}
+  catch(e){document.getElementById('v2-result').textContent=e.message;}
+  finally{button.disabled=false;}
+}
+async function setV2Mode(mode){
+  if(!confirm(mode==='automatic'?'启用后普通、手动与夜间压缩将使用新生产，会调用模型并写入 Memos。确认 Memos 支持固定 ID 和事件日期写入，且已备份数据？':'切回兼容生产？已被新生产接管的失败批次仍会保留，不会重复压缩。'))return;
+  try{await post('/api/production/v2/mode',{mode,confirm_model_calls:true,confirm_delivery:true,confirm_memos_contract:true});await loadV2();}catch(e){document.getElementById('v2-result').textContent=e.message;}
+}
+async function upgradeV2(p,action,job,button){
+  if(!confirm(action==='upgrade_apply'?'把核验过的原文证据接入这篇旧日记的召回？不会改写日记，不会调用模型，可以撤回。':'撤回新增证据关联？原日记和原文保持不变。'))return;
+  button.disabled=true;
+  try{const d=await post('/api/production/v2/control',{action,episode_id:p.episode_id,job_id:job,confirm_upgrade:true});document.getElementById('v2-result').textContent=d.status;await loadV2();}
+  catch(e){document.getElementById('v2-result').textContent=e.message;button.disabled=false;}
+}
+async function controlV2(job,action,button){
+  const body={job_id:job.job_id,action};
+  if(action==='publish'){
+    if(!confirm('将合格草稿新增到 Memos，并建立索引与原文关联，不会替换已有旧日记。索引可能调用 embedding；重复点击不会重复生成正文。继续？'))return;
+    body.confirm_delivery=true;
+  }else if(action==='revalidate'){
+    if(!confirm('只重新校验已保存的抽取响应，不调用模型，不写 Memos；原响应和修复记录都会保留。继续？'))return;
+    body.confirm_local_revalidation=true;
+  }else if(!['pause','cancel'].includes(action)){
+    if(!confirm('该操作可能产生模型费用。已有原文不会删除，草稿不会自动发布。继续？'))return;
+    body.confirm_model_calls=true;
+    if(action==='resume'&&job.budget?.expired){
+      if(!confirm('延长仅抽取阶段作业的等待期限，已用请求数和预算不清零。继续？'))return;
+      body.renew_deadline=true;
+    }
+    if(action!=='resume'){
+      const cap=prompt('新修订的总请求上限（5~30，原作业费用不清零）','12');if(cap===null)return;
+      body.job_cap=Number(cap);if(!Number.isInteger(body.job_cap)||body.job_cap<5||body.job_cap>30)return;
+      body.request_id=crypto.randomUUID();
+      body.use_current_routes=confirm('采用调度台当前模型分工？取消则保留原作业冻结路线。');
+      if(action==='reextract')body.upgrade_production_contract=confirm('将这次重新抽取升级为 RC6 解释核验与文学写作？会增加一次有预算限制的核验调用；取消则保留旧生产合同。');
+    }
+  }
+  button.disabled=true;
+  try{const d=await post('/api/production/v2/control',body);document.getElementById('v2-result').textContent=action==='revalidate'?'本地校验通过 '+d.accepted_parts.length+' 块，已有 '+d.already_verified.length+' 块，仍需处理 '+d.rejected.length+' 块；同步审核 '+(d.reviews_reconciled||[]).length+' 篇；模型调用 0 次':'作业 '+d.job_id+' · '+d.status;await loadV2();}
+  catch(e){document.getElementById('v2-result').textContent=e.message;button.disabled=false;}
+}
+setInterval(()=>{if(!document.hidden&&document.getElementById('v2-start').closest('.panel').classList.contains('active'))loadV2();},5000);
 loadAll();
 </script>
 </body>
 </html>
+

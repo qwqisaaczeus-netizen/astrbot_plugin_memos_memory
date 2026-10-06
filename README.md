@@ -10,7 +10,9 @@
 
 **[下载 6.1.0 ZIP](https://github.com/qwqisaaczeus-netizen/astrbot_plugin_memos_memory/releases/download/v6.1.0/astrbot_plugin_memos_memory-6.1.0.zip)** · [发布说明](docs/releases/v6.1.0.md) · [安装与升级](docs/installation.md) · [架构与能力](docs/architecture.md) · [更新记录](CHANGELOG.md)
 
-## 6.1.0：清蓝工作台与受控记忆生产
+## 6.1.0
+
+> 本版重点：统一工作台，完善证据核验与生产恢复。
 
 6.1.0 整合 RC6 A 测试修正与清蓝界面。总览、心潮、月历、记忆生产、模型调度、补偿和控制台使用统一控件与状态颜色；统计、注入构成和同日多篇日记读取实际数据。
 
